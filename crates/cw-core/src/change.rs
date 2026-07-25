@@ -26,11 +26,13 @@ pub enum ImageBufferError {
     EmptyImage,
 }
 
-/// Downscaled grayscale view of a frame, kept between ticks instead of the full frame
-/// (a few tens of KiB per monitor rather than tens of MiB).
+/// Downscaled grayscale view used to estimate changed source-screen pixels, kept between ticks
+/// instead of the full frame (a few tens of KiB per monitor rather than tens of MiB).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Thumbnail {
     luma: Vec<u8>,
+    source_width: u32,
+    source_height: u32,
 }
 
 impl Thumbnail {
@@ -48,7 +50,23 @@ impl Thumbnail {
 
         Ok(Self {
             luma: grayscale.into_raw(),
+            source_width: width,
+            source_height: height,
         })
+    }
+
+    /// Source frame dimensions this thumbnail was downscaled from.
+    pub fn source_dimensions(&self) -> (u32, u32) {
+        (self.source_width, self.source_height)
+    }
+
+    /// Estimated number of SOURCE pixels that changed, using this thumbnail's source dimensions.
+    /// The thumbnail is a fixed size, so one sample stands for `source_width * source_height /
+    /// (THUMBNAIL_WIDTH * THUMBNAIL_HEIGHT)` screen pixels.
+    pub fn changed_source_pixels(&self, other: &Thumbnail, pixel_threshold: u8) -> f64 {
+        self.changed_fraction(other, pixel_threshold)
+            * f64::from(self.source_width)
+            * f64::from(self.source_height)
     }
 
     /// Fraction (0.0..=1.0) of samples whose absolute luma difference is strictly greater
@@ -69,16 +87,22 @@ impl Thumbnail {
     }
 }
 
-/// Whether this frame must be stored and OCR-ed.
-/// `previous` is `None` for the first frame of a monitor, which always counts as changed.
+/// Whether this frame must be stored and OCR-ed based on changed source-screen pixels.
+/// The first frame and a source-resolution change always count as changed.
 pub fn frame_changed(
     previous: Option<&Thumbnail>,
     current: &Thumbnail,
     config: &crate::config::CaptureConfig,
 ) -> bool {
-    previous.is_none_or(|previous| {
-        previous.changed_fraction(current, config.change_pixel_threshold) > config.change_ratio
-    })
+    let Some(previous) = previous else {
+        return true;
+    };
+    if previous.source_dimensions() != current.source_dimensions() {
+        return true;
+    }
+
+    previous.changed_source_pixels(current, config.change_pixel_threshold)
+        > f64::from(config.change_area_pixels)
 }
 
 pub(crate) fn rgba_image(
@@ -114,6 +138,7 @@ mod tests {
 
     const WIDTH: u32 = 2560;
     const HEIGHT: u32 = 1440;
+    const INK: u8 = 30;
 
     /// Solid RGBA image of `w`x`h filled with (v, v, v, 255).
     fn solid(w: u32, h: u32, v: u8) -> Vec<u8> {
@@ -135,6 +160,16 @@ mod tests {
                 buf[offset..offset + 4].copy_from_slice(&[v, v, v, 255]);
             }
         }
+    }
+
+    /// One monospace glyph in an 8x16 cell: a 2px stem plus a crossbar, about 23% ink coverage.
+    /// A filled rectangle is NOT a substitute — it overstates a text edit by roughly 2.5x, which is
+    /// how the previous default was validated against fixtures that were far easier to detect than
+    /// real text.
+    fn glyph(buf: &mut [u8], width: u32, column: u32, top: u32) {
+        let x = 100 + column * 8;
+        fill_rect(buf, width, x + 2, x + 4, top + 2, top + 14, INK);
+        fill_rect(buf, width, x + 1, x + 6, top + 8, top + 10, INK);
     }
 
     #[test]
@@ -165,38 +200,104 @@ mod tests {
     }
 
     #[test]
-    fn single_text_line_edit_is_detected() {
+    fn ten_characters_typed_are_detected() {
         let before = solid(WIDTH, HEIGHT, 200);
         let mut after = before.clone();
-        fill_rect(&mut after, WIDTH, 100, 900, 500, 520, 30);
+        for column in 0..10 {
+            glyph(&mut after, WIDTH, column, HEIGHT / 2);
+        }
         let before = Thumbnail::from_rgba(&before, WIDTH, HEIGHT)
             .expect("the fixed-size before frame must be valid RGBA");
         let after = Thumbnail::from_rgba(&after, WIDTH, HEIGHT)
             .expect("the fixed-size after frame must be valid RGBA");
         let config = CaptureConfig::default();
-        let changed_fraction = before.changed_fraction(&after, config.change_pixel_threshold);
+        let changed_source_pixels =
+            before.changed_source_pixels(&after, config.change_pixel_threshold);
 
         assert!(
             frame_changed(Some(&before), &after, &config),
-            "the edited text line must be detected; changed_fraction={changed_fraction}"
+            "ten typed characters must be detected; changed_source_pixels={changed_source_pixels}"
         );
     }
 
     #[test]
-    fn terminal_line_append_is_detected() {
+    fn a_blinking_cursor_alone_is_ignored() {
         let before = solid(WIDTH, HEIGHT, 200);
         let mut after = before.clone();
-        fill_rect(&mut after, WIDTH, 0, 600, 1400, 1420, 30);
+        glyph(&mut after, WIDTH, 0, HEIGHT / 2);
         let before = Thumbnail::from_rgba(&before, WIDTH, HEIGHT)
             .expect("the fixed-size before frame must be valid RGBA");
         let after = Thumbnail::from_rgba(&after, WIDTH, HEIGHT)
             .expect("the fixed-size after frame must be valid RGBA");
         let config = CaptureConfig::default();
-        let changed_fraction = before.changed_fraction(&after, config.change_pixel_threshold);
+        let changed_source_pixels =
+            before.changed_source_pixels(&after, config.change_pixel_threshold);
+
+        // A caret must not keep the pipeline busy.
+        assert!(
+            !frame_changed(Some(&before), &after, &config),
+            "a blinking cursor alone must be ignored; changed_source_pixels={changed_source_pixels}"
+        );
+    }
+
+    #[test]
+    fn an_eighty_character_line_is_detected() {
+        let before = solid(WIDTH, HEIGHT, 200);
+        let mut after = before.clone();
+        for column in 0..80 {
+            glyph(&mut after, WIDTH, column, 1400);
+        }
+        let before = Thumbnail::from_rgba(&before, WIDTH, HEIGHT)
+            .expect("the fixed-size before frame must be valid RGBA");
+        let after = Thumbnail::from_rgba(&after, WIDTH, HEIGHT)
+            .expect("the fixed-size after frame must be valid RGBA");
+        let config = CaptureConfig::default();
+        let changed_source_pixels =
+            before.changed_source_pixels(&after, config.change_pixel_threshold);
 
         assert!(
             frame_changed(Some(&before), &after, &config),
-            "the appended terminal line must be detected; changed_fraction={changed_fraction}"
+            "an eighty-character line must be detected; changed_source_pixels={changed_source_pixels}"
+        );
+    }
+
+    #[test]
+    fn the_same_edit_is_detected_on_every_monitor_size() {
+        // Measured source-pixel values: 1338, 1238, 1600, 1350 — a 1.3x spread, against 7.8x when
+        // the threshold was a thumbnail fraction.
+        for (width, height) in [(1366, 768), (1920, 1080), (2560, 1440), (3840, 2160)] {
+            let before = solid(width, height, 200);
+            let mut after = before.clone();
+            for column in 0..10 {
+                glyph(&mut after, width, column, height / 2);
+            }
+            let before = Thumbnail::from_rgba(&before, width, height)
+                .expect("the before frame must be valid RGBA");
+            let after = Thumbnail::from_rgba(&after, width, height)
+                .expect("the after frame must be valid RGBA");
+            let config = CaptureConfig::default();
+            let changed_source_pixels =
+                before.changed_source_pixels(&after, config.change_pixel_threshold);
+
+            assert!(
+                frame_changed(Some(&before), &after, &config),
+                "ten typed characters must be detected at {width}x{height}; changed_source_pixels={changed_source_pixels}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_resolution_change_counts_as_changed() {
+        let before = solid(1920, 1080, 200);
+        let after = solid(2560, 1440, 200);
+        let before = Thumbnail::from_rgba(&before, 1920, 1080)
+            .expect("the 1920x1080 before frame must be valid RGBA");
+        let after = Thumbnail::from_rgba(&after, 2560, 1440)
+            .expect("the 2560x1440 after frame must be valid RGBA");
+
+        assert!(
+            frame_changed(Some(&before), &after, &CaptureConfig::default()),
+            "a source-resolution change must invalidate the stored frame"
         );
     }
 

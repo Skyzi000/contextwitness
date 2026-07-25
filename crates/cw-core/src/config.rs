@@ -10,9 +10,10 @@ pub const DEFAULT_CONFIG_TOML: &str = r#"# ContextWitness configuration.
 interval_secs = 2
 # A pixel counts as changed when its grayscale value moves by more than this (0-254).
 change_pixel_threshold = 8
-# Store and OCR a frame once more than this fraction of pixels changed (0.0 or more, below 1.0).
-# Lower is more sensitive.
-change_ratio = 0.002
+# Store and OCR a frame once more than this many screen pixels changed.
+# Counted in source-screen pixels, so the same edit behaves the same on every monitor.
+# The default is roughly seven to ten characters of text.
+change_area_pixels = 1000
 # WebP encoder quality (0-100).
 webp_quality = 75
 
@@ -78,8 +79,8 @@ pub struct CaptureConfig {
     pub interval_secs: u64,
     /// Per-pixel luma delta from 0 through 255.
     pub change_pixel_threshold: u8,
-    /// Fraction of changed pixels required to keep a capture.
-    pub change_ratio: f64,
+    /// Capture once more than this many source-screen pixels changed since the stored frame.
+    pub change_area_pixels: u32,
     /// WebP encoding quality.
     pub webp_quality: u8,
 }
@@ -89,7 +90,7 @@ impl Default for CaptureConfig {
         Self {
             interval_secs: 2,
             change_pixel_threshold: 8,
-            change_ratio: 0.002,
+            change_area_pixels: 1000,
             webp_quality: 75,
         }
     }
@@ -231,16 +232,6 @@ impl Config {
 
     /// Reject values that parse but would break collection. Called by [`Config::load_from_path`].
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if !self.capture.change_ratio.is_finite()
-            || !(0.0..1.0).contains(&self.capture.change_ratio)
-        {
-            return Err(ConfigError::Invalid {
-                field: "capture.change_ratio",
-                reason: "must be a finite fraction from 0.0 (inclusive) to 1.0 (exclusive)"
-                    .to_owned(),
-            });
-        }
-
         if self.capture.change_pixel_threshold == 255 {
             return Err(ConfigError::Invalid {
                 field: "capture.change_pixel_threshold",
@@ -414,7 +405,7 @@ mod tests {
 
         assert_eq!(config.capture.interval_secs, 2);
         assert_eq!(config.capture.change_pixel_threshold, 8);
-        assert_eq!(config.capture.change_ratio, 0.002);
+        assert_eq!(config.capture.change_area_pixels, 1000);
         assert_eq!(config.capture.webp_quality, 75);
         assert_eq!(config.ocr.languages, vec!["ja".to_owned(), "en".to_owned()]);
         assert_eq!(config.storage.data_dir, "");
@@ -481,73 +472,6 @@ mod tests {
         assert!(
             Config::default().validate().is_ok(),
             "the built-in defaults should be semantically valid"
-        );
-    }
-
-    #[test]
-    fn validate_rejects_nan_change_ratio() {
-        let mut config = Config::default();
-        config.capture.change_ratio = f64::NAN;
-
-        // frame_changed compares with `>`, so NaN silently disables all capture.
-        assert!(
-            matches!(
-                config.validate(),
-                Err(ConfigError::Invalid {
-                    field: "capture.change_ratio",
-                    ..
-                })
-            ),
-            "a NaN change ratio should be rejected"
-        );
-    }
-
-    #[test]
-    fn validate_rejects_out_of_range_change_ratio() {
-        for change_ratio in [-1.0, 2.0] {
-            let mut config = Config::default();
-            config.capture.change_ratio = change_ratio;
-
-            assert!(
-                matches!(
-                    config.validate(),
-                    Err(ConfigError::Invalid {
-                        field: "capture.change_ratio",
-                        ..
-                    })
-                ),
-                "an out-of-range change ratio should be rejected: {change_ratio}"
-            );
-        }
-    }
-
-    #[test]
-    fn validate_rejects_change_ratio_of_one() {
-        let mut config = Config::default();
-        config.capture.change_ratio = 1.0;
-
-        // `changed_fraction` maxes out at 1.0 and `frame_changed` compares with `>`,
-        // so 1.0 stops all capture after the first frame.
-        assert!(
-            matches!(
-                config.validate(),
-                Err(ConfigError::Invalid {
-                    field: "capture.change_ratio",
-                    ..
-                })
-            ),
-            "a change ratio of exactly one should be rejected"
-        );
-    }
-
-    #[test]
-    fn validate_accepts_change_ratio_just_below_one() {
-        let mut config = Config::default();
-        config.capture.change_ratio = 0.999;
-
-        assert!(
-            config.validate().is_ok(),
-            "a change ratio just below one should remain valid"
         );
     }
 
@@ -648,7 +572,7 @@ mod tests {
         let temp_dir = unique_temp_path("invalid-values");
         std::fs::create_dir(&temp_dir).expect("the unique test directory should be creatable");
         let path = temp_dir.join("config.toml");
-        std::fs::write(&path, "[capture]\nchange_ratio = 2.0\n")
+        std::fs::write(&path, "[capture]\nchange_pixel_threshold = 255\n")
             .expect("the semantically invalid test config should be writable");
 
         let result = Config::load_from_path(&path);
@@ -659,7 +583,7 @@ mod tests {
             matches!(
                 result,
                 Err(ConfigError::Invalid {
-                    field: "capture.change_ratio",
+                    field: "capture.change_pixel_threshold",
                     ..
                 })
             ),
