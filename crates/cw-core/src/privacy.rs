@@ -1,7 +1,9 @@
 /// True when `foreground_process` (a full path or a bare file name) matches any blacklist entry.
 /// Matching rule (v1, deliberately simple): compare the file-name component only,
-/// Unicode case-insensitively, as a whole-string equality. No globs, no path matching, no
-/// substring matching.
+/// uppercasing both sides the way Windows compares file names, as a whole-string equality. No
+/// globs, no path matching, no substring matching. This deliberately over-matches Unicode edge
+/// cases such as `ß` uppercasing to `SS`; for a privacy blacklist, skipping too much is safer than
+/// failing to honor an exclusion.
 pub fn is_blacklisted(foreground_process: &str, blacklist: &[String]) -> bool {
     let Some(foreground_file_name) = file_name_component(foreground_process) else {
         return false;
@@ -9,7 +11,7 @@ pub fn is_blacklisted(foreground_process: &str, blacklist: &[String]) -> bool {
 
     blacklist.iter().any(|entry| {
         file_name_component(entry).is_some_and(|entry_file_name| {
-            foreground_file_name.to_lowercase() == entry_file_name.to_lowercase()
+            foreground_file_name.to_uppercase() == entry_file_name.to_uppercase()
         })
     })
 }
@@ -108,6 +110,28 @@ mod tests {
         assert!(
             !is_blacklisted(r"C:\Program Files\Пример\КИПАСЫ.EXE", &blacklist),
             "a different non-ASCII executable file name must not match"
+        );
+    }
+
+    #[test]
+    fn blacklist_matches_greek_sigma_case_variants() {
+        let uppercase_sigma_entry = "\u{039F}\u{03A3}.exe"; // ΟΣ.exe
+        let final_sigma_entry = "\u{039F}\u{03C2}.exe"; // Ος.exe
+        let uppercase_sigma_input = "\u{039F}\u{03A3}.EXE"; // ΟΣ.EXE
+        let sigma_input = "\u{03C3}.exe"; // σ.exe
+        let omega_entry = "\u{03C9}.exe"; // ω.exe
+
+        assert!(
+            is_blacklisted(final_sigma_entry, &[uppercase_sigma_entry.to_owned()]),
+            "a Greek final sigma should match the uppercase sigma variant"
+        );
+        assert!(
+            is_blacklisted(uppercase_sigma_input, &[final_sigma_entry.to_owned()]),
+            "an uppercase Greek sigma should match the final sigma variant"
+        );
+        assert!(
+            !is_blacklisted(sigma_input, &[omega_entry.to_owned()]),
+            "different Greek letters must not match"
         );
     }
 

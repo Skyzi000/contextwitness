@@ -8,9 +8,10 @@ pub const DEFAULT_CONFIG_TOML: &str = r#"# ContextWitness configuration.
 [capture]
 # Seconds between capture attempts.
 interval_secs = 2
-# A pixel counts as changed when its grayscale value moves by more than this (0-255).
+# A pixel counts as changed when its grayscale value moves by more than this (0-254).
 change_pixel_threshold = 8
-# Store and OCR a frame once this fraction of pixels changed. Lower is more sensitive.
+# Store and OCR a frame once more than this fraction of pixels changed (0.0 or more, below 1.0).
+# Lower is more sensitive.
 change_ratio = 0.002
 # WebP encoder quality (0-100).
 webp_quality = 75
@@ -231,11 +232,20 @@ impl Config {
     /// Reject values that parse but would break collection. Called by [`Config::load_from_path`].
     pub fn validate(&self) -> Result<(), ConfigError> {
         if !self.capture.change_ratio.is_finite()
-            || !(0.0..=1.0).contains(&self.capture.change_ratio)
+            || !(0.0..1.0).contains(&self.capture.change_ratio)
         {
             return Err(ConfigError::Invalid {
                 field: "capture.change_ratio",
-                reason: "must be a finite fraction between 0.0 and 1.0".to_owned(),
+                reason: "must be a finite fraction from 0.0 (inclusive) to 1.0 (exclusive)"
+                    .to_owned(),
+            });
+        }
+
+        if self.capture.change_pixel_threshold == 255 {
+            return Err(ConfigError::Invalid {
+                field: "capture.change_pixel_threshold",
+                reason: "must be 254 or less; two pixels can never differ by more than 255"
+                    .to_owned(),
             });
         }
 
@@ -509,6 +519,60 @@ mod tests {
                 "an out-of-range change ratio should be rejected: {change_ratio}"
             );
         }
+    }
+
+    #[test]
+    fn validate_rejects_change_ratio_of_one() {
+        let mut config = Config::default();
+        config.capture.change_ratio = 1.0;
+
+        // `changed_fraction` maxes out at 1.0 and `frame_changed` compares with `>`,
+        // so 1.0 stops all capture after the first frame.
+        assert!(
+            matches!(
+                config.validate(),
+                Err(ConfigError::Invalid {
+                    field: "capture.change_ratio",
+                    ..
+                })
+            ),
+            "a change ratio of exactly one should be rejected"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_change_ratio_just_below_one() {
+        let mut config = Config::default();
+        config.capture.change_ratio = 0.999;
+
+        assert!(
+            config.validate().is_ok(),
+            "a change ratio just below one should remain valid"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_saturated_pixel_threshold() {
+        let mut config = Config::default();
+        config.capture.change_pixel_threshold = 255;
+
+        // The `abs_diff` of two `u8` values can never exceed 255.
+        assert!(
+            matches!(
+                config.validate(),
+                Err(ConfigError::Invalid {
+                    field: "capture.change_pixel_threshold",
+                    ..
+                })
+            ),
+            "a saturated pixel threshold should be rejected"
+        );
+
+        config.capture.change_pixel_threshold = 254;
+        assert!(
+            config.validate().is_ok(),
+            "a pixel threshold of 254 should remain valid"
+        );
     }
 
     #[test]
