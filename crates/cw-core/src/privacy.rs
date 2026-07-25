@@ -1,9 +1,8 @@
 /// True when `foreground_process` (a full path or a bare file name) matches any blacklist entry.
-/// The file-name component is compared with Unicode case folding (`unicase::eq`) as whole-string
-/// equality, with no globs and no substring matching.
-/// This is deliberately more permissive than the way Windows itself compares file names, because
-/// for a privacy blacklist, matching one screen too many is safer than recording a screen the user
-/// explicitly excluded.
+/// The file-name component is compared exactly the way Windows compares file names: ordinal and
+/// case-insensitive, using whole-string equality with no globs and no substring matching.
+/// Matching a name Windows considers a different file would suppress a program the user never
+/// named.
 pub fn is_blacklisted(foreground_process: &str, blacklist: &[String]) -> bool {
     let Some(foreground_file_name) = file_name_component(foreground_process) else {
         return false;
@@ -11,8 +10,26 @@ pub fn is_blacklisted(foreground_process: &str, blacklist: &[String]) -> bool {
 
     blacklist.iter().any(|entry| {
         file_name_component(entry)
-            .is_some_and(|entry_file_name| unicase::eq(foreground_file_name, entry_file_name))
+            .is_some_and(|entry_file_name| file_names_equal(foreground_file_name, entry_file_name))
     })
+}
+
+/// Whether two file-name components denote the same file on Windows.
+///
+/// Windows decides this with an ordinal, case-insensitive comparison, so that is what we call.
+/// No Unicode rule reproduces it: Windows folds ASCII, Cyrillic and accented letters, but keeps
+/// Greek final sigma, sharp s and ligatures distinct, and `NtfsDisableCaseSensitivity`-style
+/// behaviour is the OS's to define, not ours to approximate.
+fn file_names_equal(left: &str, right: &str) -> bool {
+    let left: Vec<u16> = left.encode_utf16().collect();
+    let right: Vec<u16> = right.encode_utf16().collect();
+    let result =
+        unsafe { windows::Win32::Globalization::CompareStringOrdinal(&left, &right, true) };
+
+    // A zero return means the call itself failed. Treat that as a match, so a comparison we could
+    // not perform never ends with recording a screen the user explicitly excluded.
+    result != windows::Win32::Globalization::CSTR_LESS_THAN
+        && result != windows::Win32::Globalization::CSTR_GREATER_THAN
 }
 
 fn file_name_component(path: &str) -> Option<&str> {
@@ -113,42 +130,26 @@ mod tests {
     }
 
     #[test]
-    fn blacklist_matches_greek_sigma_case_variants() {
-        let uppercase_sigma_entry = "\u{039F}\u{03A3}.exe"; // ΟΣ.exe
-        let final_sigma_entry = "\u{039F}\u{03C2}.exe"; // Ος.exe
-        let uppercase_sigma_input = "\u{039F}\u{03A3}.EXE"; // ΟΣ.EXE
-        let sigma_input = "\u{03C3}.exe"; // σ.exe
-        let omega_entry = "\u{03C9}.exe"; // ω.exe
+    fn blacklist_follows_windows_file_name_identity() {
+        // Every row was verified by creating both names in one directory on NTFS and observing
+        // whether one file or two resulted. The false rows are genuinely different files, so
+        // suppressing them would cost the user history for a program they never named.
+        let cases = [
+            ("\u{041A}i.exe", "\u{043A}i.exe", true), // Cyrillic capital ka / small ka
+            ("\u{00E9}.exe", "\u{00C9}.exe", true), // Latin small e with acute / capital E with acute
+            ("\u{039F}\u{03C2}.exe", "\u{039F}\u{03A3}.exe", false), // Greek omicron and final sigma / omicron and capital sigma
+            ("stra\u{00DF}e.exe", "STRA\u{1E9E}E.EXE", false), // Latin small sharp s / capital sharp s
+            ("stra\u{00DF}e.exe", "STRASSE.EXE", false), // Latin small sharp s / ASCII double s
+            ("\u{FB01}le.exe", "FILE.EXE", false),       // Latin small ligature fi / ASCII FI
+        ];
 
-        assert!(
-            is_blacklisted(final_sigma_entry, &[uppercase_sigma_entry.to_owned()]),
-            "a Greek final sigma should match the uppercase sigma variant"
-        );
-        assert!(
-            is_blacklisted(uppercase_sigma_input, &[final_sigma_entry.to_owned()]),
-            "an uppercase Greek sigma should match the final sigma variant"
-        );
-        assert!(
-            !is_blacklisted(sigma_input, &[omega_entry.to_owned()]),
-            "different Greek letters must not match"
-        );
-    }
-
-    #[test]
-    fn blacklist_matches_sharp_s_case_variants() {
-        let sharp_s_entry = "stra\u{00DF}e.exe"; // straße.exe
-        let capital_sharp_s_input = "STRA\u{1E9E}E.EXE"; // STRAẞE.EXE
-        let double_s_input = "STRASSE.EXE";
-
-        // The sharp-s/capital-sharp-s pair is the regression f686dcc introduced by uppercasing.
-        assert!(
-            is_blacklisted(capital_sharp_s_input, &[sharp_s_entry.to_owned()]),
-            "a lowercase sharp s should match the uppercase sharp s variant"
-        );
-        assert!(
-            is_blacklisted(double_s_input, &[sharp_s_entry.to_owned()]),
-            "a lowercase sharp s should match the double-s case-folded variant"
-        );
+        for (entry, foreground, expected) in cases {
+            assert_eq!(
+                is_blacklisted(foreground, &[entry.to_owned()]),
+                expected,
+                "Windows file-name identity for entry {entry:?} and foreground {foreground:?} should be {expected}"
+            );
+        }
     }
 
     #[test]
