@@ -200,6 +200,13 @@ pub enum ConfigError {
         /// Underlying filesystem error.
         source: std::io::Error,
     },
+    #[error("failed to write config file {path}: {source}")]
+    Write {
+        /// Path that could not be written.
+        path: std::path::PathBuf,
+        /// Underlying filesystem error.
+        source: std::io::Error,
+    },
     /// The configuration file did not contain valid TOML for [`Config`].
     #[error("failed to parse config file {path}: {source}")]
     Parse {
@@ -275,39 +282,46 @@ impl Config {
     /// when it does not exist yet. Returns `true` when a file was created, `false` when one
     /// was already present. Never overwrites an existing file.
     pub fn write_default_if_missing(path: &std::path::Path) -> Result<bool, ConfigError> {
+        if path.exists() {
+            return Ok(false);
+        }
+
         if let Some(parent) = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
         {
-            std::fs::create_dir_all(parent).map_err(|source| ConfigError::Read {
+            std::fs::create_dir_all(parent).map_err(|source| ConfigError::Write {
                 path: path.to_path_buf(),
                 source,
             })?;
         }
 
-        let mut file = match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)
-        {
-            Ok(file) => file,
-            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
-            Err(source) => {
-                return Err(ConfigError::Read {
-                    path: path.to_path_buf(),
-                    source,
-                });
-            }
-        };
+        let mut temporary = path.as_os_str().to_os_string();
+        temporary.push(format!(".tmp-{}", std::process::id()));
+        let temporary = std::path::PathBuf::from(temporary);
 
-        std::io::Write::write_all(&mut file, DEFAULT_CONFIG_TOML.as_bytes()).map_err(|source| {
-            ConfigError::Read {
+        let write_result = std::fs::File::create(&temporary).and_then(|mut file| {
+            std::io::Write::write_all(&mut file, DEFAULT_CONFIG_TOML.as_bytes())?;
+            file.sync_all()
+        });
+        if let Err(source) = write_result {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(ConfigError::Write {
                 path: path.to_path_buf(),
                 source,
-            }
-        })?;
+            });
+        }
 
-        Ok(true)
+        match std::fs::rename(&temporary, path) {
+            Ok(()) => Ok(true),
+            Err(source) => {
+                let _ = std::fs::remove_file(&temporary);
+                Err(ConfigError::Write {
+                    path: path.to_path_buf(),
+                    source,
+                })
+            }
+        }
     }
 
     /// Read `path`. A missing file is NOT an error: returns `Config::default()`.
@@ -461,6 +475,33 @@ mod tests {
             std::fs::read_to_string(&path).expect("the existing test config should be readable"),
             "user-owned contents",
             "an existing config file must never be overwritten"
+        );
+
+        std::fs::remove_dir_all(&temp_dir)
+            .expect("the default config test directory should be removable");
+    }
+
+    #[test]
+    fn write_default_if_missing_leaves_no_temporary_file() {
+        let temp_dir = unique_temp_path("write-default-no-temporary-file");
+        let path = temp_dir.join("config.toml");
+        assert!(!temp_dir.exists());
+
+        let created = Config::write_default_if_missing(&path)
+            .expect("the default config should be creatable");
+
+        assert!(created, "the first call should create the config file");
+        // A leftover temporary file would look like stale config and accumulate on failed first runs.
+        let entries: Vec<_> = std::fs::read_dir(&temp_dir)
+            .expect("the test config directory should be readable")
+            .collect::<Result<_, _>>()
+            .expect("the test config directory entries should be readable");
+        assert_eq!(entries.len(), 1, "only the config file should remain");
+        assert_eq!(
+            entries[0].file_name(),
+            path.file_name()
+                .expect("the test config path should have a file name"),
+            "the remaining entry should be the destination config"
         );
 
         std::fs::remove_dir_all(&temp_dir)
