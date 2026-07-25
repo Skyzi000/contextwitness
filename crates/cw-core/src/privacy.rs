@@ -1,7 +1,7 @@
 /// True when `foreground_process` (a full path or a bare file name) matches any blacklist entry.
 /// Matching rule (v1, deliberately simple): compare the file-name component only,
-/// case-insensitively, as a whole-string equality. No globs, no path matching, no substring
-/// matching.
+/// Unicode case-insensitively, as a whole-string equality. No globs, no path matching, no
+/// substring matching.
 pub fn is_blacklisted(foreground_process: &str, blacklist: &[String]) -> bool {
     let Some(foreground_file_name) = file_name_component(foreground_process) else {
         return false;
@@ -9,7 +9,7 @@ pub fn is_blacklisted(foreground_process: &str, blacklist: &[String]) -> bool {
 
     blacklist.iter().any(|entry| {
         file_name_component(entry).is_some_and(|entry_file_name| {
-            foreground_file_name.eq_ignore_ascii_case(entry_file_name)
+            foreground_file_name.to_lowercase() == entry_file_name.to_lowercase()
         })
     })
 }
@@ -94,6 +94,20 @@ mod tests {
         assert!(
             !is_blacklisted(r"C:\Windows\explorer.exe", &blacklist),
             "a different executable file name must not match"
+        );
+    }
+
+    #[test]
+    fn blacklist_matches_non_ascii_names_case_insensitively() {
+        let blacklist = ["КиПасс.exe".into()];
+
+        assert!(
+            is_blacklisted(r"C:\Program Files\Пример\КИПАСС.EXE", &blacklist),
+            "the file name should match regardless of Unicode case"
+        );
+        assert!(
+            !is_blacklisted(r"C:\Program Files\Пример\КИПАСЫ.EXE", &blacklist),
+            "a different non-ASCII executable file name must not match"
         );
     }
 

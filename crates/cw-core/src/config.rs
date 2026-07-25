@@ -1,5 +1,52 @@
 use serde::{Deserialize, Serialize};
 
+/// Commented TOML listing every setting at its built-in default. Written on first run so the
+/// user has a discoverable, editable starting point.
+pub const DEFAULT_CONFIG_TOML: &str = r#"# ContextWitness configuration.
+# Every value below is the built-in default; delete a line to keep using that default.
+
+[capture]
+# Seconds between capture attempts.
+interval_secs = 2
+# A pixel counts as changed when its grayscale value moves by more than this (0-255).
+change_pixel_threshold = 8
+# Store and OCR a frame once this fraction of pixels changed. Lower is more sensitive.
+change_ratio = 0.002
+# WebP encoder quality (0-100).
+webp_quality = 75
+
+[ocr]
+# Languages offered to the OCR engine, most important first.
+languages = ["ja", "en"]
+
+[storage]
+# Where captures and the database live. Empty means the per-user local data directory.
+data_dir = ""
+# Delete stored images older than this many days.
+image_retention_days = 14
+# Delete the oldest images once stored images exceed this size, in GiB.
+image_retention_max_gib = 50
+
+[privacy]
+# Capture stops entirely while one of these executables is in the foreground.
+# Matched case-insensitively against the executable file name, e.g. ["KeePass.exe"].
+process_blacklist = []
+
+[hindsight]
+# Memory bank that receives episodes.
+bank_id = "contextwitness"
+# Context label sent with every episode.
+context_label = "screen capture"
+
+[episode]
+# Observations are grouped into episodes of this length.
+window_minutes = 5
+
+[activitywatch]
+# Reserved for a future release; ActivityWatch is not part of v1.
+enabled = false
+"#;
+
 /// Complete ContextWitness configuration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
@@ -159,6 +206,14 @@ pub enum ConfigError {
         /// Underlying TOML deserialization error.
         source: toml::de::Error,
     },
+    /// A parsed configuration value would break collection.
+    #[error("invalid configuration value for {field}: {reason}")]
+    Invalid {
+        /// TOML path of the invalid field.
+        field: &'static str,
+        /// Explanation of the accepted values.
+        reason: String,
+    },
     /// A per-user directory could not be resolved.
     #[error("could not resolve {what} directory for this user")]
     UnresolvedDir {
@@ -171,6 +226,87 @@ impl Config {
     /// Parse from a TOML string. Unknown keys are an error (typos must not be silently ignored).
     pub fn from_toml_str(text: &str) -> Result<Config, toml::de::Error> {
         toml::from_str(text)
+    }
+
+    /// Reject values that parse but would break collection. Called by [`Config::load_from_path`].
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if !self.capture.change_ratio.is_finite()
+            || !(0.0..=1.0).contains(&self.capture.change_ratio)
+        {
+            return Err(ConfigError::Invalid {
+                field: "capture.change_ratio",
+                reason: "must be a finite fraction between 0.0 and 1.0".to_owned(),
+            });
+        }
+
+        if self.capture.interval_secs < 1 {
+            return Err(ConfigError::Invalid {
+                field: "capture.interval_secs",
+                reason: "must be at least 1 second".to_owned(),
+            });
+        }
+
+        if self.capture.webp_quality > 100 {
+            return Err(ConfigError::Invalid {
+                field: "capture.webp_quality",
+                reason: "must be between 0 and 100".to_owned(),
+            });
+        }
+
+        if self.episode.window_minutes < 1 {
+            return Err(ConfigError::Invalid {
+                field: "episode.window_minutes",
+                reason: "must be at least 1 minute".to_owned(),
+            });
+        }
+
+        if self.hindsight.bank_id.trim().is_empty() {
+            return Err(ConfigError::Invalid {
+                field: "hindsight.bank_id",
+                reason: "must not be empty".to_owned(),
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Create `path` (and any missing parent directories) containing [`DEFAULT_CONFIG_TOML`]
+    /// when it does not exist yet. Returns `true` when a file was created, `false` when one
+    /// was already present. Never overwrites an existing file.
+    pub fn write_default_if_missing(path: &std::path::Path) -> Result<bool, ConfigError> {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            std::fs::create_dir_all(parent).map_err(|source| ConfigError::Read {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        }
+
+        let mut file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+        {
+            Ok(file) => file,
+            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+            Err(source) => {
+                return Err(ConfigError::Read {
+                    path: path.to_path_buf(),
+                    source,
+                });
+            }
+        };
+
+        std::io::Write::write_all(&mut file, DEFAULT_CONFIG_TOML.as_bytes()).map_err(|source| {
+            ConfigError::Read {
+                path: path.to_path_buf(),
+                source,
+            }
+        })?;
+
+        Ok(true)
     }
 
     /// Read `path`. A missing file is NOT an error: returns `Config::default()`.
@@ -189,10 +325,13 @@ impl Config {
             }
         };
 
-        Self::from_toml_str(&text).map_err(|source| ConfigError::Parse {
+        let config = Self::from_toml_str(&text).map_err(|source| ConfigError::Parse {
             path: path.to_path_buf(),
             source,
-        })
+        })?;
+        config.validate()?;
+
+        Ok(config)
     }
 }
 
@@ -276,6 +415,192 @@ mod tests {
         assert_eq!(config.hindsight.context_label, "screen capture");
         assert_eq!(config.episode.window_minutes, 5);
         assert!(!config.activitywatch.enabled);
+    }
+
+    #[test]
+    fn default_config_template_parses_to_defaults() {
+        let config = Config::from_toml_str(DEFAULT_CONFIG_TOML)
+            .expect("the built-in default config template should parse");
+
+        assert_eq!(
+            config,
+            Config::default(),
+            "the built-in config template should stay aligned with the defaults"
+        );
+    }
+
+    #[test]
+    fn write_default_if_missing_creates_file_and_parents() {
+        let temp_dir = unique_temp_path("write-default");
+        let path = temp_dir.join("nested").join("config.toml");
+        assert!(!temp_dir.exists());
+
+        let created = Config::write_default_if_missing(&path)
+            .expect("the default config and its parent directories should be creatable");
+
+        assert!(created, "the first call should create the config file");
+        assert!(path.exists(), "the default config file should exist");
+        assert_eq!(
+            std::fs::read_to_string(&path)
+                .expect("the newly created default config should be readable"),
+            DEFAULT_CONFIG_TOML,
+            "the created file should contain the exact default config template"
+        );
+
+        std::fs::write(&path, "user-owned contents")
+            .expect("the test config should be replaceable before the second call");
+        let created_again = Config::write_default_if_missing(&path)
+            .expect("an existing config should not make default creation fail");
+
+        assert!(
+            !created_again,
+            "the second call should report that the config already exists"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("the existing test config should be readable"),
+            "user-owned contents",
+            "an existing config file must never be overwritten"
+        );
+
+        std::fs::remove_dir_all(&temp_dir)
+            .expect("the default config test directory should be removable");
+    }
+
+    #[test]
+    fn validate_accepts_defaults() {
+        assert!(
+            Config::default().validate().is_ok(),
+            "the built-in defaults should be semantically valid"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_nan_change_ratio() {
+        let mut config = Config::default();
+        config.capture.change_ratio = f64::NAN;
+
+        // frame_changed compares with `>`, so NaN silently disables all capture.
+        assert!(
+            matches!(
+                config.validate(),
+                Err(ConfigError::Invalid {
+                    field: "capture.change_ratio",
+                    ..
+                })
+            ),
+            "a NaN change ratio should be rejected"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_out_of_range_change_ratio() {
+        for change_ratio in [-1.0, 2.0] {
+            let mut config = Config::default();
+            config.capture.change_ratio = change_ratio;
+
+            assert!(
+                matches!(
+                    config.validate(),
+                    Err(ConfigError::Invalid {
+                        field: "capture.change_ratio",
+                        ..
+                    })
+                ),
+                "an out-of-range change ratio should be rejected: {change_ratio}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_zero_interval() {
+        let mut config = Config::default();
+        config.capture.interval_secs = 0;
+
+        assert!(
+            matches!(
+                config.validate(),
+                Err(ConfigError::Invalid {
+                    field: "capture.interval_secs",
+                    ..
+                })
+            ),
+            "a zero capture interval should be rejected"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_zero_window_minutes() {
+        let mut config = Config::default();
+        config.episode.window_minutes = 0;
+
+        assert!(
+            matches!(
+                config.validate(),
+                Err(ConfigError::Invalid {
+                    field: "episode.window_minutes",
+                    ..
+                })
+            ),
+            "a zero episode window should be rejected"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_excessive_webp_quality() {
+        let mut config = Config::default();
+        config.capture.webp_quality = 101;
+
+        assert!(
+            matches!(
+                config.validate(),
+                Err(ConfigError::Invalid {
+                    field: "capture.webp_quality",
+                    ..
+                })
+            ),
+            "WebP quality above 100 should be rejected"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_blank_bank_id() {
+        let mut config = Config::default();
+        config.hindsight.bank_id = "   ".to_owned();
+
+        assert!(
+            matches!(
+                config.validate(),
+                Err(ConfigError::Invalid {
+                    field: "hindsight.bank_id",
+                    ..
+                })
+            ),
+            "a whitespace-only Hindsight bank ID should be rejected"
+        );
+    }
+
+    #[test]
+    fn load_from_path_rejects_invalid_values() {
+        let temp_dir = unique_temp_path("invalid-values");
+        std::fs::create_dir(&temp_dir).expect("the unique test directory should be creatable");
+        let path = temp_dir.join("config.toml");
+        std::fs::write(&path, "[capture]\nchange_ratio = 2.0\n")
+            .expect("the semantically invalid test config should be writable");
+
+        let result = Config::load_from_path(&path);
+
+        std::fs::remove_file(&path).expect("the invalid test config should be removable");
+        std::fs::remove_dir(&temp_dir).expect("the empty test directory should be removable");
+        assert!(
+            matches!(
+                result,
+                Err(ConfigError::Invalid {
+                    field: "capture.change_ratio",
+                    ..
+                })
+            ),
+            "loading should reject a semantically invalid config"
+        );
     }
 
     #[test]
