@@ -14,3 +14,4 @@ chrono.workspace = true
 ulid.workspace = true
 toml.workspace = true
 dirs.workspace = true
+unicase.workspace = true

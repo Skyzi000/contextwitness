@@ -1,18 +1,17 @@
 /// True when `foreground_process` (a full path or a bare file name) matches any blacklist entry.
-/// Matching rule (v1, deliberately simple): compare the file-name component only,
-/// uppercasing both sides the way Windows compares file names, as a whole-string equality. No
-/// globs, no path matching, no substring matching. This deliberately over-matches Unicode edge
-/// cases such as `ß` uppercasing to `SS`; for a privacy blacklist, skipping too much is safer than
-/// failing to honor an exclusion.
+/// The file-name component is compared with Unicode case folding (`unicase::eq`) as whole-string
+/// equality, with no globs and no substring matching.
+/// This is deliberately more permissive than the way Windows itself compares file names, because
+/// for a privacy blacklist, matching one screen too many is safer than recording a screen the user
+/// explicitly excluded.
 pub fn is_blacklisted(foreground_process: &str, blacklist: &[String]) -> bool {
     let Some(foreground_file_name) = file_name_component(foreground_process) else {
         return false;
     };
 
     blacklist.iter().any(|entry| {
-        file_name_component(entry).is_some_and(|entry_file_name| {
-            foreground_file_name.to_uppercase() == entry_file_name.to_uppercase()
-        })
+        file_name_component(entry)
+            .is_some_and(|entry_file_name| unicase::eq(foreground_file_name, entry_file_name))
     })
 }
 
@@ -132,6 +131,23 @@ mod tests {
         assert!(
             !is_blacklisted(sigma_input, &[omega_entry.to_owned()]),
             "different Greek letters must not match"
+        );
+    }
+
+    #[test]
+    fn blacklist_matches_sharp_s_case_variants() {
+        let sharp_s_entry = "stra\u{00DF}e.exe"; // straße.exe
+        let capital_sharp_s_input = "STRA\u{1E9E}E.EXE"; // STRAẞE.EXE
+        let double_s_input = "STRASSE.EXE";
+
+        // The sharp-s/capital-sharp-s pair is the regression f686dcc introduced by uppercasing.
+        assert!(
+            is_blacklisted(capital_sharp_s_input, &[sharp_s_entry.to_owned()]),
+            "a lowercase sharp s should match the uppercase sharp s variant"
+        );
+        assert!(
+            is_blacklisted(double_s_input, &[sharp_s_entry.to_owned()]),
+            "a lowercase sharp s should match the double-s case-folded variant"
         );
     }
 

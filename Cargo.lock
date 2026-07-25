@@ -87,6 +87,7 @@ dependencies = [
  "thiserror",
  "toml",
  "ulid",
+ "unicase",
 ]
 
 [[package]]
@@ -558,6 +559,12 @@ dependencies = [
  "serde",
  "web-time",
 ]
+
+[[package]]
+name = "unicase"
+version = "2.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dbc4bc3a9f746d862c45cb89d705aa10f187bb96c76001afab07a0d35ce60142"
 
 [[package]]
 name = "unicode-ident"
