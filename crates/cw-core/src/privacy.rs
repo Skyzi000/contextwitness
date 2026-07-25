@@ -1,8 +1,8 @@
 /// True when `foreground_process` (a full path or a bare file name) matches any blacklist entry.
-/// The file-name component is compared exactly the way Windows compares file names: ordinal and
-/// case-insensitive, using whole-string equality with no globs and no substring matching.
-/// Matching a name Windows considers a different file would suppress a program the user never
-/// named.
+/// The file-name component is compared with Windows' default file-name comparison: ordinal and
+/// case-insensitive, as whole-string equality with no globs and no substring matching.
+/// Treating a name Windows considers different as a match would suppress a program the user never
+/// named. See [`file_names_equal`] for what this does and does not guarantee.
 pub fn is_blacklisted(foreground_process: &str, blacklist: &[String]) -> bool {
     let Some(foreground_file_name) = file_name_component(foreground_process) else {
         return false;
@@ -14,12 +14,17 @@ pub fn is_blacklisted(foreground_process: &str, blacklist: &[String]) -> bool {
     })
 }
 
-/// Whether two file-name components denote the same file on Windows.
+/// Whether two file-name components are the same name under Windows' default file-name comparison.
 ///
-/// Windows decides this with an ordinal, case-insensitive comparison, so that is what we call.
-/// No Unicode rule reproduces it: Windows folds ASCII, Cyrillic and accented letters, but keeps
-/// Greek final sigma, sharp s and ligatures distinct, and `NtfsDisableCaseSensitivity`-style
-/// behaviour is the OS's to define, not ours to approximate.
+/// Windows makes that judgement with an ordinal, case-insensitive comparison, so that is what we
+/// call. No Unicode rule reproduces it: Windows folds ASCII, Cyrillic and accented letters, but
+/// keeps Greek final sigma, sharp s and ligatures distinct.
+///
+/// This is a NAME comparison, not a file-identity check. A directory with per-directory case
+/// sensitivity enabled can hold `Foo.exe` and `foo.exe` as two distinct files, and this function
+/// still reports them equal. That is accepted deliberately: a blacklist entry is a bare executable
+/// name the user typed rather than a path, so there is no directory to consult, and case-sensitive
+/// directories exist for WSL interop rather than for installed Windows applications.
 fn file_names_equal(left: &str, right: &str) -> bool {
     let left: Vec<u16> = left.encode_utf16().collect();
     let right: Vec<u16> = right.encode_utf16().collect();
