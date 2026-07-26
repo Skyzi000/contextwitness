@@ -69,9 +69,9 @@ pub fn window_start(
 /// Ids and metadata stay UTC regardless. A window that straddles a DST transition renders every
 /// line at the single supplied offset; the header prints the offset, so the result stays readable.
 ///
-/// The fold relation is currently an equivalence relation, so comparing against the last kept
-/// entry and the immediately preceding one agree. Keep `Vec::dedup_by`'s last-kept behavior
-/// regardless: a future rule that is not an equivalence relation would need it.
+/// The fold relation is field-wise equality and therefore an equivalence relation, so comparing
+/// against the last kept entry and the immediately preceding one agree. Keep `Vec::dedup_by`'s
+/// last-kept behavior regardless: a future rule that is not an equivalence relation would need it.
 pub fn build_episode(
     window_start: chrono::DateTime<chrono::Utc>,
     window_minutes: u32,
@@ -105,25 +105,23 @@ pub fn build_episode(
         },
     );
     entries.dedup_by(|current, previous| {
+        // Fold only when this entry would render exactly the line the last kept one already put in
+        // the document; then it adds nothing but a timestamp, which is the premise of folding.
+        //
+        // `dhash` is deliberately absent. A 9x8 fingerprint does not move when text is typed — zero
+        // differing bits measured for ten characters on every supported configuration, and zero for
+        // four hundred at 3840x2160 — so equal fingerprints never justified a deletion. Requiring
+        // them to match is also backwards for playback, where the fingerprint moves every frame and
+        // would keep about 150 identical text-free lines for a five-minute video.
         let current = current.1;
         let previous = previous.1;
 
         current.monitor_id == previous.monitor_id
-            && match (current.ocr_text.as_deref(), previous.ocr_text.as_deref()) {
-                (Some(current), Some(previous)) => current == previous,
-                (None, None) => {
-                    // `NoText` and `Failed` both leave `ocr_text` empty, so comparing the
-                    // fingerprint alone deletes a failure that follows a no-text frame on an
-                    // unchanged screen — the likely case rather than a corner one. A failure must
-                    // stay visible in the body and keep its image reference for a later re-OCR.
-                    // Two identical failures on an unchanged screen still fold because they say
-                    // the same thing.
-                    current.dhash == previous.dhash
-                        && current.ocr_status == previous.ocr_status
-                        && current.ocr_error == previous.ocr_error
-                }
-                _ => false,
-            }
+            && current.foreground_process == previous.foreground_process
+            && current.foreground_window_title == previous.foreground_window_title
+            && current.ocr_status == previous.ocr_status
+            && current.ocr_error == previous.ocr_error
+            && current.ocr_text == previous.ocr_text
     });
 
     if entries.is_empty() {
@@ -540,50 +538,108 @@ Monitor DISPLAY2 (1920x1080):
     }
 
     #[test]
-    fn text_free_entries_collapse_only_when_the_fingerprint_matches() {
-        let matching = vec![
+    fn text_free_entries_fold_across_a_changed_fingerprint() {
+        // This is a video playing: the fingerprint moves on every frame while the document line
+        // stays identical, and the old rule kept every one of them.
+        let observations = vec![
             observation(
                 1,
                 "2026-07-24T16:00:01Z",
-                screen_payload("DISPLAY1", 1, OcrStatus::NoText, None),
+                ScreenPayload {
+                    foreground_process: Some("vlc.exe".to_owned()),
+                    foreground_window_title: Some("Movie".to_owned()),
+                    ..screen_payload("DISPLAY1", 1, OcrStatus::NoText, None)
+                },
             ),
             observation(
                 2,
                 "2026-07-24T16:00:02Z",
-                screen_payload("DISPLAY1", 1, OcrStatus::NoText, None),
+                ScreenPayload {
+                    foreground_process: Some("vlc.exe".to_owned()),
+                    foreground_window_title: Some("Movie".to_owned()),
+                    ..screen_payload("DISPLAY1", 2, OcrStatus::NoText, None)
+                },
             ),
         ];
-        let matching_episode = build_episode(
+        let episode = build_episode(
             timestamp("2026-07-24T16:00:00Z"),
             5,
             FixedOffset::east_opt(0).expect("UTC offset should be valid"),
-            &matching,
+            &observations,
         )
         .expect("the observations should build an episode");
 
-        assert_eq!(matching_episode.metadata.entry_count, "1");
+        assert_eq!(episode.metadata.entry_count, "1");
+    }
 
-        let different = vec![
+    #[test]
+    fn a_different_application_keeps_the_entry_even_with_an_identical_fingerprint() {
+        // The fingerprint says nothing here: the switch between two text-free applications is the
+        // only thing the entry records, and the old rule deleted it.
+        let observations = vec![
             observation(
                 1,
                 "2026-07-24T16:00:01Z",
-                screen_payload("DISPLAY1", 1, OcrStatus::NoText, None),
+                ScreenPayload {
+                    foreground_process: Some("vlc.exe".to_owned()),
+                    ..screen_payload("DISPLAY1", 1, OcrStatus::NoText, None)
+                },
             ),
             observation(
                 2,
                 "2026-07-24T16:00:02Z",
-                screen_payload("DISPLAY1", 2, OcrStatus::NoText, None),
+                ScreenPayload {
+                    foreground_process: Some("game.exe".to_owned()),
+                    ..screen_payload("DISPLAY1", 1, OcrStatus::NoText, None)
+                },
             ),
         ];
-        let different_episode = build_episode(
+        let episode = build_episode(
             timestamp("2026-07-24T16:00:00Z"),
             5,
             FixedOffset::east_opt(0).expect("UTC offset should be valid"),
-            &different,
+            &observations,
         )
         .expect("the observations should build an episode");
 
-        assert_eq!(different_episode.metadata.entry_count, "2");
+        assert_eq!(episode.metadata.entry_count, "2");
+        assert!(episode.content.contains("vlc.exe"));
+        assert!(episode.content.contains("game.exe"));
+    }
+
+    #[test]
+    fn a_changed_window_title_keeps_the_entry() {
+        let observations = vec![
+            observation(
+                1,
+                "2026-07-24T16:00:01Z",
+                ScreenPayload {
+                    foreground_process: Some("editor.exe".to_owned()),
+                    foreground_window_title: Some("first.txt".to_owned()),
+                    ..screen_payload("DISPLAY1", 1, OcrStatus::Succeeded, Some("same text"))
+                },
+            ),
+            observation(
+                2,
+                "2026-07-24T16:00:02Z",
+                ScreenPayload {
+                    foreground_process: Some("editor.exe".to_owned()),
+                    foreground_window_title: Some("second.txt".to_owned()),
+                    ..screen_payload("DISPLAY1", 1, OcrStatus::Succeeded, Some("same text"))
+                },
+            ),
+        ];
+        let episode = build_episode(
+            timestamp("2026-07-24T16:00:00Z"),
+            5,
+            FixedOffset::east_opt(0).expect("UTC offset should be valid"),
+            &observations,
+        )
+        .expect("the observations should build an episode");
+
+        assert_eq!(episode.metadata.entry_count, "2");
+        assert!(episode.content.contains("first.txt"));
+        assert!(episode.content.contains("second.txt"));
     }
 
     #[test]
@@ -617,7 +673,7 @@ Monitor DISPLAY2 (1920x1080):
     }
 
     #[test]
-    fn identical_failures_on_an_unchanged_screen_fold_but_different_ones_do_not() {
+    fn identical_failures_fold_but_different_errors_do_not() {
         let failures = |second_error: &str| {
             vec![
                 observation(
@@ -633,7 +689,7 @@ Monitor DISPLAY2 (1920x1080):
                     "2026-07-24T16:00:02Z",
                     ScreenPayload {
                         ocr_error: Some(second_error.to_owned()),
-                        ..screen_payload("DISPLAY1", 1, OcrStatus::Failed, None)
+                        ..screen_payload("DISPLAY1", 2, OcrStatus::Failed, None)
                     },
                 ),
             ]
