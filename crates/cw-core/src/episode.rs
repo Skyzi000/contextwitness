@@ -1,16 +1,21 @@
 //! Grouping observations into fixed-length episodes for delivery.
 
+const SCREEN_SOURCE: &str = "screen";
+
 /// A finished episode: the exact text and metadata that will be stored and delivered.
 ///
 /// There is deliberately no `id` field — the ULID is assigned by the store when the row is
 /// inserted, so that building an episode twice yields two equal values.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Episode {
+    /// Source that produced this episode; goes straight into the `episodes.source` column and is
+    /// the prefix of `document_id`, so the two can never disagree.
+    pub source: &'static str,
     /// Inclusive start of the window.
     pub start_at: chrono::DateTime<chrono::Utc>,
     /// Exclusive end of the window.
     pub end_at: chrono::DateTime<chrono::Utc>,
-    /// Stable Hindsight document id derived from `start_at`.
+    /// Stable Hindsight document id derived from the source, window start, and window length.
     pub document_id: String,
     /// Rendered delivery text.
     pub content: String,
@@ -59,6 +64,10 @@ pub fn window_start(
 /// passes the machine's local offset, so a memory reads back in the time the user experienced.
 /// Ids and metadata stay UTC regardless. A window that straddles a DST transition renders every
 /// line at the single supplied offset; the header prints the offset, so the result stays readable.
+///
+/// The fold relation is currently an equivalence relation, so comparing against the last kept
+/// entry and the immediately preceding one agree. Keep `Vec::dedup_by`'s last-kept behavior
+/// regardless: a future rule that is not an equivalence relation would need it.
 pub fn build_episode(
     window_start: chrono::DateTime<chrono::Utc>,
     window_minutes: u32,
@@ -96,14 +105,11 @@ pub fn build_episode(
         let previous = previous.1;
 
         current.monitor_id == previous.monitor_id
-            && (current.dhash == previous.dhash
-                || matches!(
-                    (
-                        current.ocr_text.as_deref(),
-                        previous.ocr_text.as_deref()
-                    ),
-                    (Some(current), Some(previous)) if current == previous
-                ))
+            && match (current.ocr_text.as_deref(), previous.ocr_text.as_deref()) {
+                (Some(current), Some(previous)) => current == previous,
+                (None, None) => current.dhash == previous.dhash,
+                _ => false,
+            }
     });
 
     if entries.is_empty() {
@@ -186,9 +192,10 @@ pub fn build_episode(
     let episode_end = end_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
     Some(Episode {
+        source: SCREEN_SOURCE,
         start_at: window_start,
         end_at,
-        document_id: format!("screen-{episode_start}"),
+        document_id: format!("{SCREEN_SOURCE}-{episode_start}-{window_minutes}m"),
         content: lines.join("\n"),
         metadata: EpisodeMetadata {
             episode_start,
@@ -351,7 +358,29 @@ mod tests {
     }
 
     #[test]
-    fn document_id_is_derived_from_window_start() {
+    fn document_id_identifies_the_window_including_its_length() {
+        let start = timestamp("2026-07-24T16:00:00Z");
+        let offset = FixedOffset::east_opt(9 * 3600).expect("test offset should be valid");
+        let observations = golden_observations();
+        let five_minute_episode = build_episode(start, 5, offset, &observations)
+            .expect("the golden observations should build an episode");
+
+        assert_eq!(
+            five_minute_episode.document_id,
+            "screen-2026-07-24T16:00:00Z-5m"
+        );
+
+        let ten_minute_episode = build_episode(start, 10, offset, &observations)
+            .expect("the golden observations should build an episode");
+
+        assert_ne!(
+            ten_minute_episode.document_id,
+            five_minute_episode.document_id
+        );
+    }
+
+    #[test]
+    fn episode_carries_the_source_the_store_column_needs() {
         let episode = build_episode(
             timestamp("2026-07-24T16:00:00Z"),
             5,
@@ -360,7 +389,8 @@ mod tests {
         )
         .expect("the golden observations should build an episode");
 
-        assert_eq!(episode.document_id, "screen-2026-07-24T16:00:00Z");
+        assert_eq!(episode.source, "screen");
+        assert!(episode.document_id.starts_with(episode.source));
     }
 
     #[test]
@@ -399,7 +429,10 @@ Monitor DISPLAY2 (1920x1080):
     }
 
     #[test]
-    fn consecutive_same_dhash_entries_are_collapsed() {
+    fn same_dhash_with_different_ocr_text_is_never_collapsed() {
+        // A 9x8 fingerprint does not move when ten characters are typed: zero differing bits were
+        // measured on every supported configuration, and still zero for up to 400 characters at
+        // 3840x2160. Folding on it would drop the OCR text this product exists to deliver.
         let observations = vec![
             observation(
                 1,
@@ -427,13 +460,9 @@ Monitor DISPLAY2 (1920x1080):
         )
         .expect("the observations should build an episode");
 
-        assert_eq!(episode.metadata.entry_count, 1);
-        assert_eq!(
-            episode.metadata.image_paths,
-            vec!["images/earlier.webp".to_owned()]
-        );
-        assert!(episode.content.ends_with("    earlier"));
-        assert!(!episode.content.contains("later"));
+        assert_eq!(episode.metadata.entry_count, 2);
+        assert!(episode.content.contains("earlier"));
+        assert!(episode.content.contains("later"));
     }
 
     #[test]
@@ -470,6 +499,80 @@ Monitor DISPLAY2 (1920x1080):
             episode.metadata.image_paths,
             vec!["images/earlier.webp".to_owned()]
         );
+    }
+
+    #[test]
+    fn text_free_entries_collapse_only_when_the_fingerprint_matches() {
+        let matching = vec![
+            observation(
+                1,
+                "2026-07-24T16:00:01Z",
+                screen_payload("DISPLAY1", 1, OcrStatus::NoText, None),
+            ),
+            observation(
+                2,
+                "2026-07-24T16:00:02Z",
+                screen_payload("DISPLAY1", 1, OcrStatus::NoText, None),
+            ),
+        ];
+        let matching_episode = build_episode(
+            timestamp("2026-07-24T16:00:00Z"),
+            5,
+            FixedOffset::east_opt(0).expect("UTC offset should be valid"),
+            &matching,
+        )
+        .expect("the observations should build an episode");
+
+        assert_eq!(matching_episode.metadata.entry_count, 1);
+
+        let different = vec![
+            observation(
+                1,
+                "2026-07-24T16:00:01Z",
+                screen_payload("DISPLAY1", 1, OcrStatus::NoText, None),
+            ),
+            observation(
+                2,
+                "2026-07-24T16:00:02Z",
+                screen_payload("DISPLAY1", 2, OcrStatus::NoText, None),
+            ),
+        ];
+        let different_episode = build_episode(
+            timestamp("2026-07-24T16:00:00Z"),
+            5,
+            FixedOffset::east_opt(0).expect("UTC offset should be valid"),
+            &different,
+        )
+        .expect("the observations should build an episode");
+
+        assert_eq!(different_episode.metadata.entry_count, 2);
+    }
+
+    #[test]
+    fn a_text_bearing_entry_never_collapses_into_a_text_free_one() {
+        let observations = vec![
+            observation(
+                1,
+                "2026-07-24T16:00:01Z",
+                screen_payload("DISPLAY1", 1, OcrStatus::NoText, None),
+            ),
+            observation(
+                2,
+                "2026-07-24T16:00:02Z",
+                screen_payload("DISPLAY1", 1, OcrStatus::Succeeded, Some("typed")),
+            ),
+        ];
+
+        let episode = build_episode(
+            timestamp("2026-07-24T16:00:00Z"),
+            5,
+            FixedOffset::east_opt(0).expect("UTC offset should be valid"),
+            &observations,
+        )
+        .expect("the observations should build an episode");
+
+        assert_eq!(episode.metadata.entry_count, 2);
+        assert!(episode.content.contains("typed"));
     }
 
     #[test]
@@ -594,7 +697,7 @@ Monitor DISPLAY2 (1920x1080):
     }
 
     #[test]
-    fn dedup_compares_against_the_last_kept_entry() {
+    fn a_run_of_identical_text_collapses_to_its_first_entry() {
         let observations = vec![
             observation(
                 1,
@@ -609,7 +712,7 @@ Monitor DISPLAY2 (1920x1080):
                 "2026-07-24T16:00:02Z",
                 ScreenPayload {
                     image_path: Some("images/b.webp".to_owned()),
-                    ..screen_payload("DISPLAY1", 1, OcrStatus::Succeeded, Some("y"))
+                    ..screen_payload("DISPLAY1", 2, OcrStatus::Succeeded, Some("x"))
                 },
             ),
             observation(
@@ -617,7 +720,7 @@ Monitor DISPLAY2 (1920x1080):
                 "2026-07-24T16:00:03Z",
                 ScreenPayload {
                     image_path: Some("images/c.webp".to_owned()),
-                    ..screen_payload("DISPLAY1", 2, OcrStatus::Succeeded, Some("y"))
+                    ..screen_payload("DISPLAY1", 3, OcrStatus::Succeeded, Some("x"))
                 },
             ),
         ];
@@ -630,14 +733,14 @@ Monitor DISPLAY2 (1920x1080):
         )
         .expect("the observations should build an episode");
 
-        assert_eq!(episode.metadata.entry_count, 2);
+        assert_eq!(episode.metadata.entry_count, 1);
         assert_eq!(
             episode.metadata.image_paths,
-            vec!["images/a.webp".to_owned(), "images/c.webp".to_owned()]
+            vec!["images/a.webp".to_owned()]
         );
         assert!(episode.content.contains("  16:00:01"));
         assert!(!episode.content.contains("  16:00:02"));
-        assert!(episode.content.contains("  16:00:03"));
+        assert!(!episode.content.contains("  16:00:03"));
     }
 
     #[test]
