@@ -311,8 +311,11 @@ mod tests {
 
     #[test]
     fn the_same_edit_is_detected_at_every_display_scale() {
-        // Measured logical values: 853, 1138, 1238, 900 — all above the 600 default, against a
+        // Measured logical minima: 853, 1138, 1238, 1125, 900 — all above the 600 default, against a
         // source-pixel spread that put 5120x2880 @200% carets above Full HD ten-character edits.
+        // 3840x2160 appears at both 100% and 150% on purpose: unscaled 4K is an ordinary setup on a
+        // large panel, and measuring only one of the two scales is what made an earlier reading of
+        // which configuration is tightest come out backwards.
         // Bounds are the measured ten-character range over a full thumbnail-sample-period offset sweep, rounded
         // outward: a value sitting exactly on a measured edge must be inside. They pin the
         // calibration the default rests on — a change to the resize filter, the glyph fixture or
@@ -322,6 +325,7 @@ mod tests {
             (1024, 768, 1.0, 853.0, 1302.0),
             (1366, 768, 1.0, 1138.0, 1480.0),
             (1920, 1080, 1.0, 1237.0, 1857.0),
+            (3840, 2160, 1.0, 1125.0, 2700.0),
             (3840, 2160, 1.5, 900.0, 1800.0),
         ] {
             let before = solid(width, height, 200);
@@ -352,7 +356,10 @@ mod tests {
 
     #[test]
     fn a_caret_is_ignored_at_every_display_scale() {
-        // Measured logical maxima: 149, 171, 225, 400.
+        // Measured logical maxima: 149, 171, 225, 450, 400. 3840x2160 at 100% is the tightest
+        // configuration in the supported range — 450 against a 600 default — and the only realistic
+        // one where a caret can measure exactly 0, because at that sample granularity one character
+        // can split across four samples with none of them crossing the per-pixel threshold.
         // Bounds are the measured caret range over a full thumbnail-sample-period offset sweep, rounded
         // outward: a value sitting exactly on a measured edge must be inside. They pin the
         // calibration the default rests on — a change to the resize filter, the glyph fixture or
@@ -362,6 +369,7 @@ mod tests {
             (1024, 768, 1.0, 85.0, 150.0),
             (1366, 768, 1.0, 85.0, 171.0),
             (1920, 1080, 1.0, 112.0, 225.0),
+            (3840, 2160, 1.0, 0.0, 450.0),
             (3840, 2160, 1.5, 100.0, 400.0),
         ] {
             let before = solid(width, height, 200);
