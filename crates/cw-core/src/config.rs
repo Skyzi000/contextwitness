@@ -10,10 +10,10 @@ pub const DEFAULT_CONFIG_TOML: &str = r#"# ContextWitness configuration.
 interval_secs = 2
 # A pixel counts as changed when its grayscale value moves by more than this (0-254).
 change_pixel_threshold = 8
-# Store and OCR a frame once more than this many screen pixels changed.
-# Counted in source-screen pixels, so the same edit behaves the same on every monitor.
-# The default is roughly seven to ten characters of text.
-change_area_pixels = 1000
+# Store and OCR a frame once more than this many logical pixels changed.
+# Logical means at 100% display scaling, so the same edit behaves the same on a 1080p screen
+# and on a 4K screen at 200%. The default is roughly ten characters of text.
+change_area_logical_pixels = 600
 # WebP encoder quality (0-100).
 webp_quality = 75
 
@@ -79,8 +79,8 @@ pub struct CaptureConfig {
     pub interval_secs: u64,
     /// Per-pixel luma delta from 0 through 255.
     pub change_pixel_threshold: u8,
-    /// Capture once more than this many source-screen pixels changed since the stored frame.
-    pub change_area_pixels: u32,
+    /// Capture once more than this many logical pixels changed since the stored frame.
+    pub change_area_logical_pixels: u32,
     /// WebP encoding quality.
     pub webp_quality: u8,
 }
@@ -90,7 +90,7 @@ impl Default for CaptureConfig {
         Self {
             interval_secs: 2,
             change_pixel_threshold: 8,
-            change_area_pixels: 1000,
+            change_area_logical_pixels: 600,
             webp_quality: 75,
         }
     }
@@ -419,7 +419,7 @@ mod tests {
 
         assert_eq!(config.capture.interval_secs, 2);
         assert_eq!(config.capture.change_pixel_threshold, 8);
-        assert_eq!(config.capture.change_area_pixels, 1000);
+        assert_eq!(config.capture.change_area_logical_pixels, 600);
         assert_eq!(config.capture.webp_quality, 75);
         assert_eq!(config.ocr.languages, vec!["ja".to_owned(), "en".to_owned()]);
         assert_eq!(config.storage.data_dir, "");

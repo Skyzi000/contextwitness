@@ -24,21 +24,37 @@ pub enum ImageBufferError {
     /// At least one supplied image dimension is zero.
     #[error("image dimensions must be non-zero")]
     EmptyImage,
+    /// The supplied display scale is not a usable positive number.
+    #[error("display scale must be finite and greater than zero, got {dpi_scale}")]
+    InvalidDpiScale {
+        /// Rejected scale value.
+        dpi_scale: f32,
+    },
 }
 
-/// Downscaled grayscale view used to estimate changed source-screen pixels, kept between ticks
+/// Downscaled grayscale view used to estimate changed logical pixels, kept between ticks
 /// instead of the full frame (a few tens of KiB per monitor rather than tens of MiB).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Thumbnail {
     luma: Vec<u8>,
     source_width: u32,
     source_height: u32,
+    dpi_scale: f32,
 }
 
 impl Thumbnail {
     /// Build from tightly packed RGBA8. Resizes to the fixed thumbnail size with
     /// [`image::imageops::FilterType::Triangle`], then converts to luma8.
-    pub fn from_rgba(rgba: &[u8], width: u32, height: u32) -> Result<Thumbnail, ImageBufferError> {
+    pub fn from_rgba(
+        rgba: &[u8],
+        width: u32,
+        height: u32,
+        dpi_scale: f32,
+    ) -> Result<Thumbnail, ImageBufferError> {
+        if !dpi_scale.is_finite() || dpi_scale <= 0.0 {
+            return Err(ImageBufferError::InvalidDpiScale { dpi_scale });
+        }
+
         let image = rgba_image(rgba, width, height)?;
         let resized = image::imageops::resize(
             &image,
@@ -52,12 +68,18 @@ impl Thumbnail {
             luma: grayscale.into_raw(),
             source_width: width,
             source_height: height,
+            dpi_scale,
         })
     }
 
     /// Source frame dimensions this thumbnail was downscaled from.
     pub fn source_dimensions(&self) -> (u32, u32) {
         (self.source_width, self.source_height)
+    }
+
+    /// Display scale this thumbnail was captured at.
+    pub fn dpi_scale(&self) -> f32 {
+        self.dpi_scale
     }
 
     /// Estimated number of SOURCE pixels that changed, using this thumbnail's source dimensions.
@@ -67,6 +89,13 @@ impl Thumbnail {
         self.changed_fraction(other, pixel_threshold)
             * f64::from(self.source_width)
             * f64::from(self.source_height)
+    }
+
+    /// Estimated number of LOGICAL pixels that changed — source pixels divided by the square of the
+    /// display scale, so the same edit scores the same on a 1080p screen at 100% and a 4K screen at
+    /// 200%.
+    pub fn changed_logical_pixels(&self, other: &Thumbnail, pixel_threshold: u8) -> f64 {
+        self.changed_source_pixels(other, pixel_threshold) / (self.dpi_scale as f64).powi(2)
     }
 
     /// Fraction (0.0..=1.0) of samples whose absolute luma difference is strictly greater
@@ -87,8 +116,8 @@ impl Thumbnail {
     }
 }
 
-/// Whether this frame must be stored and OCR-ed based on changed source-screen pixels.
-/// The first frame and a source-resolution change always count as changed.
+/// Whether this frame must be stored and OCR-ed based on changed logical pixels.
+/// The first frame, a source-resolution change, and a display-scale change always count as changed.
 pub fn frame_changed(
     previous: Option<&Thumbnail>,
     current: &Thumbnail,
@@ -100,9 +129,12 @@ pub fn frame_changed(
     if previous.source_dimensions() != current.source_dimensions() {
         return true;
     }
+    if previous.dpi_scale() != current.dpi_scale() {
+        return true;
+    }
 
-    previous.changed_source_pixels(current, config.change_pixel_threshold)
-        > f64::from(config.change_area_pixels)
+    previous.changed_logical_pixels(current, config.change_pixel_threshold)
+        > f64::from(config.change_area_logical_pixels)
 }
 
 pub(crate) fn rgba_image(
@@ -162,23 +194,39 @@ mod tests {
         }
     }
 
-    /// One monospace glyph in an 8x16 cell: a 2px stem plus a crossbar, about 23% ink coverage.
-    /// A filled rectangle is NOT a substitute — it overstates a text edit by roughly 2.5x, which is
-    /// how the previous default was validated against fixtures that were far easier to detect than
-    /// real text.
-    fn glyph(buf: &mut [u8], width: u32, column: u32, top: u32) {
-        let x = 100 + column * 8;
-        fill_rect(buf, width, x + 2, x + 4, top + 2, top + 14, INK);
-        fill_rect(buf, width, x + 1, x + 6, top + 8, top + 10, INK);
+    /// One monospace glyph in an 8x16 cell scaled by the display scale `s`: at 200% Windows renders
+    /// the same character into 16x32 physical pixels, which is what the capture API returns.
+    /// A filled rectangle is NOT a substitute — it overstates a text edit by roughly 2.5x.
+    fn glyph(buf: &mut [u8], width: u32, left: u32, column: u32, top: u32, s: f64) {
+        let k = |v: f64| (v * s).round() as u32;
+        let x = left + column * k(8.0);
+        fill_rect(
+            buf,
+            width,
+            x + k(2.0),
+            x + k(4.0),
+            top + k(2.0),
+            top + k(14.0),
+            INK,
+        );
+        fill_rect(
+            buf,
+            width,
+            x + k(1.0),
+            x + k(6.0),
+            top + k(8.0),
+            top + k(10.0),
+            INK,
+        );
     }
 
     #[test]
     fn identical_frames_are_unchanged() {
         let before = solid(WIDTH, HEIGHT, 200);
         let after = solid(WIDTH, HEIGHT, 200);
-        let before = Thumbnail::from_rgba(&before, WIDTH, HEIGHT)
+        let before = Thumbnail::from_rgba(&before, WIDTH, HEIGHT, 1.0)
             .expect("the fixed-size before frame must be valid RGBA");
-        let after = Thumbnail::from_rgba(&after, WIDTH, HEIGHT)
+        let after = Thumbnail::from_rgba(&after, WIDTH, HEIGHT, 1.0)
             .expect("the fixed-size after frame must be valid RGBA");
 
         assert!(
@@ -190,7 +238,7 @@ mod tests {
     #[test]
     fn first_frame_is_always_changed() {
         let frame = solid(WIDTH, HEIGHT, 200);
-        let thumbnail = Thumbnail::from_rgba(&frame, WIDTH, HEIGHT)
+        let thumbnail = Thumbnail::from_rgba(&frame, WIDTH, HEIGHT, 1.0)
             .expect("the fixed-size frame must be valid RGBA");
 
         assert!(
@@ -204,11 +252,11 @@ mod tests {
         let before = solid(WIDTH, HEIGHT, 200);
         let mut after = before.clone();
         for column in 0..10 {
-            glyph(&mut after, WIDTH, column, HEIGHT / 2);
+            glyph(&mut after, WIDTH, 100, column, HEIGHT / 2, 1.0);
         }
-        let before = Thumbnail::from_rgba(&before, WIDTH, HEIGHT)
+        let before = Thumbnail::from_rgba(&before, WIDTH, HEIGHT, 1.0)
             .expect("the fixed-size before frame must be valid RGBA");
-        let after = Thumbnail::from_rgba(&after, WIDTH, HEIGHT)
+        let after = Thumbnail::from_rgba(&after, WIDTH, HEIGHT, 1.0)
             .expect("the fixed-size after frame must be valid RGBA");
         let config = CaptureConfig::default();
         let changed_source_pixels =
@@ -224,10 +272,10 @@ mod tests {
     fn a_blinking_cursor_alone_is_ignored() {
         let before = solid(WIDTH, HEIGHT, 200);
         let mut after = before.clone();
-        glyph(&mut after, WIDTH, 0, HEIGHT / 2);
-        let before = Thumbnail::from_rgba(&before, WIDTH, HEIGHT)
+        glyph(&mut after, WIDTH, 100, 0, HEIGHT / 2, 1.0);
+        let before = Thumbnail::from_rgba(&before, WIDTH, HEIGHT, 1.0)
             .expect("the fixed-size before frame must be valid RGBA");
-        let after = Thumbnail::from_rgba(&after, WIDTH, HEIGHT)
+        let after = Thumbnail::from_rgba(&after, WIDTH, HEIGHT, 1.0)
             .expect("the fixed-size after frame must be valid RGBA");
         let config = CaptureConfig::default();
         let changed_source_pixels =
@@ -245,11 +293,11 @@ mod tests {
         let before = solid(WIDTH, HEIGHT, 200);
         let mut after = before.clone();
         for column in 0..80 {
-            glyph(&mut after, WIDTH, column, 1400);
+            glyph(&mut after, WIDTH, 100, column, 1400, 1.0);
         }
-        let before = Thumbnail::from_rgba(&before, WIDTH, HEIGHT)
+        let before = Thumbnail::from_rgba(&before, WIDTH, HEIGHT, 1.0)
             .expect("the fixed-size before frame must be valid RGBA");
-        let after = Thumbnail::from_rgba(&after, WIDTH, HEIGHT)
+        let after = Thumbnail::from_rgba(&after, WIDTH, HEIGHT, 1.0)
             .expect("the fixed-size after frame must be valid RGBA");
         let config = CaptureConfig::default();
         let changed_source_pixels =
@@ -262,27 +310,112 @@ mod tests {
     }
 
     #[test]
-    fn the_same_edit_is_detected_on_every_monitor_size() {
-        // Measured source-pixel values: 1338, 1238, 1600, 1350 — a 1.3x spread, against 7.8x when
-        // the threshold was a thumbnail fraction.
-        for (width, height) in [(1366, 768), (1920, 1080), (2560, 1440), (3840, 2160)] {
+    fn the_same_edit_is_detected_at_every_display_scale() {
+        // Measured logical values: 853, 1138, 1238, 900 — all above the 600 default, against a
+        // source-pixel spread that put 5120x2880 @200% carets above Full HD ten-character edits.
+        // Bounds are the measured ten-character range over a full thumbnail-sample-period offset sweep, rounded
+        // outward: a value sitting exactly on a measured edge must be inside. They pin the
+        // calibration the default rests on — a change to the resize filter, the glyph fixture or
+        // the pixel threshold moves these numbers and should fail here rather than quietly shift
+        // how much text it takes to trigger a capture.
+        for (width, height, scale, logical_min, logical_max) in [
+            (1024, 768, 1.0, 853.0, 1302.0),
+            (1366, 768, 1.0, 1138.0, 1480.0),
+            (1920, 1080, 1.0, 1237.0, 1857.0),
+            (3840, 2160, 1.5, 900.0, 1800.0),
+        ] {
             let before = solid(width, height, 200);
             let mut after = before.clone();
             for column in 0..10 {
-                glyph(&mut after, width, column, height / 2);
+                glyph(&mut after, width, 100, column, height / 2, scale);
             }
-            let before = Thumbnail::from_rgba(&before, width, height)
+            let before = Thumbnail::from_rgba(&before, width, height, scale as f32)
                 .expect("the before frame must be valid RGBA");
-            let after = Thumbnail::from_rgba(&after, width, height)
+            let after = Thumbnail::from_rgba(&after, width, height, scale as f32)
                 .expect("the after frame must be valid RGBA");
             let config = CaptureConfig::default();
             let changed_source_pixels =
                 before.changed_source_pixels(&after, config.change_pixel_threshold);
+            let changed_logical_pixels =
+                before.changed_logical_pixels(&after, config.change_pixel_threshold);
 
             assert!(
-                frame_changed(Some(&before), &after, &config),
-                "ten typed characters must be detected at {width}x{height}; changed_source_pixels={changed_source_pixels}"
+                (logical_min..=logical_max).contains(&changed_logical_pixels),
+                "ten typed characters at {width}x{height} @{scale}x measured {changed_logical_pixels} logical pixels ({changed_source_pixels} source pixels)"
             );
+            assert!(
+                frame_changed(Some(&before), &after, &config),
+                "ten typed characters must be detected at {width}x{height} @{scale}x; changed_logical_pixels={changed_logical_pixels}; changed_source_pixels={changed_source_pixels}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_caret_is_ignored_at_every_display_scale() {
+        // Measured logical maxima: 149, 171, 225, 400.
+        // Bounds are the measured caret range over a full thumbnail-sample-period offset sweep, rounded
+        // outward: a value sitting exactly on a measured edge must be inside. They pin the
+        // calibration the default rests on — a change to the resize filter, the glyph fixture or
+        // the pixel threshold moves these numbers and should fail here rather than quietly shift
+        // how much text it takes to trigger a capture.
+        for (width, height, scale, logical_min, logical_max) in [
+            (1024, 768, 1.0, 85.0, 150.0),
+            (1366, 768, 1.0, 85.0, 171.0),
+            (1920, 1080, 1.0, 112.0, 225.0),
+            (3840, 2160, 1.5, 100.0, 400.0),
+        ] {
+            let before = solid(width, height, 200);
+            let mut after = before.clone();
+            glyph(&mut after, width, 100, 0, height / 2, scale);
+            let before = Thumbnail::from_rgba(&before, width, height, scale as f32)
+                .expect("the before frame must be valid RGBA");
+            let after = Thumbnail::from_rgba(&after, width, height, scale as f32)
+                .expect("the after frame must be valid RGBA");
+            let config = CaptureConfig::default();
+            let changed_source_pixels =
+                before.changed_source_pixels(&after, config.change_pixel_threshold);
+            let changed_logical_pixels =
+                before.changed_logical_pixels(&after, config.change_pixel_threshold);
+
+            assert!(
+                (logical_min..=logical_max).contains(&changed_logical_pixels),
+                "a caret at {width}x{height} @{scale}x measured {changed_logical_pixels} logical pixels ({changed_source_pixels} source pixels)"
+            );
+            assert!(
+                !frame_changed(Some(&before), &after, &config),
+                "a caret must be ignored at {width}x{height} @{scale}x; changed_logical_pixels={changed_logical_pixels}; changed_source_pixels={changed_source_pixels}"
+            );
+        }
+    }
+
+    #[test]
+    fn position_does_not_change_the_verdict() {
+        let width = 1366;
+        let height = 768;
+        let before = solid(width, height, 200);
+        let before = Thumbnail::from_rgba(&before, width, height, 1.0)
+            .expect("the before frame must be valid RGBA");
+        let config = CaptureConfig::default();
+
+        // A single-offset measurement is a sample, not a bound: this fixture varies about 1.3x
+        // across one thumbnail-sample period, which is how an earlier default was validated against
+        // a number that was never an upper bound.
+        for left in 100..=105 {
+            for top in height / 2..=height / 2 + 5 {
+                let mut after = solid(width, height, 200);
+                for column in 0..10 {
+                    glyph(&mut after, width, left, column, top, 1.0);
+                }
+                let after = Thumbnail::from_rgba(&after, width, height, 1.0)
+                    .expect("the after frame must be valid RGBA");
+                let changed_logical_pixels =
+                    before.changed_logical_pixels(&after, config.change_pixel_threshold);
+
+                assert!(
+                    frame_changed(Some(&before), &after, &config),
+                    "ten typed characters must be detected at left={left}, top={top}; changed_logical_pixels={changed_logical_pixels}"
+                );
+            }
         }
     }
 
@@ -290,14 +423,28 @@ mod tests {
     fn a_resolution_change_counts_as_changed() {
         let before = solid(1920, 1080, 200);
         let after = solid(2560, 1440, 200);
-        let before = Thumbnail::from_rgba(&before, 1920, 1080)
+        let before = Thumbnail::from_rgba(&before, 1920, 1080, 1.0)
             .expect("the 1920x1080 before frame must be valid RGBA");
-        let after = Thumbnail::from_rgba(&after, 2560, 1440)
+        let after = Thumbnail::from_rgba(&after, 2560, 1440, 1.0)
             .expect("the 2560x1440 after frame must be valid RGBA");
 
         assert!(
             frame_changed(Some(&before), &after, &CaptureConfig::default()),
             "a source-resolution change must invalidate the stored frame"
+        );
+    }
+
+    #[test]
+    fn a_display_scale_change_counts_as_changed() {
+        let frame = solid(WIDTH, HEIGHT, 200);
+        let before = Thumbnail::from_rgba(&frame, WIDTH, HEIGHT, 1.0)
+            .expect("the fixed-size before frame must be valid RGBA");
+        let after = Thumbnail::from_rgba(&frame, WIDTH, HEIGHT, 1.25)
+            .expect("the fixed-size after frame must be valid RGBA");
+
+        assert!(
+            frame_changed(Some(&before), &after, &CaptureConfig::default()),
+            "a display scale change must invalidate the stored frame"
         );
     }
 
@@ -325,9 +472,9 @@ mod tests {
                 30,
             );
         }
-        let before = Thumbnail::from_rgba(&before, WIDTH, HEIGHT)
+        let before = Thumbnail::from_rgba(&before, WIDTH, HEIGHT, 1.0)
             .expect("the fixed-size before frame must be valid RGBA");
-        let after = Thumbnail::from_rgba(&after, WIDTH, HEIGHT)
+        let after = Thumbnail::from_rgba(&after, WIDTH, HEIGHT, 1.0)
             .expect("the fixed-size after frame must be valid RGBA");
         let config = CaptureConfig::default();
         let changed_fraction = before.changed_fraction(&after, config.change_pixel_threshold);
@@ -342,9 +489,9 @@ mod tests {
     fn sensor_noise_below_threshold_is_ignored() {
         let before = solid(WIDTH, HEIGHT, 200);
         let after = solid(WIDTH, HEIGHT, 202);
-        let before = Thumbnail::from_rgba(&before, WIDTH, HEIGHT)
+        let before = Thumbnail::from_rgba(&before, WIDTH, HEIGHT, 1.0)
             .expect("the fixed-size before frame must be valid RGBA");
-        let after = Thumbnail::from_rgba(&after, WIDTH, HEIGHT)
+        let after = Thumbnail::from_rgba(&after, WIDTH, HEIGHT, 1.0)
             .expect("the fixed-size after frame must be valid RGBA");
         let config = CaptureConfig::default();
         let changed_fraction = before.changed_fraction(&after, config.change_pixel_threshold);
@@ -358,7 +505,7 @@ mod tests {
     #[test]
     fn changed_fraction_is_zero_for_identical_thumbnails() {
         let frame = solid(WIDTH, HEIGHT, 200);
-        let thumbnail = Thumbnail::from_rgba(&frame, WIDTH, HEIGHT)
+        let thumbnail = Thumbnail::from_rgba(&frame, WIDTH, HEIGHT, 1.0)
             .expect("the fixed-size frame must be valid RGBA");
 
         assert_eq!(
@@ -369,24 +516,40 @@ mod tests {
     }
 
     #[test]
+    fn a_non_positive_or_nan_display_scale_is_rejected() {
+        let frame = solid(1, 1, 200);
+
+        // A NaN scale would silently stop all capture rather than fail.
+        for dpi_scale in [0.0, -1.0, f32::NAN] {
+            assert!(
+                matches!(
+                    Thumbnail::from_rgba(&frame, 1, 1, dpi_scale),
+                    Err(ImageBufferError::InvalidDpiScale { .. })
+                ),
+                "display scale {dpi_scale} must return InvalidDpiScale"
+            );
+        }
+    }
+
+    #[test]
     fn rgba_length_mismatch_is_an_error() {
         assert!(
             matches!(
-                Thumbnail::from_rgba(&[0_u8; 8], 100, 100),
+                Thumbnail::from_rgba(&[0_u8; 8], 100, 100, 1.0),
                 Err(ImageBufferError::SizeMismatch { .. })
             ),
             "an RGBA buffer with the wrong length must return SizeMismatch"
         );
         assert!(
             matches!(
-                Thumbnail::from_rgba(&[], 0, 100),
+                Thumbnail::from_rgba(&[], 0, 100, 1.0),
                 Err(ImageBufferError::EmptyImage)
             ),
             "zero width must return EmptyImage"
         );
         assert!(
             matches!(
-                Thumbnail::from_rgba(&[], 100, 0),
+                Thumbnail::from_rgba(&[], 100, 0, 1.0),
                 Err(ImageBufferError::EmptyImage)
             ),
             "zero height must return EmptyImage"
