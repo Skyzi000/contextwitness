@@ -54,6 +54,23 @@ const RENAMABLE_WRITE_ACCESS: u32 = 0x4000_0000 | 0x0001_0000;
 /// FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE.
 const TEMPORARY_SHARE_MODE: u32 = 0x0000_0001 | 0x0000_0002 | 0x0000_0004;
 
+/// Distinguishes concurrent publish attempts within one process; the process id distinguishes
+/// processes.
+static NEXT_TEMPORARY_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A temporary path beside `destination`, distinct for every call.
+///
+/// Sharing one temporary between two publish attempts is not a near miss: the share mode lets the
+/// second `open` succeed, its `truncate` discards bytes the first has already flushed, and the
+/// loser's handle goes on writing into the file after the winner has published it under the
+/// destination name (all measured 2026-07-27).
+fn temporary_path_beside(destination: &std::path::Path) -> std::path::PathBuf {
+    let id = NEXT_TEMPORARY_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut temporary = destination.as_os_str().to_os_string();
+    temporary.push(format!(".tmp-{}-{id}", std::process::id()));
+    std::path::PathBuf::from(temporary)
+}
+
 /// Rename the open file to `destination`, failing instead of replacing when that name is taken.
 /// `Ok(true)` when the file now lives at `destination`, `Ok(false)` when something else already
 /// does.
@@ -364,9 +381,8 @@ impl Config {
             })?;
         }
 
-        let mut temporary = path.as_os_str().to_os_string();
-        temporary.push(format!(".tmp-{}", std::process::id()));
-        let temporary = std::path::PathBuf::from(temporary);
+        // Beside the destination, never across volumes: a cross-volume rename is not atomic.
+        let temporary = temporary_path_beside(path);
 
         let mut file = std::fs::OpenOptions::new()
             .write(true)
@@ -527,6 +543,28 @@ mod tests {
             config,
             Config::default(),
             "the built-in config template should stay aligned with the defaults"
+        );
+    }
+
+    #[test]
+    fn every_publish_attempt_gets_its_own_temporary() {
+        let destination = std::path::Path::new("dir").join("config.toml");
+        let first = temporary_path_beside(&destination);
+        let second = temporary_path_beside(&destination);
+
+        assert_ne!(
+            first, second,
+            "two publish attempts sharing a temporary would let one truncate what the other has already flushed"
+        );
+        assert_eq!(
+            first.parent(),
+            destination.parent(),
+            "the publishing rename is only atomic within one volume"
+        );
+        assert_eq!(
+            second.parent(),
+            destination.parent(),
+            "the publishing rename is only atomic within one volume"
         );
     }
 
