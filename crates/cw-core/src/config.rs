@@ -49,6 +49,61 @@ window_minutes = 5
 enabled = false
 "#;
 
+/// GENERIC_WRITE | DELETE. The DELETE right is what lets a handle rename its own file.
+const RENAMABLE_WRITE_ACCESS: u32 = 0x4000_0000 | 0x0001_0000;
+/// FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE.
+const TEMPORARY_SHARE_MODE: u32 = 0x0000_0001 | 0x0000_0002 | 0x0000_0004;
+
+/// Rename the open file to `destination`, failing instead of replacing when that name is taken.
+/// `Ok(true)` when the file now lives at `destination`, `Ok(false)` when something else already
+/// does.
+fn rename_without_replacing(
+    file: &std::fs::File,
+    destination: &std::path::Path,
+) -> Result<bool, windows::core::Error> {
+    use std::os::windows::{ffi::OsStrExt, io::AsRawHandle};
+    use windows::Win32::{
+        Foundation::{ERROR_ALREADY_EXISTS, HANDLE},
+        Storage::FileSystem::{FILE_RENAME_INFO, FileRenameInfo, SetFileInformationByHandle},
+    };
+
+    // `fs::rename` cannot be used to publish a config: on Windows it is MoveFileExW with
+    // MOVEFILE_REPLACE_EXISTING and silently replaces the destination (measured 2026-07-27).
+    // Creating the destination first and filling it afterwards is no better — the name exists
+    // before the content does, so a concurrent `setup` is told the config is ready, writes the
+    // user's settings into the empty shell, and has them replaced a moment later. Renaming by
+    // handle with ReplaceIfExists = FALSE is the only operation that makes the name appear
+    // already holding the full template, and it works on exFAT as well as NTFS (both measured).
+    let destination = std::path::absolute(destination)?;
+    let destination: Vec<u16> = destination.as_os_str().encode_wide().collect();
+    let name_bytes = destination.len() * std::mem::size_of::<u16>();
+    let mut buf = vec![0u64; (std::mem::size_of::<FILE_RENAME_INFO>() + name_bytes).div_ceil(8)];
+    let result = unsafe {
+        let info = buf.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+        (*info).Anonymous.ReplaceIfExists = false;
+        (*info).RootDirectory = HANDLE::default();
+        (*info).FileNameLength = name_bytes as u32;
+        std::ptr::copy_nonoverlapping(
+            destination.as_ptr(),
+            std::ptr::addr_of_mut!((*info).FileName).cast::<u16>(),
+            destination.len(),
+        );
+        SetFileInformationByHandle(
+            HANDLE(file.as_raw_handle()),
+            FileRenameInfo,
+            buf.as_ptr().cast(),
+            (buf.len() * 8) as u32,
+        )
+    };
+    let already_exists = windows::core::HRESULT::from_win32(ERROR_ALREADY_EXISTS.0); // 0x800700B7
+
+    match result {
+        Ok(()) => Ok(true),
+        Err(error) if error.code() == already_exists => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 /// Complete ContextWitness configuration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
@@ -281,12 +336,14 @@ impl Config {
     /// Create `path` (and any missing parent directories) containing [`DEFAULT_CONFIG_TOML`]
     /// when it does not exist yet. Returns `true` when this call created the file, `false` when
     /// one was already present — including when another process created it first, since
-    /// reserving the name is what tests for it. Never overwrites an existing file.
+    /// publishing is what tests for it. Never overwrites an existing file.
     ///
-    /// The content is written to a temporary file and renamed into place, so a reader never sees
-    /// a partial config. Between the reservation and the rename it can see an empty one, which
-    /// loads as [`Config::default()`] — the same as no config at all.
+    /// The content is written to a temporary file and renamed onto `path` only if that name is
+    /// still free, so the config never exists in a half-written or empty state that another
+    /// process could mistake for a finished one.
     pub fn write_default_if_missing(path: &std::path::Path) -> Result<bool, ConfigError> {
+        use std::os::windows::fs::OpenOptionsExt;
+
         if let Some(parent) = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -297,50 +354,48 @@ impl Config {
             })?;
         }
 
-        // `create_new` reserves the NAME before any content exists. It is the only std call that
-        // both refuses to replace an existing file and works on every filesystem — `rename`
-        // replaces silently on Windows, `hard_link` fails with ERROR_NOT_SUPPORTED on exFAT (both
-        // measured 2026-07-27). Holding the name is what makes the rename below safe: it can only
-        // ever replace this call's own empty reservation.
-        let reservation = match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)
-        {
-            Ok(file) => file,
-            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
-            Err(source) => {
-                return Err(ConfigError::Write {
-                    path: path.to_path_buf(),
-                    source,
-                });
-            }
-        };
-        drop(reservation);
-
         let mut temporary = path.as_os_str().to_os_string();
         temporary.push(format!(".tmp-{}", std::process::id()));
         let temporary = std::path::PathBuf::from(temporary);
 
-        let publish = (|| -> std::io::Result<()> {
-            let mut file = std::fs::File::create(&temporary)?;
-            std::io::Write::write_all(&mut file, DEFAULT_CONFIG_TOML.as_bytes())?;
-            file.sync_all()?;
-            std::fs::rename(&temporary, path)
-        })();
-
-        if let Err(source) = publish {
-            let _ = std::fs::remove_file(&temporary);
-            // The reservation goes too. Left behind, it would make every later run return Ok(false)
-            // against a 0-byte file: defaults, no commented template, and no error saying why.
-            let _ = std::fs::remove_file(path);
-            return Err(ConfigError::Write {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .access_mode(RENAMABLE_WRITE_ACCESS)
+            .share_mode(TEMPORARY_SHARE_MODE)
+            .open(&temporary)
+            .map_err(|source| ConfigError::Write {
                 path: path.to_path_buf(),
                 source,
-            });
-        }
+            })?;
+        std::io::Write::write_all(&mut file, DEFAULT_CONFIG_TOML.as_bytes()).map_err(|source| {
+            ConfigError::Write {
+                path: path.to_path_buf(),
+                source,
+            }
+        })?;
+        file.sync_all().map_err(|source| ConfigError::Write {
+            path: path.to_path_buf(),
+            source,
+        })?;
 
-        Ok(true)
+        match rename_without_replacing(&file, path) {
+            Ok(true) => Ok(true),
+            Ok(false) => {
+                drop(file);
+                let _ = std::fs::remove_file(&temporary);
+                Ok(false)
+            }
+            Err(error) => {
+                drop(file);
+                let _ = std::fs::remove_file(&temporary);
+                Err(ConfigError::Write {
+                    path: path.to_path_buf(),
+                    source: std::io::Error::from(error),
+                })
+            }
+        }
     }
 
     /// Read `path`. A missing file is NOT an error: returns `Config::default()`.
@@ -494,6 +549,19 @@ mod tests {
             std::fs::read_to_string(&path).expect("the existing test config should be readable"),
             "user-owned contents",
             "an existing config file must never be overwritten"
+        );
+        // This call lost the real rename race, so its temporary file must have been cleaned up.
+        let entries: Vec<_> = std::fs::read_dir(
+            path.parent()
+                .expect("the test config path should have a parent directory"),
+        )
+        .expect("the test config directory should be readable")
+        .collect::<Result<_, _>>()
+        .expect("the test config directory entries should be readable");
+        assert_eq!(
+            entries.len(),
+            1,
+            "the failed rename should leave only the existing config"
         );
 
         std::fs::remove_dir_all(&temp_dir)
@@ -726,9 +794,8 @@ mod tests {
         let path = unique_temp_path("empty-config");
         std::fs::write(&path, "").expect("the empty test config should be writable");
 
-        // `write_default_if_missing` leaves a 0-byte reservation visible between creating the
-        // name and renaming the content onto it, so a reader in that window must get defaults,
-        // not an error.
+        // A config the user has emptied reads the same as no config at all, which is what
+        // `load_from_path` already does for a missing file.
         let config =
             Config::load_from_path(&path).expect("an empty config file should use defaults");
 
