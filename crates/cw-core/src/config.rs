@@ -344,6 +344,16 @@ impl Config {
     pub fn write_default_if_missing(path: &std::path::Path) -> Result<bool, ConfigError> {
         use std::os::windows::fs::OpenOptionsExt;
 
+        // A fast path, not the check. Every startup after the first lands here, and the answer is
+        // already on disk — without this the common case creates a temporary, writes the template,
+        // flushes it to disk and deletes it again to learn what one `exists()` already said.
+        // Correctness does not rest on it: `rename_without_replacing` below refuses to replace a
+        // config that appears after this test, so removing this line would change only how much
+        // work a normal startup does.
+        if path.exists() {
+            return Ok(false);
+        }
+
         if let Some(parent) = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -369,16 +379,18 @@ impl Config {
                 path: path.to_path_buf(),
                 source,
             })?;
-        std::io::Write::write_all(&mut file, DEFAULT_CONFIG_TOML.as_bytes()).map_err(|source| {
-            ConfigError::Write {
+        let write_result = std::io::Write::write_all(&mut file, DEFAULT_CONFIG_TOML.as_bytes())
+            .and_then(|()| file.sync_all());
+        if let Err(source) = write_result {
+            drop(file);
+            // Left behind, this looks like a stale config to anyone reading the directory, and it
+            // accumulates on every failed first run.
+            let _ = std::fs::remove_file(&temporary);
+            return Err(ConfigError::Write {
                 path: path.to_path_buf(),
                 source,
-            }
-        })?;
-        file.sync_all().map_err(|source| ConfigError::Write {
-            path: path.to_path_buf(),
-            source,
-        })?;
+            });
+        }
 
         match rename_without_replacing(&file, path) {
             Ok(true) => Ok(true),
@@ -550,7 +562,8 @@ mod tests {
             "user-owned contents",
             "an existing config file must never be overwritten"
         );
-        // This call lost the real rename race, so its temporary file must have been cleaned up.
+        // An existing config is answered without writing anything, so nothing may appear in the
+        // directory alongside it.
         let entries: Vec<_> = std::fs::read_dir(
             path.parent()
                 .expect("the test config path should have a parent directory"),
@@ -561,11 +574,56 @@ mod tests {
         assert_eq!(
             entries.len(),
             1,
-            "the failed rename should leave only the existing config"
+            "the existing config should remain the only directory entry"
         );
 
         std::fs::remove_dir_all(&temp_dir)
             .expect("the default config test directory should be removable");
+    }
+
+    #[test]
+    fn rename_without_replacing_reports_a_taken_name_and_leaves_both_files() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let temp_dir = unique_temp_path("rename-without-replacing-taken");
+        assert!(!temp_dir.exists());
+        std::fs::create_dir(&temp_dir)
+            .expect("the unique rename test directory should be creatable");
+        let destination = temp_dir.join("config.toml");
+        let temporary = temp_dir.join("config.toml.tmp-test");
+        std::fs::write(&destination, "a config another process finished first")
+            .expect("the winning config should be writable");
+
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .access_mode(RENAMABLE_WRITE_ACCESS)
+            .share_mode(TEMPORARY_SHARE_MODE)
+            .open(&temporary)
+            .expect("the temporary config should be openable");
+        std::io::Write::write_all(&mut file, DEFAULT_CONFIG_TOML.as_bytes())
+            .expect("the default config should be writable to the temporary");
+
+        // The public entry point takes a fast path when a config is already present, so target the
+        // helper directly: this is the branch where the config appears after that test, which
+        // cannot be reached through the public entry point deterministically.
+        let renamed = rename_without_replacing(&file, &destination)
+            .expect("a taken destination should be reported without an error");
+        drop(file);
+
+        assert!(!renamed, "a taken destination should be reported as false");
+        assert_eq!(
+            std::fs::read_to_string(&destination)
+                .expect("the winning config should remain readable"),
+            "a config another process finished first"
+        );
+        assert!(
+            temporary.exists(),
+            "the rename should leave temporary cleanup to its caller"
+        );
+
+        std::fs::remove_dir_all(&temp_dir).expect("the rename test directory should be removable");
     }
 
     #[test]
