@@ -23,21 +23,25 @@ pub struct Episode {
     pub metadata: EpisodeMetadata,
 }
 
-/// Retain metadata stored alongside the content. Images themselves are never delivered, so the
-/// paths are the only link from a memory back to the local screenshot.
+/// Retain metadata stored alongside the content, already in the form Hindsight accepts.
+///
+/// Every value is a string because `MemoryItem.metadata` is declared
+/// `additionalProperties: {"type": "string"}`; a number or an array there is rejected outright.
+/// The snapshot is delivered exactly as stored, so the conversion has to happen here rather than
+/// at delivery time.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct EpisodeMetadata {
     /// Window start, RFC 3339 UTC.
     pub episode_start: String,
     /// Window end, RFC 3339 UTC.
     pub episode_end: String,
-    /// Monitors that contributed an entry, in render order.
-    pub monitors: Vec<String>,
-    /// Number of entries in `content` after consecutive duplicates were collapsed.
-    pub entry_count: usize,
-    /// Relative image paths of the rendered entries, in render order. Entries collapsed as
-    /// duplicates and entries with no stored image are absent.
-    pub image_paths: Vec<String>,
+    /// Monitors that contributed an entry, in render order, as a JSON array string.
+    pub monitors: String,
+    /// Number of entries in `content` after folding, in decimal.
+    pub entry_count: String,
+    /// Relative image paths of the rendered entries, in render order, as a JSON array string.
+    /// Entries folded as duplicates and entries with no stored image are absent.
+    pub image_paths: String,
 }
 
 /// Truncate `at` down to a multiple of `window_minutes` counted from the Unix epoch.
@@ -107,7 +111,17 @@ pub fn build_episode(
         current.monitor_id == previous.monitor_id
             && match (current.ocr_text.as_deref(), previous.ocr_text.as_deref()) {
                 (Some(current), Some(previous)) => current == previous,
-                (None, None) => current.dhash == previous.dhash,
+                (None, None) => {
+                    // `NoText` and `Failed` both leave `ocr_text` empty, so comparing the
+                    // fingerprint alone deletes a failure that follows a no-text frame on an
+                    // unchanged screen — the likely case rather than a corner one. A failure must
+                    // stay visible in the body and keep its image reference for a later re-OCR.
+                    // Two identical failures on an unchanged screen still fold because they say
+                    // the same thing.
+                    current.dhash == previous.dhash
+                        && current.ocr_status == previous.ocr_status
+                        && current.ocr_error == previous.ocr_error
+                }
                 _ => false,
             }
     });
@@ -200,9 +214,10 @@ pub fn build_episode(
         metadata: EpisodeMetadata {
             episode_start,
             episode_end,
-            monitors,
-            entry_count: entries.len(),
-            image_paths,
+            monitors: serde_json::to_string(&monitors).expect("a list of strings must serialise"),
+            entry_count: entries.len().to_string(),
+            image_paths: serde_json::to_string(&image_paths)
+                .expect("a list of strings must serialise"),
         },
     })
 }
@@ -421,11 +436,37 @@ Monitor DISPLAY2 (1920x1080):
             serde_json::json!({
                 "episode_start": "2026-07-24T16:00:00Z",
                 "episode_end": "2026-07-24T16:05:00Z",
-                "monitors": ["DISPLAY1", "DISPLAY2"],
-                "entry_count": 4,
-                "image_paths": ["images/a.webp", "images/c.webp", "images/e.webp"]
+                "monitors": "[\"DISPLAY1\",\"DISPLAY2\"]",
+                "entry_count": "4",
+                "image_paths": "[\"images/a.webp\",\"images/c.webp\",\"images/e.webp\"]"
             })
         );
+    }
+
+    #[test]
+    fn every_metadata_value_is_a_string_as_hindsight_requires() {
+        let episode = build_episode(
+            timestamp("2026-07-24T16:00:00Z"),
+            5,
+            FixedOffset::east_opt(9 * 3600).expect("test offset should be valid"),
+            &golden_observations(),
+        )
+        .expect("the golden observations should build an episode");
+        let metadata = serde_json::to_value(&episode.metadata)
+            .expect("episode metadata should serialize to JSON");
+        let metadata = metadata
+            .as_object()
+            .expect("episode metadata should serialize as an object");
+
+        // `MemoryItem.metadata` is `additionalProperties: {"type": "string"}` in the 0.8.4
+        // schema. A field added later as a number or an array would make every episode fail
+        // delivery, and this test catches that instead of a 422 in production.
+        for (key, value) in metadata {
+            assert!(
+                value.is_string(),
+                "metadata field `{key}` must be a string, got {value}"
+            );
+        }
     }
 
     #[test]
@@ -460,7 +501,7 @@ Monitor DISPLAY2 (1920x1080):
         )
         .expect("the observations should build an episode");
 
-        assert_eq!(episode.metadata.entry_count, 2);
+        assert_eq!(episode.metadata.entry_count, "2");
         assert!(episode.content.contains("earlier"));
         assert!(episode.content.contains("later"));
     }
@@ -494,11 +535,8 @@ Monitor DISPLAY2 (1920x1080):
         )
         .expect("the observations should build an episode");
 
-        assert_eq!(episode.metadata.entry_count, 1);
-        assert_eq!(
-            episode.metadata.image_paths,
-            vec!["images/earlier.webp".to_owned()]
-        );
+        assert_eq!(episode.metadata.entry_count, "1");
+        assert_eq!(episode.metadata.image_paths, "[\"images/earlier.webp\"]");
     }
 
     #[test]
@@ -523,7 +561,7 @@ Monitor DISPLAY2 (1920x1080):
         )
         .expect("the observations should build an episode");
 
-        assert_eq!(matching_episode.metadata.entry_count, 1);
+        assert_eq!(matching_episode.metadata.entry_count, "1");
 
         let different = vec![
             observation(
@@ -545,7 +583,93 @@ Monitor DISPLAY2 (1920x1080):
         )
         .expect("the observations should build an episode");
 
-        assert_eq!(different_episode.metadata.entry_count, 2);
+        assert_eq!(different_episode.metadata.entry_count, "2");
+    }
+
+    #[test]
+    fn a_failed_entry_never_folds_into_a_no_text_one() {
+        let observations = vec![
+            observation(
+                1,
+                "2026-07-24T16:00:01Z",
+                screen_payload("DISPLAY1", 1, OcrStatus::NoText, None),
+            ),
+            observation(
+                2,
+                "2026-07-24T16:00:02Z",
+                ScreenPayload {
+                    ocr_error: Some("engine unavailable".to_owned()),
+                    ..screen_payload("DISPLAY1", 1, OcrStatus::Failed, None)
+                },
+            ),
+        ];
+
+        let episode = build_episode(
+            timestamp("2026-07-24T16:00:00Z"),
+            5,
+            FixedOffset::east_opt(0).expect("UTC offset should be valid"),
+            &observations,
+        )
+        .expect("the observations should build an episode");
+
+        assert_eq!(episode.metadata.entry_count, "2");
+        assert!(episode.content.contains("[OCR failed: engine unavailable]"));
+    }
+
+    #[test]
+    fn identical_failures_on_an_unchanged_screen_fold_but_different_ones_do_not() {
+        let failures = |second_error: &str| {
+            vec![
+                observation(
+                    1,
+                    "2026-07-24T16:00:01Z",
+                    ScreenPayload {
+                        ocr_error: Some("engine unavailable".to_owned()),
+                        ..screen_payload("DISPLAY1", 1, OcrStatus::Failed, None)
+                    },
+                ),
+                observation(
+                    2,
+                    "2026-07-24T16:00:02Z",
+                    ScreenPayload {
+                        ocr_error: Some(second_error.to_owned()),
+                        ..screen_payload("DISPLAY1", 1, OcrStatus::Failed, None)
+                    },
+                ),
+            ]
+        };
+
+        let identical = failures("engine unavailable");
+        let identical_episode = build_episode(
+            timestamp("2026-07-24T16:00:00Z"),
+            5,
+            FixedOffset::east_opt(0).expect("UTC offset should be valid"),
+            &identical,
+        )
+        .expect("the identical failures should build an episode");
+
+        assert_eq!(identical_episode.metadata.entry_count, "1");
+
+        let different = failures("timed out");
+        let different_episode = build_episode(
+            timestamp("2026-07-24T16:00:00Z"),
+            5,
+            FixedOffset::east_opt(0).expect("UTC offset should be valid"),
+            &different,
+        )
+        .expect("the different failures should build an episode");
+
+        assert_eq!(different_episode.metadata.entry_count, "2");
+        assert!(
+            different_episode
+                .content
+                .contains("[OCR failed: engine unavailable]")
+        );
+        assert!(
+            different_episode
+                .content
+                .contains("[OCR failed: timed out]")
+        );
     }
 
     #[test]
@@ -571,7 +695,7 @@ Monitor DISPLAY2 (1920x1080):
         )
         .expect("the observations should build an episode");
 
-        assert_eq!(episode.metadata.entry_count, 2);
+        assert_eq!(episode.metadata.entry_count, "2");
         assert!(episode.content.contains("typed"));
     }
 
@@ -603,7 +727,7 @@ Monitor DISPLAY2 (1920x1080):
         )
         .expect("the observations should build an episode");
 
-        assert_eq!(episode.metadata.entry_count, 3);
+        assert_eq!(episode.metadata.entry_count, "3");
     }
 
     #[test]
@@ -673,7 +797,7 @@ Monitor DISPLAY2 (1920x1080):
         )
         .expect("the screen observation should build an episode");
 
-        assert_eq!(episode.metadata.entry_count, 1);
+        assert_eq!(episode.metadata.entry_count, "1");
         assert!(!episode.content.contains("synthetic"));
     }
 
@@ -733,11 +857,8 @@ Monitor DISPLAY2 (1920x1080):
         )
         .expect("the observations should build an episode");
 
-        assert_eq!(episode.metadata.entry_count, 1);
-        assert_eq!(
-            episode.metadata.image_paths,
-            vec!["images/a.webp".to_owned()]
-        );
+        assert_eq!(episode.metadata.entry_count, "1");
+        assert_eq!(episode.metadata.image_paths, "[\"images/a.webp\"]");
         assert!(episode.content.contains("  16:00:01"));
         assert!(!episode.content.contains("  16:00:02"));
         assert!(!episode.content.contains("  16:00:03"));

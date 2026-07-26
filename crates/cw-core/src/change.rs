@@ -137,6 +137,32 @@ pub fn frame_changed(
         > f64::from(config.change_area_logical_pixels)
 }
 
+/// Largest value `Thumbnail::changed_logical_pixels` can return for a monitor of this size: every
+/// sampled pixel changed. Returns 0.0 for a scale that is not finite and positive.
+pub fn max_logical_pixels(width: u32, height: u32, dpi_scale: f32) -> f64 {
+    if !dpi_scale.is_finite() || dpi_scale <= 0.0 {
+        return 0.0;
+    }
+
+    f64::from(width) * f64::from(height) / f64::from(dpi_scale).powi(2)
+}
+
+/// Whether `config.change_area_logical_pixels` can ever be exceeded on a monitor of this size.
+///
+/// `frame_changed` compares with `>`, so a threshold at or above the monitor's logical area is
+/// never satisfied and that monitor is never captured again after its first frame — silently, with
+/// no error anywhere. `Config::validate` cannot check this because no monitor is known when the
+/// config is read, so the daemon calls this once per monitor at enumeration. Kept here so the
+/// bound and the comparison that makes it a bound stay in the same file.
+pub fn change_threshold_is_reachable(
+    width: u32,
+    height: u32,
+    dpi_scale: f32,
+    config: &crate::config::CaptureConfig,
+) -> bool {
+    max_logical_pixels(width, height, dpi_scale) > f64::from(config.change_area_logical_pixels)
+}
+
 pub(crate) fn rgba_image(
     rgba: &[u8],
     width: u32,
@@ -165,7 +191,10 @@ pub(crate) fn rgba_image(
 
 #[cfg(test)]
 mod tests {
-    use super::{ImageBufferError, Thumbnail, frame_changed};
+    use super::{
+        ImageBufferError, Thumbnail, change_threshold_is_reachable, frame_changed,
+        max_logical_pixels,
+    };
     use crate::config::CaptureConfig;
 
     const WIDTH: u32 = 2560;
@@ -245,6 +274,61 @@ mod tests {
             frame_changed(None, &thumbnail, &CaptureConfig::default()),
             "the first frame for a monitor must always be treated as changed"
         );
+    }
+
+    #[test]
+    fn a_threshold_at_the_monitor_area_can_never_fire() {
+        assert_eq!(max_logical_pixels(1920, 1080, 1.0), 2_073_600.0);
+
+        // A threshold in this range does not merely reduce captures; it stops them completely and
+        // silently.
+        let config = |change_area_logical_pixels| CaptureConfig {
+            change_area_logical_pixels,
+            ..CaptureConfig::default()
+        };
+        assert!(!change_threshold_is_reachable(
+            1920,
+            1080,
+            1.0,
+            &config(2_073_600)
+        ));
+        assert!(change_threshold_is_reachable(
+            1920,
+            1080,
+            1.0,
+            &config(2_073_599)
+        ));
+
+        assert_eq!(max_logical_pixels(2560, 1440, 2.0), 921_600.0);
+        assert!(change_threshold_is_reachable(
+            2560,
+            1440,
+            2.0,
+            &CaptureConfig::default()
+        ));
+        assert!(!change_threshold_is_reachable(
+            2560,
+            1440,
+            2.0,
+            &config(921_600)
+        ));
+    }
+
+    #[test]
+    fn an_unusable_display_scale_makes_no_threshold_reachable() {
+        let config = CaptureConfig {
+            change_area_logical_pixels: 0,
+            ..CaptureConfig::default()
+        };
+
+        // Failing closed is right here: a scale we cannot use must surface as a startup error, not
+        // as a monitor that quietly captures nothing.
+        for dpi_scale in [0.0, -1.0, f32::NAN] {
+            assert_eq!(max_logical_pixels(1920, 1080, dpi_scale), 0.0);
+            assert!(!change_threshold_is_reachable(
+                1920, 1080, dpi_scale, &config
+            ));
+        }
     }
 
     #[test]
