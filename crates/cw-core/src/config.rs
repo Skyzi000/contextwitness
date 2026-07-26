@@ -280,11 +280,12 @@ impl Config {
 
     /// Create `path` (and any missing parent directories) containing [`DEFAULT_CONFIG_TOML`]
     /// when it does not exist yet. Returns `true` when this call created the file, `false` when
-    /// one was already present — including when another process created it first, since the
-    /// creation is what tests for it. Never overwrites an existing file.
+    /// one was already present — including when another process created it first, since
+    /// reserving the name is what tests for it. Never overwrites an existing file.
     ///
-    /// A write that fails partway removes the file it created. A process killed mid-write can
-    /// still leave a partial config, which surfaces as a parse error naming the path.
+    /// The content is written to a temporary file and renamed into place, so a reader never sees
+    /// a partial config. Between the reservation and the rename it can see an empty one, which
+    /// loads as [`Config::default()`] — the same as no config at all.
     pub fn write_default_if_missing(path: &std::path::Path) -> Result<bool, ConfigError> {
         if let Some(parent) = path
             .parent()
@@ -296,12 +297,12 @@ impl Config {
             })?;
         }
 
-        // `create_new` is the existence check, not just the write: it is the only std call that
-        // refuses to replace an existing file AND works on every filesystem. `rename` replaces
-        // the destination silently on Windows, and `hard_link` fails with ERROR_NOT_SUPPORTED on
-        // exFAT (both measured 2026-07-27). Checking `exists()` first would only re-open the gap
-        // between the check and the write that this call closes.
-        let mut file = match std::fs::OpenOptions::new()
+        // `create_new` reserves the NAME before any content exists. It is the only std call that
+        // both refuses to replace an existing file and works on every filesystem — `rename`
+        // replaces silently on Windows, `hard_link` fails with ERROR_NOT_SUPPORTED on exFAT (both
+        // measured 2026-07-27). Holding the name is what makes the rename below safe: it can only
+        // ever replace this call's own empty reservation.
+        let reservation = match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(path)
@@ -315,11 +316,23 @@ impl Config {
                 });
             }
         };
+        drop(reservation);
 
-        if let Err(source) = std::io::Write::write_all(&mut file, DEFAULT_CONFIG_TOML.as_bytes()) {
-            drop(file);
-            // A half-written config would parse-error on every later start, and the caller would
-            // have no way to tell it apart from one the user wrote.
+        let mut temporary = path.as_os_str().to_os_string();
+        temporary.push(format!(".tmp-{}", std::process::id()));
+        let temporary = std::path::PathBuf::from(temporary);
+
+        let publish = (|| -> std::io::Result<()> {
+            let mut file = std::fs::File::create(&temporary)?;
+            std::io::Write::write_all(&mut file, DEFAULT_CONFIG_TOML.as_bytes())?;
+            file.sync_all()?;
+            std::fs::rename(&temporary, path)
+        })();
+
+        if let Err(source) = publish {
+            let _ = std::fs::remove_file(&temporary);
+            // The reservation goes too. Left behind, it would make every later run return Ok(false)
+            // against a 0-byte file: defaults, no commented template, and no error saying why.
             let _ = std::fs::remove_file(path);
             return Err(ConfigError::Write {
                 path: path.to_path_buf(),
@@ -705,6 +718,21 @@ mod tests {
         let config =
             Config::load_from_path(&path).expect("a missing config file should use defaults");
 
+        assert_eq!(config, Config::default());
+    }
+
+    #[test]
+    fn an_empty_config_file_loads_as_defaults() {
+        let path = unique_temp_path("empty-config");
+        std::fs::write(&path, "").expect("the empty test config should be writable");
+
+        // `write_default_if_missing` leaves a 0-byte reservation visible between creating the
+        // name and renaming the content onto it, so a reader in that window must get defaults,
+        // not an error.
+        let config =
+            Config::load_from_path(&path).expect("an empty config file should use defaults");
+
+        std::fs::remove_file(&path).expect("the empty test config should be removable");
         assert_eq!(config, Config::default());
     }
 
