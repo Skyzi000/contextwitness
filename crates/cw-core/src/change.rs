@@ -397,6 +397,56 @@ mod tests {
     }
 
     #[test]
+    fn the_worst_phase_on_4k_unscaled_still_separates_a_caret_from_typing() {
+        // 3840x2160 at 100% has the least room of any supported configuration, and its sample
+        // period is exactly 15x15, so all 225 phases were enumerated offline. These two offsets are
+        // the true extremes: a caret peaks at 450 logical pixels and ten characters bottom out at
+        // 1125, which is the 450 < 600 < 1125 separation the default rests on. The tables above draw
+        // at left = 100, where the same fixtures measure a comfortable 225 and 1350 and would keep
+        // passing even if the real margin had closed. A caret also drops to 0 at
+        // left = 102, top = height / 2 + 3, where one character splits across four samples and none
+        // of them crosses the per-pixel threshold.
+        let width = 3840;
+        let height = 2160;
+        let config = CaptureConfig::default();
+        let background = solid(width, height, 200);
+        let before = Thumbnail::from_rgba(&background, width, height, 1.0)
+            .expect("the 4K before frame must be valid RGBA");
+
+        let mut caret = background.clone();
+        glyph(&mut caret, width, 102, 0, height / 2, 1.0);
+        let caret = Thumbnail::from_rgba(&caret, width, height, 1.0)
+            .expect("the 4K caret frame must be valid RGBA");
+        let caret_pixels = before.changed_logical_pixels(&caret, config.change_pixel_threshold);
+
+        assert!(
+            (449.0..=451.0).contains(&caret_pixels),
+            "a caret at its worst phase must still measure about 450 logical pixels, measured {caret_pixels}"
+        );
+        assert!(
+            !frame_changed(Some(&before), &caret, &config),
+            "a caret at its worst phase must still be ignored; changed_logical_pixels={caret_pixels}"
+        );
+
+        let mut typing = background;
+        for column in 0..10 {
+            glyph(&mut typing, width, 103, column, height / 2, 1.0);
+        }
+        let typing = Thumbnail::from_rgba(&typing, width, height, 1.0)
+            .expect("the 4K typing frame must be valid RGBA");
+        let typing_pixels = before.changed_logical_pixels(&typing, config.change_pixel_threshold);
+
+        assert!(
+            (1124.0..=1126.0).contains(&typing_pixels),
+            "ten characters at their worst phase must still measure about 1125 logical pixels, measured {typing_pixels}"
+        );
+        assert!(
+            frame_changed(Some(&before), &typing, &config),
+            "ten characters at their worst phase must still be detected; changed_logical_pixels={typing_pixels}"
+        );
+    }
+
+    #[test]
     fn position_does_not_change_the_verdict() {
         let width = 1366;
         let height = 768;
