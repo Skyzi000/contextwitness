@@ -231,32 +231,6 @@ pub enum ConfigError {
     },
 }
 
-/// Move a finished temporary file onto `path` without ever replacing a file that is already
-/// there, and remove the temporary either way. `Ok(true)` when this call published the file,
-/// `Ok(false)` when someone else won the race and a config already exists.
-fn publish_without_replacing(
-    temporary: &std::path::Path,
-    path: &std::path::Path,
-) -> Result<bool, ConfigError> {
-    // `rename` cannot be used to publish this file: on Windows it is MoveFileExW with
-    // MOVEFILE_REPLACE_EXISTING and silently replaces the destination (measured 2026-07-27),
-    // which would clobber a config another process wrote after our existence check. `hard_link`
-    // is the one std call that fails instead of replacing, so it turns the "never overwrites"
-    // contract into something the filesystem enforces rather than something a check hopes for.
-    // Losing that race is not a failure: the caller wanted a config to exist, and one does.
-    let publish_result = std::fs::hard_link(temporary, path);
-    let _ = std::fs::remove_file(temporary);
-
-    match publish_result {
-        Ok(()) => Ok(true),
-        Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
-        Err(source) => Err(ConfigError::Write {
-            path: path.to_path_buf(),
-            source,
-        }),
-    }
-}
-
 impl Config {
     /// Parse from a TOML string. Unknown keys are an error (typos must not be silently ignored).
     pub fn from_toml_str(text: &str) -> Result<Config, toml::de::Error> {
@@ -306,13 +280,12 @@ impl Config {
 
     /// Create `path` (and any missing parent directories) containing [`DEFAULT_CONFIG_TOML`]
     /// when it does not exist yet. Returns `true` when this call created the file, `false` when
-    /// one was already present — including when another process created it while this call was
-    /// writing. Never overwrites an existing file.
+    /// one was already present — including when another process created it first, since the
+    /// creation is what tests for it. Never overwrites an existing file.
+    ///
+    /// A write that fails partway removes the file it created. A process killed mid-write can
+    /// still leave a partial config, which surfaces as a parse error naming the path.
     pub fn write_default_if_missing(path: &std::path::Path) -> Result<bool, ConfigError> {
-        if path.exists() {
-            return Ok(false);
-        }
-
         if let Some(parent) = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -323,23 +296,38 @@ impl Config {
             })?;
         }
 
-        let mut temporary = path.as_os_str().to_os_string();
-        temporary.push(format!(".tmp-{}", std::process::id()));
-        let temporary = std::path::PathBuf::from(temporary);
+        // `create_new` is the existence check, not just the write: it is the only std call that
+        // refuses to replace an existing file AND works on every filesystem. `rename` replaces
+        // the destination silently on Windows, and `hard_link` fails with ERROR_NOT_SUPPORTED on
+        // exFAT (both measured 2026-07-27). Checking `exists()` first would only re-open the gap
+        // between the check and the write that this call closes.
+        let mut file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+        {
+            Ok(file) => file,
+            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+            Err(source) => {
+                return Err(ConfigError::Write {
+                    path: path.to_path_buf(),
+                    source,
+                });
+            }
+        };
 
-        let write_result = std::fs::File::create(&temporary).and_then(|mut file| {
-            std::io::Write::write_all(&mut file, DEFAULT_CONFIG_TOML.as_bytes())?;
-            file.sync_all()
-        });
-        if let Err(source) = write_result {
-            let _ = std::fs::remove_file(&temporary);
+        if let Err(source) = std::io::Write::write_all(&mut file, DEFAULT_CONFIG_TOML.as_bytes()) {
+            drop(file);
+            // A half-written config would parse-error on every later start, and the caller would
+            // have no way to tell it apart from one the user wrote.
+            let _ = std::fs::remove_file(path);
             return Err(ConfigError::Write {
                 path: path.to_path_buf(),
                 source,
             });
         }
 
-        publish_without_replacing(&temporary, path)
+        Ok(true)
     }
 
     /// Read `path`. A missing file is NOT an error: returns `Config::default()`.
@@ -500,8 +488,8 @@ mod tests {
     }
 
     #[test]
-    fn write_default_if_missing_leaves_no_temporary_file() {
-        let temp_dir = unique_temp_path("write-default-no-temporary-file");
+    fn write_default_if_missing_leaves_only_the_config_file() {
+        let temp_dir = unique_temp_path("write-default-only-the-config-file");
         let path = temp_dir.join("config.toml");
         assert!(!temp_dir.exists());
 
@@ -509,7 +497,8 @@ mod tests {
             .expect("the default config should be creatable");
 
         assert!(created, "the first call should create the config file");
-        // A leftover temporary file would look like stale config and accumulate on failed first runs.
+        // Creation must put exactly one file in the directory, so no future scheme leaves scratch
+        // files behind for the user to mistake for a stale config.
         let entries: Vec<_> = std::fs::read_dir(&temp_dir)
             .expect("the test config directory should be readable")
             .collect::<Result<_, _>>()
@@ -524,38 +513,6 @@ mod tests {
 
         std::fs::remove_dir_all(&temp_dir)
             .expect("the default config test directory should be removable");
-    }
-
-    #[test]
-    fn publishing_over_a_config_that_appeared_first_keeps_it_and_reports_not_created() {
-        let temp_dir = unique_temp_path("publish-over-config-that-appeared-first");
-        std::fs::create_dir(&temp_dir).expect("the unique test directory should be creatable");
-        let path = temp_dir.join("config.toml");
-        let temporary = temp_dir.join("config.toml.tmp-test");
-        std::fs::write(&path, "a config another process wrote")
-            .expect("the competing config should be writable");
-        std::fs::write(&temporary, DEFAULT_CONFIG_TOML)
-            .expect("the temporary default config should be writable");
-
-        // Another process created the config between this call's existence check and its publish.
-        let result = publish_without_replacing(&temporary, &path);
-
-        assert!(
-            matches!(result, Ok(false)),
-            "publishing should report that another process created the config first"
-        );
-        assert_eq!(
-            std::fs::read_to_string(&path).expect("the competing config should be readable"),
-            "a config another process wrote",
-            "the config that appeared first must not be replaced"
-        );
-        assert!(
-            !temporary.exists(),
-            "the unpublished temporary config should be removed"
-        );
-
-        std::fs::remove_dir_all(&temp_dir)
-            .expect("the publish race test directory should be removable");
     }
 
     #[test]
