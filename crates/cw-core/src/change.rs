@@ -163,11 +163,7 @@ pub fn change_threshold_is_reachable(
     max_logical_pixels(width, height, dpi_scale) > f64::from(config.change_area_logical_pixels)
 }
 
-pub(crate) fn rgba_image(
-    rgba: &[u8],
-    width: u32,
-    height: u32,
-) -> Result<image::RgbaImage, ImageBufferError> {
+fn rgba_image(rgba: &[u8], width: u32, height: u32) -> Result<image::RgbaImage, ImageBufferError> {
     if width == 0 || height == 0 {
         return Err(ImageBufferError::EmptyImage);
     }

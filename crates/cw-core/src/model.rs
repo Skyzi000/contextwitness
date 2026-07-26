@@ -16,7 +16,6 @@ pub struct ScreenPayload {
     pub width: u32,
     pub height: u32,
     pub image_path: Option<String>,
-    pub dhash: u64,
     pub ocr_status: OcrStatus,
     pub ocr_error: Option<String>,
     pub ocr_text: Option<String>,
@@ -107,7 +106,6 @@ mod tests {
             width: 1920,
             height: 1080,
             image_path: Some("screens/observation.png".to_owned()),
-            dhash: 123_456_789,
             ocr_status: OcrStatus::Succeeded,
             ocr_error: Some("non-fatal OCR warning".to_owned()),
             ocr_text: Some("テスト".to_owned()),
@@ -140,7 +138,7 @@ mod tests {
     fn payload_json_matches_golden_fixture() {
         let payload = fully_populated_screen_payload();
         let json = serde_json::to_string(&payload).expect("screen payload should serialize");
-        let golden = r#"{"monitor_id":"monitor-1","width":1920,"height":1080,"image_path":"screens/observation.png","dhash":123456789,"ocr_status":"succeeded","ocr_error":"non-fatal OCR warning","ocr_text":"テスト","ocr_langs":["ja-JP","en-US"],"foreground_process":"notepad.exe","foreground_window_title":"メモ帳"}"#;
+        let golden = r#"{"monitor_id":"monitor-1","width":1920,"height":1080,"image_path":"screens/observation.png","ocr_status":"succeeded","ocr_error":"non-fatal OCR warning","ocr_text":"テスト","ocr_langs":["ja-JP","en-US"],"foreground_process":"notepad.exe","foreground_window_title":"メモ帳"}"#;
 
         assert_eq!(json, golden);
         assert!(

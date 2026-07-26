@@ -3,7 +3,6 @@
 
 pub mod change;
 pub mod config;
-pub mod dhash;
 pub mod episode;
 pub mod model;
 pub mod privacy;

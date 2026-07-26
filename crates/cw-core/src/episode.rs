@@ -108,11 +108,11 @@ pub fn build_episode(
         // Fold only when this entry would render exactly the line the last kept one already put in
         // the document; then it adds nothing but a timestamp, which is the premise of folding.
         //
-        // `dhash` is deliberately absent. A 9x8 fingerprint does not move when text is typed — zero
-        // differing bits measured for ten characters on every supported configuration, and zero for
-        // four hundred at 3840x2160 — so equal fingerprints never justified a deletion. Requiring
-        // them to match is also backwards for playback, where the fingerprint moves every frame and
-        // would keep about 150 identical text-free lines for a five-minute video.
+        // Comparing the fields the renderer reads is the whole rule. An earlier version also
+        // consulted a perceptual fingerprint of the frame and that was wrong in both directions:
+        // a 9x8 hash does not move when text is typed, so equal hashes deleted entries that were
+        // not duplicates, and it moves on nearly every frame of a video, so requiring a match kept
+        // a hundred and fifty identical text-free lines. The fingerprint has since been removed.
         let current = current.1;
         let previous = previous.1;
 
@@ -236,7 +236,6 @@ mod tests {
 
     fn screen_payload(
         monitor_id: &str,
-        dhash: u64,
         ocr_status: OcrStatus,
         ocr_text: Option<&str>,
     ) -> ScreenPayload {
@@ -245,7 +244,6 @@ mod tests {
             width: 1920,
             height: 1080,
             image_path: None,
-            dhash,
             ocr_status,
             ocr_error: None,
             ocr_text: ocr_text.map(str::to_owned),
@@ -276,12 +274,7 @@ mod tests {
                     image_path: Some("images/a.webp".to_owned()),
                     foreground_process: Some("firefox.exe".to_owned()),
                     foreground_window_title: Some("Example Page".to_owned()),
-                    ..screen_payload(
-                        "DISPLAY1",
-                        1,
-                        OcrStatus::Succeeded,
-                        Some("line one\nline two"),
-                    )
+                    ..screen_payload("DISPLAY1", OcrStatus::Succeeded, Some("line one\nline two"))
                 },
             ),
             observation(
@@ -293,12 +286,7 @@ mod tests {
                     image_path: Some("images/b.webp".to_owned()),
                     foreground_process: Some("firefox.exe".to_owned()),
                     foreground_window_title: Some("Example Page".to_owned()),
-                    ..screen_payload(
-                        "DISPLAY1",
-                        1,
-                        OcrStatus::Succeeded,
-                        Some("line one\nline two"),
-                    )
+                    ..screen_payload("DISPLAY1", OcrStatus::Succeeded, Some("line one\nline two"))
                 },
             ),
             observation(
@@ -310,7 +298,7 @@ mod tests {
                     image_path: Some("images/c.webp".to_owned()),
                     foreground_process: Some("Code.exe".to_owned()),
                     foreground_window_title: Some("contextwitness - Visual Studio Code".to_owned()),
-                    ..screen_payload("DISPLAY1", 2, OcrStatus::Succeeded, Some("fn main() {}"))
+                    ..screen_payload("DISPLAY1", OcrStatus::Succeeded, Some("fn main() {}"))
                 },
             ),
             observation(
@@ -322,7 +310,7 @@ mod tests {
                     ocr_error: Some("engine unavailable".to_owned()),
                     foreground_process: Some("Code.exe".to_owned()),
                     foreground_window_title: Some("contextwitness - Visual Studio Code".to_owned()),
-                    ..screen_payload("DISPLAY1", 3, OcrStatus::Failed, None)
+                    ..screen_payload("DISPLAY1", OcrStatus::Failed, None)
                 },
             ),
             observation(
@@ -330,7 +318,7 @@ mod tests {
                 "2026-07-24T16:00:30Z",
                 ScreenPayload {
                     image_path: Some("images/e.webp".to_owned()),
-                    ..screen_payload("DISPLAY2", 4, OcrStatus::NoText, None)
+                    ..screen_payload("DISPLAY2", OcrStatus::NoText, None)
                 },
             ),
         ]
@@ -468,7 +456,7 @@ Monitor DISPLAY2 (1920x1080):
     }
 
     #[test]
-    fn same_dhash_with_different_ocr_text_is_never_collapsed() {
+    fn consecutive_entries_with_different_text_are_never_collapsed() {
         // A 9x8 fingerprint does not move when ten characters are typed: zero differing bits were
         // measured on every supported configuration, and still zero for up to 400 characters at
         // 3840x2160. Folding on it would drop the OCR text this product exists to deliver.
@@ -478,7 +466,7 @@ Monitor DISPLAY2 (1920x1080):
                 "2026-07-24T16:00:01Z",
                 ScreenPayload {
                     image_path: Some("images/earlier.webp".to_owned()),
-                    ..screen_payload("DISPLAY1", 1, OcrStatus::Succeeded, Some("earlier"))
+                    ..screen_payload("DISPLAY1", OcrStatus::Succeeded, Some("earlier"))
                 },
             ),
             observation(
@@ -486,7 +474,7 @@ Monitor DISPLAY2 (1920x1080):
                 "2026-07-24T16:00:02Z",
                 ScreenPayload {
                     image_path: Some("images/later.webp".to_owned()),
-                    ..screen_payload("DISPLAY1", 1, OcrStatus::Succeeded, Some("later"))
+                    ..screen_payload("DISPLAY1", OcrStatus::Succeeded, Some("later"))
                 },
             ),
         ];
@@ -505,40 +493,7 @@ Monitor DISPLAY2 (1920x1080):
     }
 
     #[test]
-    fn consecutive_identical_ocr_text_is_collapsed() {
-        let observations = vec![
-            observation(
-                1,
-                "2026-07-24T16:00:01Z",
-                ScreenPayload {
-                    image_path: Some("images/earlier.webp".to_owned()),
-                    ..screen_payload("DISPLAY1", 1, OcrStatus::Succeeded, Some("same"))
-                },
-            ),
-            observation(
-                2,
-                "2026-07-24T16:00:02Z",
-                ScreenPayload {
-                    image_path: Some("images/later.webp".to_owned()),
-                    ..screen_payload("DISPLAY1", 2, OcrStatus::Succeeded, Some("same"))
-                },
-            ),
-        ];
-
-        let episode = build_episode(
-            timestamp("2026-07-24T16:00:00Z"),
-            5,
-            FixedOffset::east_opt(0).expect("UTC offset should be valid"),
-            &observations,
-        )
-        .expect("the observations should build an episode");
-
-        assert_eq!(episode.metadata.entry_count, "1");
-        assert_eq!(episode.metadata.image_paths, "[\"images/earlier.webp\"]");
-    }
-
-    #[test]
-    fn text_free_entries_fold_across_a_changed_fingerprint() {
+    fn text_free_entries_from_the_same_application_fold() {
         // This is a video playing: the fingerprint moves on every frame while the document line
         // stays identical, and the old rule kept every one of them.
         let observations = vec![
@@ -548,7 +503,7 @@ Monitor DISPLAY2 (1920x1080):
                 ScreenPayload {
                     foreground_process: Some("vlc.exe".to_owned()),
                     foreground_window_title: Some("Movie".to_owned()),
-                    ..screen_payload("DISPLAY1", 1, OcrStatus::NoText, None)
+                    ..screen_payload("DISPLAY1", OcrStatus::NoText, None)
                 },
             ),
             observation(
@@ -557,7 +512,7 @@ Monitor DISPLAY2 (1920x1080):
                 ScreenPayload {
                     foreground_process: Some("vlc.exe".to_owned()),
                     foreground_window_title: Some("Movie".to_owned()),
-                    ..screen_payload("DISPLAY1", 2, OcrStatus::NoText, None)
+                    ..screen_payload("DISPLAY1", OcrStatus::NoText, None)
                 },
             ),
         ];
@@ -573,7 +528,7 @@ Monitor DISPLAY2 (1920x1080):
     }
 
     #[test]
-    fn a_different_application_keeps_the_entry_even_with_an_identical_fingerprint() {
+    fn a_different_application_keeps_the_entry() {
         // The fingerprint says nothing here: the switch between two text-free applications is the
         // only thing the entry records, and the old rule deleted it.
         let observations = vec![
@@ -582,7 +537,7 @@ Monitor DISPLAY2 (1920x1080):
                 "2026-07-24T16:00:01Z",
                 ScreenPayload {
                     foreground_process: Some("vlc.exe".to_owned()),
-                    ..screen_payload("DISPLAY1", 1, OcrStatus::NoText, None)
+                    ..screen_payload("DISPLAY1", OcrStatus::NoText, None)
                 },
             ),
             observation(
@@ -590,7 +545,7 @@ Monitor DISPLAY2 (1920x1080):
                 "2026-07-24T16:00:02Z",
                 ScreenPayload {
                     foreground_process: Some("game.exe".to_owned()),
-                    ..screen_payload("DISPLAY1", 1, OcrStatus::NoText, None)
+                    ..screen_payload("DISPLAY1", OcrStatus::NoText, None)
                 },
             ),
         ];
@@ -616,7 +571,7 @@ Monitor DISPLAY2 (1920x1080):
                 ScreenPayload {
                     foreground_process: Some("editor.exe".to_owned()),
                     foreground_window_title: Some("first.txt".to_owned()),
-                    ..screen_payload("DISPLAY1", 1, OcrStatus::Succeeded, Some("same text"))
+                    ..screen_payload("DISPLAY1", OcrStatus::Succeeded, Some("same text"))
                 },
             ),
             observation(
@@ -625,7 +580,7 @@ Monitor DISPLAY2 (1920x1080):
                 ScreenPayload {
                     foreground_process: Some("editor.exe".to_owned()),
                     foreground_window_title: Some("second.txt".to_owned()),
-                    ..screen_payload("DISPLAY1", 1, OcrStatus::Succeeded, Some("same text"))
+                    ..screen_payload("DISPLAY1", OcrStatus::Succeeded, Some("same text"))
                 },
             ),
         ];
@@ -648,14 +603,14 @@ Monitor DISPLAY2 (1920x1080):
             observation(
                 1,
                 "2026-07-24T16:00:01Z",
-                screen_payload("DISPLAY1", 1, OcrStatus::NoText, None),
+                screen_payload("DISPLAY1", OcrStatus::NoText, None),
             ),
             observation(
                 2,
                 "2026-07-24T16:00:02Z",
                 ScreenPayload {
                     ocr_error: Some("engine unavailable".to_owned()),
-                    ..screen_payload("DISPLAY1", 1, OcrStatus::Failed, None)
+                    ..screen_payload("DISPLAY1", OcrStatus::Failed, None)
                 },
             ),
         ];
@@ -681,7 +636,7 @@ Monitor DISPLAY2 (1920x1080):
                     "2026-07-24T16:00:01Z",
                     ScreenPayload {
                         ocr_error: Some("engine unavailable".to_owned()),
-                        ..screen_payload("DISPLAY1", 1, OcrStatus::Failed, None)
+                        ..screen_payload("DISPLAY1", OcrStatus::Failed, None)
                     },
                 ),
                 observation(
@@ -689,7 +644,7 @@ Monitor DISPLAY2 (1920x1080):
                     "2026-07-24T16:00:02Z",
                     ScreenPayload {
                         ocr_error: Some(second_error.to_owned()),
-                        ..screen_payload("DISPLAY1", 2, OcrStatus::Failed, None)
+                        ..screen_payload("DISPLAY1", OcrStatus::Failed, None)
                     },
                 ),
             ]
@@ -734,12 +689,12 @@ Monitor DISPLAY2 (1920x1080):
             observation(
                 1,
                 "2026-07-24T16:00:01Z",
-                screen_payload("DISPLAY1", 1, OcrStatus::NoText, None),
+                screen_payload("DISPLAY1", OcrStatus::NoText, None),
             ),
             observation(
                 2,
                 "2026-07-24T16:00:02Z",
-                screen_payload("DISPLAY1", 1, OcrStatus::Succeeded, Some("typed")),
+                screen_payload("DISPLAY1", OcrStatus::Succeeded, Some("typed")),
             ),
         ];
 
@@ -761,17 +716,17 @@ Monitor DISPLAY2 (1920x1080):
             observation(
                 1,
                 "2026-07-24T16:00:01Z",
-                screen_payload("DISPLAY1", 1, OcrStatus::Succeeded, Some("a")),
+                screen_payload("DISPLAY1", OcrStatus::Succeeded, Some("a")),
             ),
             observation(
                 2,
                 "2026-07-24T16:00:02Z",
-                screen_payload("DISPLAY1", 2, OcrStatus::Succeeded, Some("b")),
+                screen_payload("DISPLAY1", OcrStatus::Succeeded, Some("b")),
             ),
             observation(
                 3,
                 "2026-07-24T16:00:03Z",
-                screen_payload("DISPLAY1", 1, OcrStatus::Succeeded, Some("a")),
+                screen_payload("DISPLAY1", OcrStatus::Succeeded, Some("a")),
             ),
         ];
 
@@ -805,12 +760,12 @@ Monitor DISPLAY2 (1920x1080):
             observation(
                 1,
                 "2026-07-24T15:59:59Z",
-                screen_payload("DISPLAY1", 1, OcrStatus::NoText, None),
+                screen_payload("DISPLAY1", OcrStatus::NoText, None),
             ),
             observation(
                 2,
                 "2026-07-24T16:05:00Z",
-                screen_payload("DISPLAY1", 2, OcrStatus::NoText, None),
+                screen_payload("DISPLAY1", OcrStatus::NoText, None),
             ),
         ];
 
@@ -841,7 +796,7 @@ Monitor DISPLAY2 (1920x1080):
             observation(
                 2,
                 "2026-07-24T16:00:02Z",
-                screen_payload("DISPLAY1", 1, OcrStatus::NoText, None),
+                screen_payload("DISPLAY1", OcrStatus::NoText, None),
             ),
         ];
 
@@ -862,7 +817,7 @@ Monitor DISPLAY2 (1920x1080):
         let observations = vec![observation(
             1,
             "2026-07-24T16:00:01Z",
-            screen_payload("DISPLAY1", 1, OcrStatus::Failed, None),
+            screen_payload("DISPLAY1", OcrStatus::Failed, None),
         )];
 
         let episode = build_episode(
@@ -884,7 +839,7 @@ Monitor DISPLAY2 (1920x1080):
                 "2026-07-24T16:00:01Z",
                 ScreenPayload {
                     image_path: Some("images/a.webp".to_owned()),
-                    ..screen_payload("DISPLAY1", 1, OcrStatus::Succeeded, Some("x"))
+                    ..screen_payload("DISPLAY1", OcrStatus::Succeeded, Some("x"))
                 },
             ),
             observation(
@@ -892,7 +847,7 @@ Monitor DISPLAY2 (1920x1080):
                 "2026-07-24T16:00:02Z",
                 ScreenPayload {
                     image_path: Some("images/b.webp".to_owned()),
-                    ..screen_payload("DISPLAY1", 2, OcrStatus::Succeeded, Some("x"))
+                    ..screen_payload("DISPLAY1", OcrStatus::Succeeded, Some("x"))
                 },
             ),
             observation(
@@ -900,7 +855,7 @@ Monitor DISPLAY2 (1920x1080):
                 "2026-07-24T16:00:03Z",
                 ScreenPayload {
                     image_path: Some("images/c.webp".to_owned()),
-                    ..screen_payload("DISPLAY1", 3, OcrStatus::Succeeded, Some("x"))
+                    ..screen_payload("DISPLAY1", OcrStatus::Succeeded, Some("x"))
                 },
             ),
         ];
@@ -925,7 +880,7 @@ Monitor DISPLAY2 (1920x1080):
         let trailing = vec![observation(
             1,
             "2026-07-24T16:00:01Z",
-            screen_payload("DISPLAY1", 1, OcrStatus::Succeeded, Some("only line\n\n")),
+            screen_payload("DISPLAY1", OcrStatus::Succeeded, Some("only line\n\n")),
         )];
         let trailing_episode = build_episode(
             timestamp("2026-07-24T16:00:00Z"),
@@ -941,7 +896,7 @@ Monitor DISPLAY2 (1920x1080):
         let interior = vec![observation(
             1,
             "2026-07-24T16:00:01Z",
-            screen_payload("DISPLAY1", 1, OcrStatus::Succeeded, Some("a\n\nb\n\n")),
+            screen_payload("DISPLAY1", OcrStatus::Succeeded, Some("a\n\nb\n\n")),
         )];
         let interior_episode = build_episode(
             timestamp("2026-07-24T16:00:00Z"),
