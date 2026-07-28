@@ -84,16 +84,27 @@ pub enum StoreError {
     },
 }
 
+/// What the database header says this file is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ownership {
+    /// Already carries our application id.
+    Ours,
+    /// Carries no application id, holds nothing and has no version marker, so there is nothing to
+    /// take over.
+    FreeToClaim,
+}
+
 /// Refuse a database that belongs to another program.
 ///
 /// `user_version` cannot answer this: zero is SQLite's default and most applications never set it,
 /// so "version 0" means "not one of ours yet" only once the file is known to be ours in the first
 /// place. An id of zero on a database that holds nothing is the one case where there is nothing to
 /// take over, so that file is claimed rather than refused.
-fn ensure_database_is_ours(
-    conn: &rusqlite::Connection,
-    path: &std::path::Path,
-) -> Result<(), StoreError> {
+///
+/// A `user_version` that is not zero is not a default — some program wrote it — so a file carrying
+/// one is being managed by somebody even while it is still empty, and claiming it would overwrite
+/// the marker of an owner we can see is using the field. Zero is the only value that says nothing.
+fn ownership(conn: &rusqlite::Connection, path: &std::path::Path) -> Result<Ownership, StoreError> {
     let found: i32 = conn
         .pragma_query_value(None, "application_id", |row| row.get(0))
         .map_err(|source| StoreError::Open {
@@ -102,7 +113,7 @@ fn ensure_database_is_ours(
         })?;
 
     match found {
-        APPLICATION_ID => Ok(()),
+        APPLICATION_ID => Ok(Ownership::Ours),
         0 => {
             let entries: i64 = conn
                 .query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))
@@ -110,8 +121,8 @@ fn ensure_database_is_ours(
                     path: path.to_path_buf(),
                     source,
                 })?;
-            if entries == 0 {
-                Ok(())
+            if entries == 0 && read_user_version(conn, path)? == 0 {
+                Ok(Ownership::FreeToClaim)
             } else {
                 Err(StoreError::ForeignDatabase {
                     path: path.to_path_buf(),
@@ -192,7 +203,7 @@ pub fn open(path: &std::path::Path) -> Result<rusqlite::Connection, StoreError> 
 
     // Before the version gate, because "whose file is this" has to be settled before "which
     // schema is it at" — and both before the WAL switch, which is the first thing that writes.
-    ensure_database_is_ours(&conn, path)?;
+    ownership(&conn, path)?;
 
     // Refuse a file this build cannot handle BEFORE changing anything about it. Everything applied
     // above is per-connection, but the WAL switch below is written into the database header and
@@ -201,6 +212,8 @@ pub fn open(path: &std::path::Path) -> Result<rusqlite::Connection, StoreError> 
     // could still move the file forward between this read and the switch; that window is accepted,
     // because the most it can cost is a journal mode change a newer build of this program would
     // have made anyway.
+    // Neither of these two is the decision the schema rests on — both are taken again inside the
+    // write transaction, on the view the writes actually land on.
     let current = read_user_version(&conn, path)?;
     if !(0..=SCHEMA_VERSION).contains(&current) {
         return Err(StoreError::UnsupportedSchema {
@@ -227,6 +240,7 @@ fn migrate(conn: &mut rusqlite::Connection, path: &std::path::Path) -> Result<()
             path: path.to_path_buf(),
             source,
         })?;
+    let ownership = ownership(&transaction, path)?;
     let current = read_user_version(&transaction, path)?;
 
     // The lower bound is not decoration: current as usize on a negative number skips every
@@ -239,6 +253,17 @@ fn migrate(conn: &mut rusqlite::Connection, path: &std::path::Path) -> Result<()
         });
     }
 
+    // Claiming is not conditional on there being migrations to run: the two are separate facts, and
+    // a file we have decided to take over has to come out of this transaction carrying our name.
+    if ownership == Ownership::FreeToClaim {
+        transaction
+            .pragma_update(None, "application_id", APPLICATION_ID)
+            .map_err(|source| StoreError::Migrate {
+                path: path.to_path_buf(),
+                source,
+            })?;
+    }
+
     let pending = &MIGRATIONS[current as usize..];
     if !pending.is_empty() {
         for migration in pending {
@@ -249,14 +274,8 @@ fn migrate(conn: &mut rusqlite::Connection, path: &std::path::Path) -> Result<()
                     source,
                 })?;
         }
-        // Claimed in the same transaction that creates the schema, so a database only carries
-        // our name once it carries our tables.
-        transaction
-            .pragma_update(None, "application_id", APPLICATION_ID)
-            .map_err(|source| StoreError::Migrate {
-                path: path.to_path_buf(),
-                source,
-            })?;
+        // Written only when something was applied, so an already-current database's open stays a
+        // read.
         transaction
             .pragma_update(None, "user_version", SCHEMA_VERSION)
             .map_err(|source| StoreError::Migrate {
@@ -273,7 +292,7 @@ fn migrate(conn: &mut rusqlite::Connection, path: &std::path::Path) -> Result<()
 
 #[cfg(test)]
 mod tests {
-    use super::{SCHEMA_VERSION, StoreError, open};
+    use super::{APPLICATION_ID, SCHEMA_VERSION, StoreError, open};
     use tempfile::tempdir;
 
     #[test]
@@ -389,11 +408,14 @@ mod tests {
     fn a_schema_version_this_build_cannot_migrate_from_is_rejected() {
         // Above the range means a newer build has already written the file; below it would
         // otherwise skip every migration and return an empty database as though it had succeeded.
+        // The database has to be ours for the version to be the thing that refuses it.
         for found in [SCHEMA_VERSION + 1, -1] {
             let dir = tempdir().expect("the temporary database directory should be creatable");
             let path = dir.path().join("db.sqlite3");
             let conn = rusqlite::Connection::open(&path)
                 .expect("the schema-version test database should be openable");
+            conn.pragma_update(None, "application_id", APPLICATION_ID)
+                .expect("the ContextWitness application id should be writable");
             conn.pragma_update(None, "user_version", found)
                 .expect("the unsupported schema version should be writable");
             drop(conn);
@@ -410,10 +432,13 @@ mod tests {
 
     #[test]
     fn an_unsupported_database_is_not_modified() {
+        // The database has to be ours for the version to be the thing that refuses it.
         let dir = tempdir().expect("the temporary database directory should be creatable");
         let path = dir.path().join("db.sqlite3");
         let conn = rusqlite::Connection::open(&path)
             .expect("the unsupported-schema test database should be openable");
+        conn.pragma_update(None, "application_id", APPLICATION_ID)
+            .expect("the ContextWitness application id should be writable");
         conn.pragma_update(None, "user_version", SCHEMA_VERSION + 1)
             .expect("the unsupported schema version should be writable");
         let journal_mode: String = conn
@@ -441,6 +466,49 @@ mod tests {
             "refusing a file this build cannot handle means leaving it exactly as it was found, \
              and the WAL switch is written into the database header"
         );
+    }
+
+    #[test]
+    fn an_unclaimed_database_with_a_version_marker_is_refused_and_left_alone() {
+        for found in [SCHEMA_VERSION, SCHEMA_VERSION + 1] {
+            let dir = tempdir().expect("the temporary database directory should be creatable");
+            let path = dir.path().join("db.sqlite3");
+            let conn = rusqlite::Connection::open(&path)
+                .expect("the version-marked database should be openable");
+            conn.pragma_update(None, "user_version", found)
+                .expect("the version marker should be writable");
+            drop(conn);
+
+            match open(&path) {
+                Err(StoreError::ForeignDatabase { found, .. }) => assert_eq!(found, 0),
+                Err(error) => panic!("expected ForeignDatabase, got {error:?}"),
+                Ok(_) => panic!("the unclaimed version-marked database was accepted"),
+            }
+
+            let conn = rusqlite::Connection::open(&path)
+                .expect("the refused database should still be openable");
+            let journal_mode: String = conn
+                .pragma_query_value(None, "journal_mode", |row| row.get(0))
+                .expect("the refused database journal mode should be readable");
+            let user_version: i32 = conn
+                .pragma_query_value(None, "user_version", |row| row.get(0))
+                .expect("the refused database version marker should be readable");
+            let observations: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE name = 'observations'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("the ContextWitness table count should be readable");
+
+            assert_eq!(
+                (journal_mode.as_str(), user_version, observations),
+                ("delete", found, 0),
+                "SCHEMA_VERSION is the case that used to be accepted and handed back with no \
+                 tables in it, and a marker that is not zero is one somebody wrote, so the file \
+                 is not ours to take"
+            );
+        }
     }
 
     #[test]
