@@ -272,6 +272,7 @@ pub enum ConfigError {
         /// Underlying filesystem error.
         source: std::io::Error,
     },
+    /// Writing the default configuration file failed.
     #[error("failed to write config file {path}: {source}")]
     Write {
         /// Path that could not be written.
