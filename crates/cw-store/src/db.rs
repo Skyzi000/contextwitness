@@ -9,15 +9,12 @@ const MIGRATIONS: &[&str] = &[include_str!("../migrations/0001_init.sql")];
 /// The schema version this build understands.
 pub const SCHEMA_VERSION: i32 = MIGRATIONS.len() as i32;
 
-/// Applied to every connection, per design section 7. WAL and the busy timeout are the contract
-/// between the subsystems that each hold their own connection; foreign keys are off by default in
-/// SQLite and have to be asked for per connection.
-/// The busy timeout comes first: it is the only one of the three that has to be in place before
-/// another statement runs, because switching a brand-new file to WAL needs an exclusive lock and
-/// would otherwise fail outright against a concurrent first open.
-const CONNECTION_CONTRACT: &str = "\
+/// Per-connection settings, applied before anything else. Neither of these changes the database
+/// itself, so both are safe to apply to a file this build may turn out to be unable to handle;
+/// WAL is not, and is set separately below. The busy timeout comes first: it is the one that has
+/// to be in place before any statement that can meet a lock held by another connection.
+const CONNECTION_SETTINGS: &str = "\
     PRAGMA busy_timeout = 5000;\n\
-    PRAGMA journal_mode = WAL;\n\
     PRAGMA foreign_keys = ON;\n";
 
 /// Errors produced while opening or migrating the database.
@@ -39,6 +36,17 @@ pub enum StoreError {
         /// Underlying SQLite error.
         source: rusqlite::Error,
     },
+    /// The database could not be put into WAL mode.
+    #[error(
+        "database {path} is in {actual} mode, not WAL; the subsystems that each hold their own \
+         connection cannot share a database without it"
+    )]
+    JournalMode {
+        /// Database file path.
+        path: PathBuf,
+        /// Journal mode the database is actually in.
+        actual: String,
+    },
     /// Applying a database migration failed.
     #[error("failed to migrate database {path}: {source}")]
     Migrate {
@@ -59,6 +67,42 @@ pub enum StoreError {
         /// Highest schema version this build understands.
         supported: i32,
     },
+}
+
+/// Read `PRAGMA user_version`, the marker that decides which migrations still have to run.
+fn read_user_version(
+    conn: &rusqlite::Connection,
+    path: &std::path::Path,
+) -> Result<i32, StoreError> {
+    conn.pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(|source| StoreError::Migrate {
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
+/// Put the database into WAL mode, failing when it does not take.
+///
+/// `PRAGMA journal_mode = WAL` reports a refusal by returning the mode the database is actually in
+/// rather than by failing, so the returned row is the only evidence that the statement did what it
+/// says.
+fn enable_wal(conn: &rusqlite::Connection, path: &std::path::Path) -> Result<(), StoreError> {
+    let actual = conn
+        .query_row("PRAGMA journal_mode = WAL", [], |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(|source| StoreError::Open {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if actual.eq_ignore_ascii_case("wal") {
+        Ok(())
+    } else {
+        Err(StoreError::JournalMode {
+            path: path.to_path_buf(),
+            actual,
+        })
+    }
 }
 
 /// Open the database at `path`, apply the connection contract and bring the schema up to
@@ -83,11 +127,29 @@ pub fn open(path: &std::path::Path) -> Result<rusqlite::Connection, StoreError> 
         path: path.to_path_buf(),
         source,
     })?;
-    conn.execute_batch(CONNECTION_CONTRACT)
+    conn.execute_batch(CONNECTION_SETTINGS)
         .map_err(|source| StoreError::Open {
             path: path.to_path_buf(),
             source,
         })?;
+
+    // Refuse a file this build cannot handle BEFORE changing anything about it. Everything applied
+    // above is per-connection, but the WAL switch below is written into the database header and
+    // would outlive the refusal. This read is NOT the migration decision — that one is taken again
+    // inside the write transaction, where it is safe from a concurrent first start. A newer build
+    // could still move the file forward between this read and the switch; that window is accepted,
+    // because the most it can cost is a journal mode change a newer build of this program would
+    // have made anyway.
+    let current = read_user_version(&conn, path)?;
+    if !(0..=SCHEMA_VERSION).contains(&current) {
+        return Err(StoreError::UnsupportedSchema {
+            path: path.to_path_buf(),
+            found: current,
+            supported: SCHEMA_VERSION,
+        });
+    }
+
+    enable_wal(&conn, path)?;
     migrate(&mut conn, path)?;
     Ok(conn)
 }
@@ -104,12 +166,7 @@ fn migrate(conn: &mut rusqlite::Connection, path: &std::path::Path) -> Result<()
             path: path.to_path_buf(),
             source,
         })?;
-    let current: i32 = transaction
-        .pragma_query_value(None, "user_version", |row| row.get(0))
-        .map_err(|source| StoreError::Migrate {
-            path: path.to_path_buf(),
-            source,
-        })?;
+    let current = read_user_version(&transaction, path)?;
 
     // The lower bound is not decoration: current as usize on a negative number skips every
     // migration and would hand back a database with no tables and no error.
@@ -279,6 +336,52 @@ mod tests {
                 Err(error) => panic!("expected UnsupportedSchema for {found}, got {error:?}"),
                 Ok(_) => panic!("schema version {found} was accepted"),
             }
+        }
+    }
+
+    #[test]
+    fn an_unsupported_database_is_not_modified() {
+        let dir = tempdir().expect("the temporary database directory should be creatable");
+        let path = dir.path().join("db.sqlite3");
+        let conn = rusqlite::Connection::open(&path)
+            .expect("the unsupported-schema test database should be openable");
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+            .expect("the unsupported schema version should be writable");
+        let journal_mode: String = conn
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .expect("the starting journal mode should be readable");
+        assert_eq!(
+            journal_mode, "delete",
+            "the test database should start in rollback-journal mode"
+        );
+        drop(conn);
+
+        match open(&path) {
+            Err(StoreError::UnsupportedSchema { .. }) => {}
+            Err(error) => panic!("expected UnsupportedSchema, got {error:?}"),
+            Ok(_) => panic!("the unsupported schema version was accepted"),
+        }
+
+        let conn = rusqlite::Connection::open(&path)
+            .expect("the refused database should still be openable");
+        let journal_mode: String = conn
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .expect("the refused database journal mode should be readable");
+        assert_eq!(
+            journal_mode, "delete",
+            "refusing a file this build cannot handle means leaving it exactly as it was found, \
+             and the WAL switch is written into the database header"
+        );
+    }
+
+    #[test]
+    fn a_database_that_cannot_use_wal_is_refused() {
+        // The in-memory case stands in for the filesystem case, which has no seam: both refuse WAL
+        // by returning the mode the database is actually in rather than by failing.
+        match open(std::path::Path::new(":memory:")) {
+            Err(StoreError::JournalMode { actual, .. }) => assert_eq!(actual, "memory"),
+            Err(error) => panic!("expected JournalMode, got {error:?}"),
+            Ok(_) => panic!("the database opened without WAL"),
         }
     }
 }
