@@ -112,9 +112,13 @@ version = "0.1.0"
 name = "cw-store"
 version = "0.1.0"
 dependencies = [
+ "chrono",
+ "cw-core",
  "rusqlite",
+ "serde_json",
  "tempfile",
  "thiserror",
+ "ulid",
 ]
 
 [[package]]

@@ -1,6 +1,6 @@
 //! Owns how the database file is opened and how its schema is allowed to change.
 
-use std::path::PathBuf;
+use crate::StoreError;
 
 /// Every migration, in order. A script's index plus one is the schema version it produces, so
 /// [`SCHEMA_VERSION`] cannot drift away from the list.
@@ -20,69 +20,6 @@ const APPLICATION_ID: i32 = 0x4357_6974;
 const CONNECTION_SETTINGS: &str = "\
     PRAGMA busy_timeout = 5000;\n\
     PRAGMA foreign_keys = ON;\n";
-
-/// Errors produced while opening or migrating the database.
-#[derive(Debug, thiserror::Error)]
-pub enum StoreError {
-    /// Creating the directory that holds the database failed.
-    #[error("failed to create database directory {path}: {source}")]
-    Directory {
-        /// Directory that could not be created.
-        path: PathBuf,
-        /// Underlying filesystem error.
-        source: std::io::Error,
-    },
-    /// Opening the database or applying its connection contract failed.
-    #[error("failed to open database {path}: {source}")]
-    Open {
-        /// Database file path.
-        path: PathBuf,
-        /// Underlying SQLite error.
-        source: rusqlite::Error,
-    },
-    /// The database was not created by ContextWitness.
-    #[error(
-        "database {path} was not created by ContextWitness (application id {found}); point \
-         storage.data_dir at a directory of its own"
-    )]
-    ForeignDatabase {
-        /// Database file path.
-        path: PathBuf,
-        /// Application id found in the database header.
-        found: i32,
-    },
-    /// The database could not be put into WAL mode.
-    #[error(
-        "database {path} is in {actual} mode, not WAL; the subsystems that each hold their own \
-         connection cannot share a database without it"
-    )]
-    JournalMode {
-        /// Database file path.
-        path: PathBuf,
-        /// Journal mode the database is actually in.
-        actual: String,
-    },
-    /// Applying a database migration failed.
-    #[error("failed to migrate database {path}: {source}")]
-    Migrate {
-        /// Database file path.
-        path: PathBuf,
-        /// Underlying SQLite error.
-        source: rusqlite::Error,
-    },
-    /// The database schema version is outside the range this build understands.
-    #[error(
-        "database {path} has schema version {found}; versions 0 through {supported} are understood"
-    )]
-    UnsupportedSchema {
-        /// Database file path.
-        path: PathBuf,
-        /// Schema version found in the database.
-        found: i32,
-        /// Highest schema version this build understands.
-        supported: i32,
-    },
-}
 
 /// What the database header says this file is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -292,7 +229,8 @@ fn migrate(conn: &mut rusqlite::Connection, path: &std::path::Path) -> Result<()
 
 #[cfg(test)]
 mod tests {
-    use super::{APPLICATION_ID, SCHEMA_VERSION, StoreError, open};
+    use super::{APPLICATION_ID, SCHEMA_VERSION, open};
+    use crate::StoreError;
     use tempfile::tempdir;
 
     #[test]

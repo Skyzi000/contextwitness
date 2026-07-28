@@ -6,8 +6,12 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+cw-core.workspace = true
+chrono.workspace = true
 rusqlite.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
+ulid.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
