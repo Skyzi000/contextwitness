@@ -9,6 +9,10 @@ const MIGRATIONS: &[&str] = &[include_str!("../migrations/0001_init.sql")];
 /// The schema version this build understands.
 pub const SCHEMA_VERSION: i32 = MIGRATIONS.len() as i32;
 
+/// `PRAGMA application_id` of a ContextWitness database: ASCII "CWit". SQLite keeps this header
+/// field so a program can tell whose file it is looking at before it writes anything.
+const APPLICATION_ID: i32 = 0x4357_6974;
+
 /// Per-connection settings, applied before anything else. Neither of these changes the database
 /// itself, so both are safe to apply to a file this build may turn out to be unable to handle;
 /// WAL is not, and is set separately below. The busy timeout comes first: it is the one that has
@@ -35,6 +39,17 @@ pub enum StoreError {
         path: PathBuf,
         /// Underlying SQLite error.
         source: rusqlite::Error,
+    },
+    /// The database was not created by ContextWitness.
+    #[error(
+        "database {path} was not created by ContextWitness (application id {found}); point \
+         storage.data_dir at a directory of its own"
+    )]
+    ForeignDatabase {
+        /// Database file path.
+        path: PathBuf,
+        /// Application id found in the database header.
+        found: i32,
     },
     /// The database could not be put into WAL mode.
     #[error(
@@ -67,6 +82,48 @@ pub enum StoreError {
         /// Highest schema version this build understands.
         supported: i32,
     },
+}
+
+/// Refuse a database that belongs to another program.
+///
+/// `user_version` cannot answer this: zero is SQLite's default and most applications never set it,
+/// so "version 0" means "not one of ours yet" only once the file is known to be ours in the first
+/// place. An id of zero on a database that holds nothing is the one case where there is nothing to
+/// take over, so that file is claimed rather than refused.
+fn ensure_database_is_ours(
+    conn: &rusqlite::Connection,
+    path: &std::path::Path,
+) -> Result<(), StoreError> {
+    let found: i32 = conn
+        .pragma_query_value(None, "application_id", |row| row.get(0))
+        .map_err(|source| StoreError::Open {
+            path: path.to_path_buf(),
+            source,
+        })?;
+
+    match found {
+        APPLICATION_ID => Ok(()),
+        0 => {
+            let entries: i64 = conn
+                .query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))
+                .map_err(|source| StoreError::Open {
+                    path: path.to_path_buf(),
+                    source,
+                })?;
+            if entries == 0 {
+                Ok(())
+            } else {
+                Err(StoreError::ForeignDatabase {
+                    path: path.to_path_buf(),
+                    found: 0,
+                })
+            }
+        }
+        found => Err(StoreError::ForeignDatabase {
+            path: path.to_path_buf(),
+            found,
+        }),
+    }
 }
 
 /// Read `PRAGMA user_version`, the marker that decides which migrations still have to run.
@@ -133,6 +190,10 @@ pub fn open(path: &std::path::Path) -> Result<rusqlite::Connection, StoreError> 
             source,
         })?;
 
+    // Before the version gate, because "whose file is this" has to be settled before "which
+    // schema is it at" — and both before the WAL switch, which is the first thing that writes.
+    ensure_database_is_ours(&conn, path)?;
+
     // Refuse a file this build cannot handle BEFORE changing anything about it. Everything applied
     // above is per-connection, but the WAL switch below is written into the database header and
     // would outlive the refusal. This read is NOT the migration decision — that one is taken again
@@ -188,6 +249,14 @@ fn migrate(conn: &mut rusqlite::Connection, path: &std::path::Path) -> Result<()
                     source,
                 })?;
         }
+        // Claimed in the same transaction that creates the schema, so a database only carries
+        // our name once it carries our tables.
+        transaction
+            .pragma_update(None, "application_id", APPLICATION_ID)
+            .map_err(|source| StoreError::Migrate {
+                path: path.to_path_buf(),
+                source,
+            })?;
         transaction
             .pragma_update(None, "user_version", SCHEMA_VERSION)
             .map_err(|source| StoreError::Migrate {
@@ -382,6 +451,91 @@ mod tests {
             Err(StoreError::JournalMode { actual, .. }) => assert_eq!(actual, "memory"),
             Err(error) => panic!("expected JournalMode, got {error:?}"),
             Ok(_) => panic!("the database opened without WAL"),
+        }
+    }
+
+    #[test]
+    fn a_fresh_database_is_claimed() {
+        let dir = tempdir().expect("the temporary database directory should be creatable");
+        let path = dir.path().join("db.sqlite3");
+        let conn = open(&path).expect("the fresh database should initialize");
+        let application_id: i32 = conn
+            .pragma_query_value(None, "application_id", |row| row.get(0))
+            .expect("the application id should be readable");
+
+        // 0x43576974 spells "CWit" in ASCII.
+        assert_eq!(application_id, 0x4357_6974);
+    }
+
+    #[test]
+    fn another_applications_database_is_refused_and_left_alone() {
+        let dir = tempdir().expect("the temporary database directory should be creatable");
+        let path = dir.path().join("db.sqlite3");
+        let conn = rusqlite::Connection::open(&path)
+            .expect("the other application's database should be openable");
+        conn.execute("CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)", [])
+            .expect("the other application's table should be creatable");
+        conn.execute(
+            "INSERT INTO notes (body) VALUES (?1)",
+            ["someone else's data"],
+        )
+        .expect("the other application's row should be writable");
+        drop(conn);
+
+        match open(&path) {
+            Err(StoreError::ForeignDatabase { found, .. }) => assert_eq!(found, 0),
+            Err(error) => panic!("expected ForeignDatabase, got {error:?}"),
+            Ok(_) => panic!("the other application's database was accepted"),
+        }
+
+        let conn = rusqlite::Connection::open(&path)
+            .expect("the refused database should still be openable");
+        let body: String = conn
+            .query_row("SELECT body FROM notes", [], |row| row.get(0))
+            .expect("the other application's row should remain readable");
+        let journal_mode: String = conn
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .expect("the refused database journal mode should be readable");
+        let user_version: i32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("the refused database schema version should be readable");
+        let observations: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name = 'observations'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("the ContextWitness table count should be readable");
+
+        assert_eq!(
+            (
+                body.as_str(),
+                journal_mode.as_str(),
+                user_version,
+                observations
+            ),
+            ("someone else's data", "delete", 0, 0),
+            "a database another program owns must come back exactly as it was found, and \
+             user_version in particular is the field that program would be using for its own \
+             migrations"
+        );
+    }
+
+    #[test]
+    fn an_empty_database_claimed_by_another_application_is_refused() {
+        let dir = tempdir().expect("the temporary database directory should be creatable");
+        let path = dir.path().join("db.sqlite3");
+        let conn = rusqlite::Connection::open(&path)
+            .expect("the other application's database should be openable");
+        conn.pragma_update(None, "application_id", 0x0000_0001)
+            .expect("the other application's application id should be writable");
+        drop(conn);
+
+        // An empty file someone else has already put their name on is still theirs.
+        match open(&path) {
+            Err(StoreError::ForeignDatabase { found, .. }) => assert_eq!(found, 1),
+            Err(error) => panic!("expected ForeignDatabase, got {error:?}"),
+            Ok(_) => panic!("the other application's database was accepted"),
         }
     }
 }
