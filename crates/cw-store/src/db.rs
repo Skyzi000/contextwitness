@@ -100,6 +100,11 @@ fn read_user_version(
 /// `PRAGMA journal_mode = WAL` reports a refusal by returning the mode the database is actually in
 /// rather than by failing, so the returned row is the only evidence that the statement did what it
 /// says.
+/// `query_one` rather than `query_row`, because that evidence arrives before the statement is
+/// finished. The mode change is written in a transaction that commits when the statement halts,
+/// which is the step after the row: `query_row` never takes that step and rusqlite discards the
+/// reset it does instead, so an `SQLITE_IOERR` or `SQLITE_FULL` from that commit would be dropped
+/// and this function would report success. `query_one` steps again and returns it.
 ///
 /// Converting a rollback-journal database to WAL needs an exclusive lock, and this is the one
 /// statement `PRAGMA busy_timeout` does not reach: measured 2026-07-29 with a 5000 ms timeout in
@@ -113,7 +118,7 @@ fn read_user_version(
 fn enable_wal(conn: &rusqlite::Connection, path: &std::path::Path) -> Result<(), StoreError> {
     let deadline = std::time::Instant::now() + WAL_SWITCH_DEADLINE;
     loop {
-        match conn.query_row("PRAGMA journal_mode = WAL", [], |row| {
+        match conn.query_one("PRAGMA journal_mode = WAL", [], |row| {
             row.get::<_, String>(0)
         }) {
             Ok(actual) if actual.eq_ignore_ascii_case("wal") => return Ok(()),
@@ -447,9 +452,11 @@ mod tests {
 
         assert_eq!(
             value, "2026-07-27T00:00:00Z",
-            "a re-run of 0001_init.sql — which is what an IF NOT EXISTS or a drop-and-recreate \
-             would allow — would erase what is already stored, and the version marker is the \
-             only thing preventing it"
+            "reopening an already-migrated database has to hand back what was stored. Measured \
+             2026-07-30, a second run of 0001_init.sql fails with \"table observations already \
+             exists\" and rolls back, so a broken version marker would make the reopen above panic \
+             rather than reach this line — erasing this row would take a drop-and-recreate, which \
+             that file deliberately does not use"
         );
     }
 
