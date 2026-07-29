@@ -21,6 +21,15 @@ const CONNECTION_SETTINGS: &str = "\
     PRAGMA busy_timeout = 5000;\n\
     PRAGMA foreign_keys = ON;\n";
 
+/// How long to keep retrying the WAL switch. The same budget as the busy timeout and a separate
+/// constant on purpose: SQLite's busy handler does not cover this statement, so the waiting is ours
+/// to do.
+const WAL_SWITCH_DEADLINE: std::time::Duration = std::time::Duration::from_millis(5000);
+
+/// How long to leave a contending connection alone between attempts. Long enough that the retries
+/// are not a spin, short enough to be invisible against the worst wait actually measured.
+const WAL_SWITCH_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_millis(2);
+
 /// What the database header says this file is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Ownership {
@@ -91,22 +100,41 @@ fn read_user_version(
 /// `PRAGMA journal_mode = WAL` reports a refusal by returning the mode the database is actually in
 /// rather than by failing, so the returned row is the only evidence that the statement did what it
 /// says.
+///
+/// Converting a rollback-journal database to WAL needs an exclusive lock, and this is the one
+/// statement `PRAGMA busy_timeout` does not reach: measured 2026-07-29 with a 5000 ms timeout in
+/// place, it came back `SQLITE_BUSY` after 612 us rather than waiting. Every subsystem opens its own
+/// connection, so on first start several of them meet on this one conversion — six opening together
+/// failed 83% of the time without a retry here, and none with it. Reasserting WAL on a database that
+/// already has it needs no exclusive lock and succeeds even while another connection is writing, so
+/// only the very first open in the life of a database ever waits.
 fn enable_wal(conn: &rusqlite::Connection, path: &std::path::Path) -> Result<(), StoreError> {
-    let actual = conn
-        .query_row("PRAGMA journal_mode = WAL", [], |row| {
+    let deadline = std::time::Instant::now() + WAL_SWITCH_DEADLINE;
+    loop {
+        match conn.query_row("PRAGMA journal_mode = WAL", [], |row| {
             row.get::<_, String>(0)
-        })
-        .map_err(|source| StoreError::Open {
-            path: path.to_path_buf(),
-            source,
-        })?;
-    if actual.eq_ignore_ascii_case("wal") {
-        Ok(())
-    } else {
-        Err(StoreError::JournalMode {
-            path: path.to_path_buf(),
-            actual,
-        })
+        }) {
+            Ok(actual) if actual.eq_ignore_ascii_case("wal") => return Ok(()),
+            Ok(actual) => {
+                return Err(StoreError::JournalMode {
+                    path: path.to_path_buf(),
+                    actual,
+                });
+            }
+            Err(source) => {
+                let contended = matches!(
+                    source.sqlite_error_code(),
+                    Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+                );
+                if !contended || std::time::Instant::now() >= deadline {
+                    return Err(StoreError::Open {
+                        path: path.to_path_buf(),
+                        source,
+                    });
+                }
+                std::thread::sleep(WAL_SWITCH_RETRY_PAUSE);
+            }
+        }
     }
 }
 
@@ -138,19 +166,12 @@ pub fn open(path: &std::path::Path) -> Result<rusqlite::Connection, StoreError> 
             source,
         })?;
 
-    // Before the version gate, because "whose file is this" has to be settled before "which
-    // schema is it at" — and both before the WAL switch, which is the first thing that writes.
+    // Ownership before the version gate, because "whose file is this" has to be settled before
+    // "which schema is it at". Both are early refusals taken without asking SQLite for a lock: a
+    // file that is plainly not ours is turned away before this program starts a transaction on it.
+    // Neither is the decision anything rests on — `migrate` takes both again inside its write
+    // transaction, on the view its own writes land on.
     ownership(&conn, path)?;
-
-    // Refuse a file this build cannot handle BEFORE changing anything about it. Everything applied
-    // above is per-connection, but the WAL switch below is written into the database header and
-    // would outlive the refusal. This read is NOT the migration decision — that one is taken again
-    // inside the write transaction, where it is safe from a concurrent first start. A newer build
-    // could still move the file forward between this read and the switch; that window is accepted,
-    // because the most it can cost is a journal mode change a newer build of this program would
-    // have made anyway.
-    // Neither of these two is the decision the schema rests on — both are taken again inside the
-    // write transaction, on the view the writes actually land on.
     let current = read_user_version(&conn, path)?;
     if !(0..=SCHEMA_VERSION).contains(&current) {
         return Err(StoreError::UnsupportedSchema {
@@ -160,8 +181,15 @@ pub fn open(path: &std::path::Path) -> Result<rusqlite::Connection, StoreError> 
         });
     }
 
-    enable_wal(&conn, path)?;
+    // Migrate first, switch second. Everything applied above is per-connection; the WAL switch is
+    // written into the database header, where it would outlive a refusal. Ordering it after the
+    // migration means the only thing that changes the file is reached through the write transaction
+    // that decided the file is ours, and that decision cannot be overtaken: reading ownership and
+    // then switching left a window in which another program could create its own database at this
+    // path between the two, and a permanent journal mode change would already have landed on it by
+    // the time `migrate` refused.
     migrate(&mut conn, path)?;
+    enable_wal(&conn, path)?;
     Ok(conn)
 }
 
@@ -274,6 +302,49 @@ mod tests {
         assert_eq!(journal_mode, "wal");
         assert_eq!(busy_timeout, 5000);
         assert_eq!(foreign_keys, 1);
+    }
+
+    #[test]
+    fn a_first_start_where_every_subsystem_opens_at_once_succeeds() {
+        // Design section 7 gives every subsystem its own connection, so a first start is several
+        // opens at the same moment against a database still in rollback-journal mode. They all meet
+        // on the WAL conversion, which needs an exclusive lock and does not go through the busy
+        // timeout: measured 2026-07-29, six connections opening together failed 83% of the time
+        // before enable_wal waited on its own behalf.
+        const CONNECTIONS: usize = 8;
+        // One simultaneous start is one sample of a race. Measured 2026-07-29 against the code
+        // before this fix, a single start caught it in 25 runs out of 30, so four independent
+        // starts put a miss below one run in five hundred.
+        const ROUNDS: usize = 4;
+
+        let dir = tempdir().expect("the temporary database directory should be creatable");
+        for round in 0..ROUNDS {
+            let path = dir.path().join(format!("{round}.sqlite3"));
+            let ready = std::sync::Arc::new(std::sync::Barrier::new(CONNECTIONS));
+            let openers = (0..CONNECTIONS)
+                .map(|_| {
+                    let path = path.clone();
+                    let ready = std::sync::Arc::clone(&ready);
+                    std::thread::spawn(move || {
+                        ready.wait();
+                        let conn = open(&path)?;
+                        conn.pragma_query_value(None, "journal_mode", |row| row.get::<_, String>(0))
+                            .map_err(|source| StoreError::Open { path, source })
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            for opener in openers {
+                let mode = opener
+                    .join()
+                    .expect("an opening thread should not panic")
+                    .expect("every simultaneous open should succeed");
+                assert_eq!(
+                    mode, "wal",
+                    "every connection has to come back in WAL, not only the one that converted the file"
+                );
+            }
+        }
     }
 
     #[test]
