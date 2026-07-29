@@ -569,6 +569,38 @@ mod tests {
     }
 
     #[test]
+    fn a_resume_that_cannot_be_recorded_changes_nothing() {
+        let (_dir, mut conn) = database();
+        let event_id = ulid::Ulid::new();
+
+        set_pause(
+            &mut conn,
+            Pause::Indefinite,
+            event_id,
+            at(2026, 7, 30, 12, 0, 0),
+        )
+        .expect("the endless pause should be stored");
+
+        // This is the counterpart of `a_pause_that_cannot_be_recorded_changes_nothing`; without
+        // the transaction, the pause would be gone with nothing recording that it went.
+        let error = resume(&mut conn, event_id, at(2026, 7, 30, 12, 1, 0))
+            .expect_err("the duplicate event id should refuse the resume");
+
+        match error {
+            StoreError::RecordEvent { id, .. } => assert_eq!(id, event_id.to_string()),
+            other => panic!("expected RecordEvent, got {other:?}"),
+        }
+        assert_eq!(
+            get_pause(&conn).expect("the original pause should remain readable"),
+            Some(Pause::Indefinite)
+        );
+        let event_count: i64 = conn
+            .query_row("SELECT count(*) FROM control_events", [], |row| row.get(0))
+            .expect("the control event count should be readable");
+        assert_eq!(event_count, 1);
+    }
+
+    #[test]
     fn a_pause_that_is_both_kinds_at_once_is_refused() {
         let (_dir, conn) = database();
 
@@ -777,6 +809,17 @@ mod tests {
             at: at(2026, 7, 30, 12, 2, 0),
             detail: Some("middle.exe".to_owned()),
         };
+        // This boundary row is what tells `<= end - 1 ns` apart from `< end - 1 ns`; without it,
+        // that change passes every test while losing the event at the window's last nanosecond.
+        let boundary = ControlEvent {
+            id: ulid::Ulid::new(),
+            kind: EventKind::BlacklistSkip,
+            at: middle
+                .at
+                .checked_sub_signed(chrono::TimeDelta::nanoseconds(1))
+                .expect("the boundary timestamp should be representable"),
+            detail: Some("boundary.exe".to_owned()),
+        };
         let last = ControlEvent {
             id: ulid::Ulid::new(),
             kind: EventKind::BlacklistSkip,
@@ -784,7 +827,7 @@ mod tests {
             detail: Some("last.exe".to_owned()),
         };
 
-        for event in [&last, &first, &middle] {
+        for event in [&last, &first, &middle, &boundary] {
             record_event(&conn, event).expect("the audit event should be stored");
         }
         let earlier = events_in_window(&conn, at(2026, 7, 30, 12, 0, 0), middle.at)
@@ -792,11 +835,11 @@ mod tests {
         let later = events_in_window(&conn, middle.at, at(2026, 7, 30, 12, 4, 0))
             .expect("the later window should be readable");
 
-        assert_eq!(earlier, std::slice::from_ref(&first));
+        assert_eq!(earlier, [first.clone(), boundary.clone()]);
         assert_eq!(later, [middle.clone(), last.clone()]);
         let mut tiled = earlier;
         tiled.extend(later);
-        assert_eq!(tiled, [first, middle, last]);
+        assert_eq!(tiled, [first, boundary, middle, last]);
     }
 
     #[test]

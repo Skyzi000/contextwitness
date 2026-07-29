@@ -38,11 +38,20 @@ const NANOSECONDS_PER_SECOND: u32 = 1_000_000_000;
 /// Every task that stores a timestamp uses this, so the decision is taken once.
 pub(crate) fn to_sql(at: DateTime<Utc>) -> Result<String, crate::StoreError> {
     let spelled = at.to_rfc3339_opts(SecondsFormat::Nanos, true);
-    if spelled.len() == SPELLED_LENGTH && at.nanosecond() < NANOSECONDS_PER_SECOND {
-        Ok(spelled)
-    } else {
-        Err(crate::StoreError::TimestampOutOfRange { at: spelled })
+    if at.nanosecond() >= NANOSECONDS_PER_SECOND {
+        // Reporting `spelled` alone would name an ordinary instant this schema stores every day:
+        // that is the whole defect being refused here, the two values sharing one text.
+        return Err(crate::StoreError::TimestampOutOfRange {
+            at: format!(
+                "{spelled} spelled from a nanosecond field of {}",
+                at.nanosecond()
+            ),
+        });
     }
+    if spelled.len() != SPELLED_LENGTH {
+        return Err(crate::StoreError::TimestampOutOfRange { at: spelled });
+    }
+    Ok(spelled)
 }
 
 /// Read a timestamp back, accepting only the spelling [`to_sql`] writes.
@@ -53,8 +62,11 @@ pub(crate) fn to_sql(at: DateTime<Utc>) -> Result<String, crate::StoreError> {
 /// digit sorts before the `Z` that should follow the ninth, and an offset can carry a year outside
 /// the range across the boundary into one `to_sql` refuses to write. Re-spelling what was parsed
 /// and demanding the original back is the whole check, and it cannot fall out of step with
-/// [`to_sql`] because it is [`to_sql`]. A row this program did not write fails loudly here rather
-/// than disappearing from a query later.
+/// [`to_sql`] because it is [`to_sql`]. That makes a row this program did not write fail loudly the
+/// moment it is decoded — but only then. A range query compares the stored TEXT before anything is
+/// decoded, so a row spelled some other way is not refused there, it is simply not selected, and
+/// this function never sees it. Nothing but [`to_sql`] may write one of these columns; the decoder
+/// catches a bad row, it does not prevent one.
 pub(crate) fn from_sql(
     text: &str,
 ) -> Result<DateTime<Utc>, Box<dyn std::error::Error + Send + Sync>> {
@@ -114,6 +126,10 @@ mod tests {
         let spellings = [
             // This ordinary instant would not sort against the `Z` spellings.
             "2026-07-30T12:00:00.000000000+09:00",
+            // Exactly thirty characters, and nine hours from where its text sorts: a length check
+            // cannot tell this from the spelling this schema writes. Measured 2026-07-30, it parses to
+            // 03:00:00 UTC and its text sorts after 11:59:59.999999999Z.
+            "2026-07-30T12:00:00.0000+09:00",
             // chrono would drop this tenth digit, but SQLite would keep comparing it.
             "2026-07-30T12:00:00.0000000001Z",
             // This eight-digit fraction would leave the stored text one character short.
@@ -124,6 +140,7 @@ mod tests {
             "2026-07-30T12:00:00Z",
         ];
 
+        assert_eq!("2026-07-30T12:00:00.0000+09:00".len(), SPELLED_LENGTH);
         for spelling in spellings {
             assert!(from_sql(spelling).is_err(), "{spelling} should be refused");
         }
