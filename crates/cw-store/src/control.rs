@@ -487,6 +487,14 @@ mod tests {
             get_pause(&conn).expect("the absent pause should be readable"),
             None
         );
+
+        // The request changed nothing, which is exactly why the row matters: the trail records what
+        // was asked for, not only what moved.
+        let events = events_in_window(&conn, at(2026, 7, 30, 12, 0, 0), at(2026, 7, 30, 12, 0, 1))
+            .expect("the audit window should be readable");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, EventKind::Resumed);
+        assert_eq!(events[0].detail, None);
     }
 
     #[test]

@@ -2,8 +2,10 @@
 
 use chrono::{DateTime, SecondsFormat, Timelike, Utc};
 
-/// The spelled length of every timestamp this schema stores. Years 0000 through 9999 produce it;
-/// anything outside them gains a sign and a digit (measured 2026-07-28) and is refused.
+/// The spelled length of every timestamp this schema stores. Years 0000 through 9999 produce it.
+/// Measured 2026-07-28, a year above gains a sign and a digit — 10000 spells `+10000-…` at 32
+/// characters — and a year below gains only a sign, so -1 spells `-0001-…` at 31. Both are refused;
+/// only the first is refused for the reason the length suggests.
 const SPELLED_LENGTH: usize = 30;
 
 /// One more than the largest value a real nanosecond field can hold. chrono spends everything at or
@@ -13,7 +15,7 @@ const NANOSECONDS_PER_SECOND: u32 = 1_000_000_000;
 /// Spell `at` for a TEXT column.
 ///
 /// Fixed width, nanosecond precision, `Z`. Every timestamp column in this schema is compared with
-/// `<` and `>=` in SQL, which compares the stored text, so string order has to be time order — and
+/// `>=` and `<=` in SQL, which compares the stored text, so string order has to be time order — and
 /// that is a property of the spelling, not of RFC 3339. With the fraction dropped when it is zero,
 /// `2026-07-25T12:34:56Z` sorts AFTER `2026-07-25T12:34:56.999999999Z`, because `Z` is 0x5A and `.`
 /// is 0x2E (measured 2026-07-28), so a row half a second into a window falls outside its own lower
@@ -32,8 +34,10 @@ const NANOSECONDS_PER_SECOND: u32 = 1_000_000_000;
 /// which no window can contain, since it falls after the last instant of one window and before the
 /// first of the next. Requiring a real nanosecond field makes the spelling name exactly one instant
 /// and keeps the stored instants on the grid, which is what lets `find_in_window` state
-/// `[start, end)` as `[start, end - 1ns]` at all. Nothing real is lost: `Utc::now()` builds from a
-/// `Duration` since the epoch, whose subsecond part is below one second by construction.
+/// `[start, end)` as `[start, end - 1ns]` at all, in `observations::find_in_window` and
+/// `control::events_in_window` alike.
+/// Nothing real is lost: `Utc::now()` builds from a `Duration` since the epoch, whose subsecond part
+/// is below one second by construction.
 ///
 /// Every task that stores a timestamp uses this, so the decision is taken once.
 pub(crate) fn to_sql(at: DateTime<Utc>) -> Result<String, crate::StoreError> {
@@ -223,7 +227,14 @@ mod tests {
         // The width and collision above are why refusing the overflowing value is not optional.
         let error =
             to_sql(overflowing).expect_err("the timestamp that names another instant should fail");
-        assert!(matches!(error, StoreError::TimestampOutOfRange { .. }));
+        let StoreError::TimestampOutOfRange { at } = error else {
+            panic!("expected TimestampOutOfRange, got {error:?}")
+        };
+        assert_eq!(
+            at, "2026-07-25T12:34:59.333333333Z spelled from a nanosecond field of 1333333333",
+            "the bare spelling belongs to an ordinary instant this schema stores, so reporting it \
+             alone would name the wrong value — which is the collision this test exists to show"
+        );
         let restored = from_sql(&spelled).expect("the ordinary instant's spelling should parse");
         assert_eq!(restored, ordinary);
     }
