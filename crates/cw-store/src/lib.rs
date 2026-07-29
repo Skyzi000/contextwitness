@@ -1,6 +1,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 //! Persistent storage functionality for ContextWitness.
 
+pub mod control;
 pub mod db;
 pub mod observations;
 mod timestamp;
@@ -116,5 +117,14 @@ pub enum StoreError {
     NotFaithful {
         /// Primary key of the observation that was not stored.
         id: String,
+    },
+    /// A control row could not be read as the value it stands for.
+    #[error("control row {subject} cannot be read: {source}")]
+    Control {
+        /// The `control_state` key, or the `control_events` id, the row is under.
+        subject: String,
+        /// What made the row unreadable.
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
     },
 }
