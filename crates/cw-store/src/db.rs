@@ -179,8 +179,10 @@ pub fn open(path: &std::path::Path) -> Result<rusqlite::Connection, StoreError> 
     // before the commit with a `sqlite_master` read after it — and calls a database this program
     // has just created somebody else's. Measured 2026-07-30, eight connections opening 0.9 ms apart
     // failed 52% of their opens that way; inside one read transaction it is 0% at every spacing
-    // tried, because a late connection either sees the file as it was and then blocks on `migrate`,
-    // or sees it already claimed.
+    // tried. What makes it safe is not that a late connection waits — it may find the migration
+    // already committed and take its own write lock without waiting at all — but that the two
+    // answers it reads are answers about the same moment, so neither can be a refusal assembled
+    // out of one reading from before another connection's commit and one from after.
     //
     // Ownership before the version gate, because "whose file is this" has to be settled before
     // "which schema is it at". Both are early refusals, and they earn their place by keeping this
