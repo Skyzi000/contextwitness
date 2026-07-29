@@ -16,9 +16,13 @@ const NANOSECONDS_PER_SECOND: u32 = 1_000_000_000;
 
 /// Spell `at` for a TEXT column.
 ///
-/// Fixed width, nanosecond precision, `Z`. Every timestamp column in this schema is compared with
-/// `>=` and `<=` in SQL, which compares the stored text, so string order has to be time order — and
-/// that is a property of the spelling, not of RFC 3339. With the fraction dropped when it is zero,
+/// Fixed width, nanosecond precision, `Z`. The columns a range query compares —
+/// `observations.observed_at` and `control_events.at` — are compared with `>=` and `<=` on the
+/// stored text, so string order has to be time order, and that is a property of the spelling, not
+/// of RFC 3339. The pause deadline and the health marks are fetched by key and decoded in Rust
+/// instead, and use this same spelling anyway: the decision is taken once, and a column that
+/// becomes range-compared later is already right rather than needing to be found first.
+/// With the fraction dropped when it is zero,
 /// `2026-07-25T12:34:56Z` sorts AFTER `2026-07-25T12:34:56.999999999Z`, because `Z` is 0x5A and `.`
 /// is 0x2E (measured 2026-07-28), so a row half a second into a window falls outside its own lower
 /// bound. Nanoseconds are not decoration either: the clock this program reads carries 100 ns
@@ -75,11 +79,14 @@ pub(crate) fn to_sql(at: DateTime<Utc>) -> Result<String, crate::StoreError> {
 /// digit sorts before the `Z` that should follow the ninth, and an offset can carry a year outside
 /// the range across the boundary into one `to_sql` refuses to write. Re-spelling what was parsed
 /// and demanding the original back is the whole check, and it cannot fall out of step with
-/// [`to_sql`] because it is [`to_sql`]. That makes a row this program did not write fail loudly the
-/// moment it is decoded — but only then. A range query compares the stored TEXT before anything is
-/// decoded, so a row spelled some other way is not refused there, it is simply not selected, and
-/// this function never sees it. Nothing but [`to_sql`] may write one of these columns; the decoder
-/// catches a bad row, it does not prevent one.
+/// [`to_sql`] because it is [`to_sql`]. What that is worth depends on who asks, because a range
+/// query compares the stored TEXT before anything is decoded. Measured 2026-07-30, all three of
+/// `…T12:00:00Z`, `…T12:00:00.0000+09:00` and `…T12:00:00.0000000001Z` sort inside a window
+/// covering that whole day, so such a query reaches this function and fails loudly; a five-minute
+/// window around noon selects only the first and drops the other two before the decoder is reached,
+/// losing them in silence. One row, two behaviours, decided by the bounds. Nothing but [`to_sql`]
+/// may write one of these columns: this function catches a bad row when a query happens to reach
+/// it, it does not prevent one.
 /// The reason `to_sql` gives for refusing the re-spelling is deliberately dropped: it describes the
 /// value that came back from parsing, and what has to be repaired is the text in the column. An
 /// error naming `-0001-12-31T23:59:00.000000000Z` for a row that reads
