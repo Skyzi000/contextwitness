@@ -7,8 +7,9 @@ const SELECT_BY_ID: &str = "SELECT id, source, observed_at, duration_ms, schema_
      FROM observations WHERE id = ?1";
 
 /// Half-open in its contract, inclusive in its SQL: `[start, end)` is exactly `[start, end - 1ns]`
-/// because every stored value is a whole number of nanoseconds, and saying it that way keeps the
-/// upper bound inside the fixed-width spelling. `build_episode` takes `[start, end)`, and adjacent
+/// because the instants this schema represents are the nanosecond grid — `to_sql` refuses an
+/// overflowing nanosecond field, so nothing storable lies strictly between the two.
+/// `build_episode` takes `[start, end)`, and adjacent
 /// five-minute windows have to tile: with both bounds inclusive an observation landing exactly on a
 /// boundary is delivered in two episodes, whose differing document ids mean nothing downstream
 /// notices. The `id` tiebreak is not decoration — one tick captures several monitors and can stamp
@@ -105,6 +106,12 @@ pub fn find_in_window(
     start: chrono::DateTime<chrono::Utc>,
     end: chrono::DateTime<chrono::Utc>,
 ) -> Result<Vec<Observation>, StoreError> {
+    // An empty or reversed window is empty whatever its bounds spell, and answering it does not
+    // require them to be spellable at all.
+    if end <= start {
+        return Ok(Vec::new());
+    }
+
     // The window's last instant, which is what the statement compares against. `checked_sub_signed`
     // rather than `-`: subtracting from the earliest instant chrono has would panic, and a window
     // ending there holds nothing.
@@ -179,7 +186,7 @@ fn decode(
 mod tests {
     use super::{find_by_id, find_in_window, insert, payload_json};
     use crate::{StoreError, db};
-    use chrono::{DateTime, TimeDelta, TimeZone, Utc};
+    use chrono::{DateTime, TimeDelta, TimeZone, Timelike, Utc};
     use cw_core::model::{
         CURRENT_SCHEMA_VERSION, Observation, OcrStatus, ScreenPayload, SourcePayload,
     };
@@ -391,6 +398,56 @@ mod tests {
         let found = find_by_id(&conn, observation.id)
             .expect("the refused observation lookup should succeed");
         assert_eq!(found, None);
+    }
+
+    #[test]
+    fn a_timestamp_that_names_another_instant_never_reaches_the_database() {
+        let dir = tempdir().expect("the temporary database directory should be creatable");
+        let path = dir.path().join("db.sqlite3");
+        let conn = db::open(&path).expect("the fresh database should initialize");
+        let observed_at = Utc
+            .with_ymd_and_hms(2016, 12, 31, 23, 59, 59)
+            .single()
+            .expect("the test timestamp should be valid")
+            .with_nanosecond(1_500_000_000)
+            .expect("the leap second should be valid");
+        let observation = screen_observation_at(observed_at);
+
+        // The row is refused precisely because no window could have returned it.
+        let error = insert(&conn, &observation)
+            .expect_err("the timestamp that no window contains should be refused");
+        assert!(matches!(error, StoreError::TimestampOutOfRange { .. }));
+        let found = find_by_id(&conn, observation.id)
+            .expect("the refused observation lookup should succeed");
+        assert_eq!(found, None);
+
+        let found = find_in_window(
+            &conn,
+            at("2016-12-31T23:55:00Z"),
+            at("2017-01-01T00:00:00Z"),
+        )
+        .expect("the window should be readable");
+        assert_eq!(found, Vec::new());
+    }
+
+    #[test]
+    fn an_empty_or_reversed_window_is_empty_rather_than_an_error() {
+        let dir = tempdir().expect("the temporary database directory should be creatable");
+        let path = dir.path().join("db.sqlite3");
+        let conn = db::open(&path).expect("the fresh database should initialize");
+        let t = at("2026-07-25T12:34:56Z");
+        let observation = screen_observation_at(t);
+
+        insert(&conn, &observation).expect("the ordinary observation should be stored");
+
+        let empty = find_in_window(&conn, t, t).expect("the empty window should be readable");
+        assert_eq!(empty, Vec::new());
+        let reversed = find_in_window(&conn, t + TimeDelta::seconds(1), t)
+            .expect("the reversed window should be readable");
+        assert_eq!(reversed, Vec::new());
+        let unspellable = find_in_window(&conn, DateTime::<Utc>::MAX_UTC, DateTime::<Utc>::MAX_UTC)
+            .expect("the unspellable empty window should be readable");
+        assert_eq!(unspellable, Vec::new());
     }
 
     #[test]

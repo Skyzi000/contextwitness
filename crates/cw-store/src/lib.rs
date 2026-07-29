@@ -94,10 +94,10 @@ pub enum StoreError {
         /// The value that does not fit.
         duration_ms: u64,
     },
-    /// A timestamp has no fixed-width spelling, so it can be neither stored nor compared.
+    /// A timestamp is not one this schema represents.
     #[error(
-        "timestamp {at} cannot be stored: only the years 0000 through 9999 have the fixed-width \
-         spelling this schema's TEXT comparisons depend on"
+        "timestamp {at} is not one this schema stores: its instants are the nanosecond grid in \
+         the years 0000 through 9999"
     )]
     TimestampOutOfRange {
         /// The timestamp that has no fixed-width spelling.
