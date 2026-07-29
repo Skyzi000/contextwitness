@@ -437,10 +437,14 @@ mod tests {
             .expect("the leap second should be valid");
         let observation = screen_observation_at(observed_at);
 
+        // Without a row to find, an empty result proves nothing about the query.
+        let ordinary = screen_observation_at(at("2016-12-31T23:59:59.999999999Z"));
+        insert(&conn, &ordinary).expect("the ordinary observation should be stored");
+
         // The row is refused because a window query would lose it even though the half-open
         // contract places it inside.
         let error = insert(&conn, &observation)
-            .expect_err("the timestamp that no window contains should be refused");
+            .expect_err("the timestamp no window query could return should be refused");
         assert!(matches!(error, StoreError::TimestampOutOfRange { .. }));
         let found = find_by_id(&conn, observation.id)
             .expect("the refused observation lookup should succeed");
@@ -452,7 +456,7 @@ mod tests {
             at("2017-01-01T00:00:00Z"),
         )
         .expect("the window should be readable");
-        assert_eq!(found, Vec::new());
+        assert_eq!(found, vec![ordinary]);
     }
 
     #[test]

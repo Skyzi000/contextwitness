@@ -80,16 +80,21 @@ pub(crate) fn to_sql(at: DateTime<Utc>) -> Result<String, crate::StoreError> {
 /// decoded, so a row spelled some other way is not refused there, it is simply not selected, and
 /// this function never sees it. Nothing but [`to_sql`] may write one of these columns; the decoder
 /// catches a bad row, it does not prevent one.
+/// The reason `to_sql` gives for refusing the re-spelling is deliberately dropped: it describes the
+/// value that came back from parsing, and what has to be repaired is the text in the column. An
+/// error naming `-0001-12-31T23:59:00.000000000Z` for a row that reads
+/// `0000-01-01T00:00:00.000000000+00:01` points at nothing anyone can find.
 pub(crate) fn from_sql(
     text: &str,
 ) -> Result<DateTime<Utc>, Box<dyn std::error::Error + Send + Sync>> {
     let at = DateTime::parse_from_rfc3339(text)?.with_timezone(&Utc);
-    if to_sql(at)? != text {
-        return Err(Box::new(crate::StoreError::TimestampOutOfRange {
+    if to_sql(at).is_ok_and(|spelled| spelled == text) {
+        Ok(at)
+    } else {
+        Err(Box::new(crate::StoreError::TimestampOutOfRange {
             at: text.to_owned(),
-        }));
+        }))
     }
-    Ok(at)
 }
 
 #[cfg(test)]
@@ -157,6 +162,16 @@ mod tests {
         for spelling in spellings {
             assert!(from_sql(spelling).is_err(), "{spelling} should be refused");
         }
+
+        // This is the case where the re-spelling itself fails. Reporting what came back from
+        // parsing would name a row that does not exist.
+        let spelling = "0000-01-01T00:00:00.000000000+00:01";
+        let error = from_sql(spelling).expect_err("the non-canonical spelling should be refused");
+        let Some(StoreError::TimestampOutOfRange { at }) = error.downcast_ref::<StoreError>()
+        else {
+            panic!("expected TimestampOutOfRange, got {error:?}")
+        };
+        assert_eq!(at, spelling);
 
         let original = Utc
             .with_ymd_and_hms(2026, 7, 30, 12, 0, 0)
@@ -249,7 +264,7 @@ mod tests {
     }
 
     #[test]
-    fn a_leap_second_belongs_to_no_window_and_is_refused() {
+    fn a_leap_second_inside_a_window_but_lost_by_its_query_is_refused() {
         let leap = Utc
             .with_ymd_and_hms(2016, 12, 31, 23, 59, 59)
             .single()
@@ -278,6 +293,9 @@ mod tests {
 
         assert!(last_ordinary_spelling < spelled);
         assert!(spelled < next_window_spelling);
+        // These DateTime comparisons are the half-open contract placing the value inside the
+        // earlier window. The two spelling comparisons above are the query losing it at both ends;
+        // together they are why this value must never be stored.
         assert!(leap > last_ordinary);
         assert!(leap < next_window_start);
 
@@ -292,9 +310,10 @@ mod tests {
              mid-minute collision, and both refusals report the field they were spelled from"
         );
         let error = from_sql(&spelled).expect_err("the leap second spelling should be refused");
-        assert!(matches!(
-            error.downcast_ref::<StoreError>(),
-            Some(StoreError::TimestampOutOfRange { .. })
-        ));
+        let Some(StoreError::TimestampOutOfRange { at }) = error.downcast_ref::<StoreError>()
+        else {
+            panic!("expected TimestampOutOfRange, got {error:?}")
+        };
+        assert_eq!(at, "2016-12-31T23:59:60.500000000Z");
     }
 }
