@@ -97,8 +97,8 @@ pub enum StoreError {
     },
     /// A timestamp is not one this schema represents.
     #[error(
-        "timestamp {at} is not one this schema stores: its instants are the nanosecond grid in \
-         the years 0000 through 9999"
+        "timestamp {at} is not one this schema stores: it keeps the nanosecond grid in the years \
+         0000 through 9999, spelled with nine fractional digits and a trailing Z"
     )]
     TimestampOutOfRange {
         /// The timestamp that has no fixed-width spelling.
@@ -121,10 +121,19 @@ pub enum StoreError {
     /// A control row could not be read as the value it stands for.
     #[error("control row {subject} cannot be read: {source}")]
     Control {
-        /// The `control_state` key, or the `control_events` id, the row is under.
+        /// The `control_state` key, or the `control_events` id, the failure is about. A failure
+        /// that is about more than one row names all of them.
         subject: String,
         /// What made the row unreadable.
         #[source]
         source: Box<dyn std::error::Error + Send + Sync>,
+    },
+    /// Appending to the audit trail failed.
+    #[error("failed to record control event {id}: {source}")]
+    RecordEvent {
+        /// Primary key of the event that was not recorded.
+        id: String,
+        /// Underlying SQLite error.
+        source: rusqlite::Error,
     },
 }

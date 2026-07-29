@@ -130,7 +130,7 @@ pub fn get_pause(conn: &rusqlite::Connection) -> Result<Option<Pause>, StoreErro
 
     match (pause_until, pause_indefinite) {
         (Some(_), Some(_)) => Err(StoreError::Control {
-            subject: PAUSE_INDEFINITE.to_owned(),
+            subject: format!("{PAUSE_UNTIL} + {PAUSE_INDEFINITE}"),
             source: invalid_data("both keys are set and only one of them can be true"),
         }),
         (None, Some(value)) => {
@@ -270,7 +270,10 @@ pub fn record_event(conn: &rusqlite::Connection, event: &ControlEvent) -> Result
             event.detail,
         ],
     )
-    .map_err(|source| StoreError::Sql { source })?;
+    .map_err(|source| StoreError::RecordEvent {
+        id: event.id.to_string(),
+        source,
+    })?;
 
     Ok(())
 }
@@ -529,6 +532,43 @@ mod tests {
     }
 
     #[test]
+    fn a_pause_that_cannot_be_recorded_changes_nothing() {
+        let (_dir, mut conn) = database();
+        let event_id = ulid::Ulid::new();
+
+        set_pause(
+            &mut conn,
+            Pause::Indefinite,
+            event_id,
+            at(2026, 7, 30, 12, 0, 0),
+        )
+        .expect("the endless pause should be stored");
+
+        // Without the transaction, this state change would land while its audit row did not; this
+        // is the only test that can tell that implementation from the transactional one.
+        let error = set_pause(
+            &mut conn,
+            Pause::Until(at(2026, 8, 1, 12, 0, 0)),
+            event_id,
+            at(2026, 7, 30, 12, 1, 0),
+        )
+        .expect_err("the duplicate event id should refuse the pause");
+
+        match error {
+            StoreError::RecordEvent { id, .. } => assert_eq!(id, event_id.to_string()),
+            other => panic!("expected RecordEvent, got {other:?}"),
+        }
+        assert_eq!(
+            get_pause(&conn).expect("the original pause should remain readable"),
+            Some(Pause::Indefinite)
+        );
+        let event_count: i64 = conn
+            .query_row("SELECT count(*) FROM control_events", [], |row| row.get(0))
+            .expect("the control event count should be readable");
+        assert_eq!(event_count, 1);
+    }
+
+    #[test]
     fn a_pause_that_is_both_kinds_at_once_is_refused() {
         let (_dir, conn) = database();
 
@@ -554,7 +594,7 @@ mod tests {
                 .to_string()
                 .contains("both keys are set and only one of them can be true")
         );
-        assert_control_subject(error, PAUSE_INDEFINITE);
+        assert_control_subject(error, &format!("{PAUSE_UNTIL} + {PAUSE_INDEFINITE}"));
     }
 
     #[test]

@@ -45,22 +45,25 @@ pub(crate) fn to_sql(at: DateTime<Utc>) -> Result<String, crate::StoreError> {
     }
 }
 
-/// Read a timestamp back, refusing one this schema does not represent.
+/// Read a timestamp back, accepting only the spelling [`to_sql`] writes.
 ///
-/// Any RFC 3339 spelling parses, not only the one [`to_sql`] writes, but an overflowing nanosecond
-/// field is rejected here too. A row carrying one would decode without complaint and then be missing
-/// from every window that contains it; a row this program did not write is meant to fail loudly, not
-/// to disappear from a query.
+/// Parsing is not enough. RFC 3339 lets the same instant be written many ways, and these columns
+/// are compared as TEXT, so a row spelled any other way is decodable and in the wrong place in
+/// every range query at once: `…+09:00` does not sort against the `Z` forms, a tenth fractional
+/// digit sorts before the `Z` that should follow the ninth, and an offset can carry a year outside
+/// the range across the boundary into one `to_sql` refuses to write. Re-spelling what was parsed
+/// and demanding the original back is the whole check, and it cannot fall out of step with
+/// [`to_sql`] because it is [`to_sql`]. A row this program did not write fails loudly here rather
+/// than disappearing from a query later.
 pub(crate) fn from_sql(
     text: &str,
 ) -> Result<DateTime<Utc>, Box<dyn std::error::Error + Send + Sync>> {
     let at = DateTime::parse_from_rfc3339(text)?.with_timezone(&Utc);
-    if at.nanosecond() >= NANOSECONDS_PER_SECOND {
+    if to_sql(at)? != text {
         return Err(Box::new(crate::StoreError::TimestampOutOfRange {
             at: text.to_owned(),
         }));
     }
-
     Ok(at)
 }
 
@@ -104,6 +107,35 @@ mod tests {
 
             assert_eq!(restored, original);
         }
+    }
+
+    #[test]
+    fn a_spelling_this_schema_does_not_write_is_refused_even_when_it_parses() {
+        let spellings = [
+            // This ordinary instant would not sort against the `Z` spellings.
+            "2026-07-30T12:00:00.000000000+09:00",
+            // chrono would drop this tenth digit, but SQLite would keep comparing it.
+            "2026-07-30T12:00:00.0000000001Z",
+            // This eight-digit fraction would leave the stored text one character short.
+            "2026-07-30T12:00:00.00000000Z",
+            // This offset would carry the UTC instant into year -1.
+            "0000-01-01T00:00:00.000000000+00:01",
+            // This form would omit the fractional part entirely.
+            "2026-07-30T12:00:00Z",
+        ];
+
+        for spelling in spellings {
+            assert!(from_sql(spelling).is_err(), "{spelling} should be refused");
+        }
+
+        let original = Utc
+            .with_ymd_and_hms(2026, 7, 30, 12, 0, 0)
+            .single()
+            .expect("the test timestamp should be valid");
+        let stored = to_sql(original).expect("the test timestamp should be spellable");
+        let restored = from_sql(&stored).expect("the stored timestamp should parse");
+
+        assert_eq!(restored, original);
     }
 
     #[test]
