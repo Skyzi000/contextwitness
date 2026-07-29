@@ -6,13 +6,15 @@ use cw_core::model::{Observation, SourcePayload};
 const SELECT_BY_ID: &str = "SELECT id, source, observed_at, duration_ms, schema_version, payload \
      FROM observations WHERE id = ?1";
 
-/// Half-open, and ordered. `build_episode` takes `[start, end)`, and adjacent five-minute windows
-/// have to tile: with both bounds inclusive an observation landing exactly on a boundary is
-/// delivered in two episodes, whose differing document ids mean nothing downstream notices. The
-/// `id` tiebreak is not decoration — one tick captures several monitors and can stamp them with the
-/// same instant, and SQLite does not promise an order among equal sort keys.
+/// Half-open in its contract, inclusive in its SQL: `[start, end)` is exactly `[start, end - 1ns]`
+/// because every stored value is a whole number of nanoseconds, and saying it that way keeps the
+/// upper bound inside the fixed-width spelling. `build_episode` takes `[start, end)`, and adjacent
+/// five-minute windows have to tile: with both bounds inclusive an observation landing exactly on a
+/// boundary is delivered in two episodes, whose differing document ids mean nothing downstream
+/// notices. The `id` tiebreak is not decoration — one tick captures several monitors and can stamp
+/// them with the same instant, and SQLite does not promise an order among equal sort keys.
 const SELECT_IN_WINDOW: &str = "SELECT id, source, observed_at, duration_ms, schema_version, payload FROM observations \
-     WHERE observed_at >= ?1 AND observed_at < ?2 ORDER BY observed_at, id";
+     WHERE observed_at >= ?1 AND observed_at <= ?2 ORDER BY observed_at, id";
 
 /// Store one observation.
 ///
@@ -103,13 +105,19 @@ pub fn find_in_window(
     start: chrono::DateTime<chrono::Utc>,
     end: chrono::DateTime<chrono::Utc>,
 ) -> Result<Vec<Observation>, StoreError> {
+    // The window's last instant, which is what the statement compares against. `checked_sub_signed`
+    // rather than `-`: subtracting from the earliest instant chrono has would panic, and a window
+    // ending there holds nothing.
+    let Some(last) = end.checked_sub_signed(chrono::TimeDelta::nanoseconds(1)) else {
+        return Ok(Vec::new());
+    };
     let mut statement = conn
         .prepare(SELECT_IN_WINDOW)
         .map_err(|source| StoreError::Sql { source })?;
     let mut rows = statement
         .query(rusqlite::params![
             timestamp::to_sql(start)?,
-            timestamp::to_sql(end)?,
+            timestamp::to_sql(last)?,
         ])
         .map_err(|source| StoreError::Sql { source })?;
     let mut observations = Vec::new();
@@ -367,7 +375,7 @@ mod tests {
     }
 
     #[test]
-    fn a_timestamp_the_schema_cannot_spell_is_refused_on_both_paths() {
+    fn a_timestamp_the_schema_cannot_spell_is_never_stored() {
         let dir = tempdir().expect("the temporary database directory should be creatable");
         let path = dir.path().join("db.sqlite3");
         let conn = db::open(&path).expect("the fresh database should initialize");
@@ -383,10 +391,30 @@ mod tests {
         let found = find_by_id(&conn, observation.id)
             .expect("the refused observation lookup should succeed");
         assert_eq!(found, None);
+    }
 
-        let error = find_in_window(&conn, at("9999-12-31T23:59:59Z"), observed_at)
-            .expect_err("the window bound without a fixed width should be refused");
-        assert!(matches!(error, StoreError::TimestampOutOfRange { .. }));
+    #[test]
+    fn every_observation_the_schema_can_store_is_inside_a_window_it_can_search() {
+        let dir = tempdir().expect("the temporary database directory should be creatable");
+        let path = dir.path().join("db.sqlite3");
+        let conn = db::open(&path).expect("the fresh database should initialize");
+        let observation = screen_observation_at(at("9999-12-31T23:59:59.999999999Z"));
+        let start = at("9999-12-31T23:55:00Z");
+        let end = Utc
+            .with_ymd_and_hms(10_000, 1, 1, 0, 0, 0)
+            .single()
+            .expect("year 10000 should be valid");
+
+        insert(&conn, &observation).expect("the last spellable observation should be stored");
+        // The exclusive end is year 10000, which has no spelling of its own. This row was
+        // previously stranded by a reader that refused to look for it.
+        let found = find_in_window(&conn, start, end)
+            .expect("the last spellable observation should be searchable");
+        assert_eq!(found, vec![observation]);
+
+        let found = find_in_window(&conn, DateTime::<Utc>::MIN_UTC, DateTime::<Utc>::MIN_UTC)
+            .expect("a window ending at the earliest instant should be empty");
+        assert_eq!(found, Vec::new());
     }
 
     #[test]
