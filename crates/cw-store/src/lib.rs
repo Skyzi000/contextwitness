@@ -94,4 +94,27 @@ pub enum StoreError {
         /// The value that does not fit.
         duration_ms: u64,
     },
+    /// A timestamp has no fixed-width spelling, so it can be neither stored nor compared.
+    #[error(
+        "timestamp {at} cannot be stored: only the years 0000 through 9999 have the fixed-width \
+         spelling this schema's TEXT comparisons depend on"
+    )]
+    TimestampOutOfRange {
+        /// The timestamp that has no fixed-width spelling.
+        at: String,
+    },
+    /// Storing an observation failed in SQLite.
+    #[error("failed to store observation {id}: {source}")]
+    Insert {
+        /// Primary key of the observation that was not stored.
+        id: String,
+        /// Underlying SQLite error.
+        source: rusqlite::Error,
+    },
+    /// An observation would not read back as the value it was given.
+    #[error("observation {id} would not read back as the value it was given, so it was not stored")]
+    NotFaithful {
+        /// Primary key of the observation that was not stored.
+        id: String,
+    },
 }

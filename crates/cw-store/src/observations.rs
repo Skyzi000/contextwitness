@@ -21,6 +21,7 @@ const SELECT_IN_WINDOW: &str = "SELECT id, source, observed_at, duration_ms, sch
 /// destroying whichever observation was there first.
 pub fn insert(conn: &rusqlite::Connection, observation: &Observation) -> Result<(), StoreError> {
     let id = observation.id.to_string();
+    let observed_at = timestamp::to_sql(observation.observed_at)?;
     let duration_ms = observation
         .duration_ms
         .map(|ms| {
@@ -34,6 +35,26 @@ pub fn insert(conn: &rusqlite::Connection, observation: &Observation) -> Result<
         id: id.clone(),
         source,
     })?;
+    // The write path must not accept anything `decode` cannot return: `from_parts` resolves the
+    // source column into a variant, so a payload naming a kind this build knows comes back as that
+    // kind rather than as what was handed in. Asking whether the round trip is faithful keeps the
+    // list of known sources in cw-core, where it belongs.
+    let stored_as = serde_json::from_str(&payload)
+        .map_err(|source| StoreError::Encoding {
+            id: id.clone(),
+            source: Box::new(source),
+        })
+        .and_then(|raw| {
+            SourcePayload::from_parts(observation.payload.kind(), raw).map_err(|source| {
+                StoreError::Encoding {
+                    id: id.clone(),
+                    source: Box::new(source),
+                }
+            })
+        })?;
+    if stored_as != observation.payload {
+        return Err(StoreError::NotFaithful { id });
+    }
 
     conn.execute(
         "INSERT INTO observations \
@@ -42,13 +63,16 @@ pub fn insert(conn: &rusqlite::Connection, observation: &Observation) -> Result<
         rusqlite::params![
             id,
             observation.payload.kind(),
-            timestamp::to_sql(observation.observed_at),
+            observed_at,
             duration_ms,
             i64::from(observation.schema_version),
             payload,
         ],
     )
-    .map_err(|source| StoreError::Sql { source })?;
+    .map_err(|source| StoreError::Insert {
+        id: id.clone(),
+        source,
+    })?;
 
     Ok(())
 }
@@ -84,8 +108,8 @@ pub fn find_in_window(
         .map_err(|source| StoreError::Sql { source })?;
     let mut rows = statement
         .query(rusqlite::params![
-            timestamp::to_sql(start),
-            timestamp::to_sql(end),
+            timestamp::to_sql(start)?,
+            timestamp::to_sql(end)?,
         ])
         .map_err(|source| StoreError::Sql { source })?;
     let mut observations = Vec::new();
@@ -147,7 +171,7 @@ fn decode(
 mod tests {
     use super::{find_by_id, find_in_window, insert, payload_json};
     use crate::{StoreError, db};
-    use chrono::{DateTime, TimeDelta, Utc};
+    use chrono::{DateTime, TimeDelta, TimeZone, Utc};
     use cw_core::model::{
         CURRENT_SCHEMA_VERSION, Observation, OcrStatus, ScreenPayload, SourcePayload,
     };
@@ -246,6 +270,44 @@ mod tests {
     }
 
     #[test]
+    fn an_observation_that_would_read_back_as_a_different_value_is_refused() {
+        let dir = tempdir().expect("the temporary database directory should be creatable");
+        let path = dir.path().join("db.sqlite3");
+        let conn = db::open(&path).expect("the fresh database should initialize");
+        let mut raw = serde_json::to_value(fully_populated_screen_payload())
+            .expect("the screen payload should serialize");
+        raw.as_object_mut()
+            .expect("the screen payload JSON should be an object")
+            .insert(
+                "future_field".to_owned(),
+                serde_json::json!("must not be lost"),
+            );
+        let observation = Observation {
+            id: ulid::Ulid::new(),
+            observed_at: at("2026-07-25T12:34:56Z"),
+            duration_ms: None,
+            schema_version: CURRENT_SCHEMA_VERSION,
+            payload: SourcePayload::Unknown {
+                source: "screen".to_owned(),
+                raw,
+            },
+        };
+        let expected_id = observation.id.to_string();
+
+        // Without the check this row reads back as Screen, with `future_field` silently gone.
+        let error = insert(&conn, &observation)
+            .expect_err("the observation that would change should be refused");
+        match error {
+            StoreError::NotFaithful { id } => assert_eq!(id, expected_id),
+            other => panic!("expected NotFaithful, got {other:?}"),
+        }
+        let found = find_by_id(&conn, observation.id)
+            .expect("the refused observation lookup should succeed");
+
+        assert_eq!(found, None);
+    }
+
+    #[test]
     fn the_window_includes_its_start_and_excludes_its_end() {
         let dir = tempdir().expect("the temporary database directory should be creatable");
         let path = dir.path().join("db.sqlite3");
@@ -305,6 +367,29 @@ mod tests {
     }
 
     #[test]
+    fn a_timestamp_the_schema_cannot_spell_is_refused_on_both_paths() {
+        let dir = tempdir().expect("the temporary database directory should be creatable");
+        let path = dir.path().join("db.sqlite3");
+        let conn = db::open(&path).expect("the fresh database should initialize");
+        let observed_at = Utc
+            .with_ymd_and_hms(10_000, 1, 1, 0, 0, 0)
+            .single()
+            .expect("year 10000 should be valid");
+        let observation = screen_observation_at(observed_at);
+
+        let error = insert(&conn, &observation)
+            .expect_err("the timestamp without a fixed width should be refused");
+        assert!(matches!(error, StoreError::TimestampOutOfRange { .. }));
+        let found = find_by_id(&conn, observation.id)
+            .expect("the refused observation lookup should succeed");
+        assert_eq!(found, None);
+
+        let error = find_in_window(&conn, at("9999-12-31T23:59:59Z"), observed_at)
+            .expect_err("the window bound without a fixed width should be refused");
+        assert!(matches!(error, StoreError::TimestampOutOfRange { .. }));
+    }
+
+    #[test]
     fn a_duplicate_id_is_refused() {
         let dir = tempdir().expect("the temporary database directory should be creatable");
         let path = dir.path().join("db.sqlite3");
@@ -317,7 +402,10 @@ mod tests {
         let stored = find_by_id(&conn, observation.id)
             .expect("the first observation should remain readable");
 
-        assert!(matches!(error, StoreError::Sql { .. }));
+        match error {
+            StoreError::Insert { id, .. } => assert_eq!(id, observation.id.to_string()),
+            other => panic!("expected Insert, got {other:?}"),
+        }
         assert_eq!(stored, Some(observation));
     }
 
