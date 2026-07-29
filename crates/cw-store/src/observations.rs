@@ -363,6 +363,30 @@ mod tests {
     }
 
     #[test]
+    fn two_observations_at_one_instant_come_back_in_id_order() {
+        let dir = tempdir().expect("the temporary database directory should be creatable");
+        let path = dir.path().join("db.sqlite3");
+        let conn = db::open(&path).expect("the fresh database should initialize");
+        let observed_at = at("2026-07-25T12:00:00Z");
+        let higher_id = ulid::Ulid::from(2u128);
+        let lower_id = ulid::Ulid::from(1u128);
+        assert!(higher_id > lower_id);
+        let mut higher = screen_observation_at(observed_at);
+        higher.id = higher_id;
+        let mut lower = screen_observation_at(observed_at);
+        lower.id = lower_id;
+
+        insert(&conn, &higher).expect("the higher-id observation should be stored first");
+        insert(&conn, &lower).expect("the lower-id observation should be stored second");
+        // Without `, id` in the ORDER BY these come back in whatever order the query plan produced,
+        // which is the one thing a stable listing has to rule out.
+        let found = find_in_window(&conn, observed_at, observed_at + TimeDelta::nanoseconds(1))
+            .expect("the tied observations should be readable");
+
+        assert_eq!(found, vec![lower, higher]);
+    }
+
+    #[test]
     fn a_whole_second_and_the_fractions_after_it_compare_correctly_in_sql() {
         let dir = tempdir().expect("the temporary database directory should be creatable");
         let path = dir.path().join("db.sqlite3");
@@ -401,7 +425,7 @@ mod tests {
     }
 
     #[test]
-    fn a_timestamp_that_names_another_instant_never_reaches_the_database() {
+    fn a_leap_second_no_window_query_could_return_never_reaches_the_database() {
         let dir = tempdir().expect("the temporary database directory should be creatable");
         let path = dir.path().join("db.sqlite3");
         let conn = db::open(&path).expect("the fresh database should initialize");
@@ -413,7 +437,8 @@ mod tests {
             .expect("the leap second should be valid");
         let observation = screen_observation_at(observed_at);
 
-        // The row is refused precisely because no window could have returned it.
+        // The row is refused because a window query would lose it even though the half-open
+        // contract places it inside.
         let error = insert(&conn, &observation)
             .expect_err("the timestamp that no window contains should be refused");
         assert!(matches!(error, StoreError::TimestampOutOfRange { .. }));

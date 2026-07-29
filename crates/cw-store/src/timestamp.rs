@@ -9,7 +9,9 @@ use chrono::{DateTime, SecondsFormat, Timelike, Utc};
 const SPELLED_LENGTH: usize = 30;
 
 /// One more than the largest value a real nanosecond field can hold. chrono spends everything at or
-/// above this on the second that follows, so two different instants would share one spelling.
+/// above this on the second that follows, which goes wrong two different ways: mid-minute the value
+/// takes text an ordinary instant already owns, and at second 59 it takes a `:60` that no instant
+/// this schema can store owns at all.
 const NANOSECONDS_PER_SECOND: u32 = 1_000_000_000;
 
 /// Spell `at` for a TEXT column.
@@ -31,8 +33,12 @@ const NANOSECONDS_PER_SECOND: u32 = 1_000_000_000;
 /// `12:34:58` carrying 1.333 seconds is written as `12:34:59.333333333Z` — the same text an
 /// ordinary, different instant already owns. The width check cannot see that, because the wrong
 /// spelling is exactly as wide as the right one. At second 59 the same overflow spells as `:60`,
-/// which no window can contain, since it falls after the last instant of one window and before the
-/// first of the next. Requiring a real nanosecond field makes the spelling name exactly one instant
+/// which no storable instant owns — and which the half-open contract still places inside a window
+/// (measured 2026-07-30, `start <= leap` and `leap < end` are both true) while the closed-form
+/// query misses it at both ends, its text sorting after `23:59:59.999999999Z` and before
+/// `2017-01-01T00:00:00.000000000Z`. That is the shape of the danger throughout: not a value
+/// outside the range, but one the contract promises to return that the query cannot find.
+/// Requiring a real nanosecond field makes the spelling name exactly one instant
 /// and keeps the stored instants on the grid, which is what lets `find_in_window` state
 /// `[start, end)` as `[start, end - 1ns]` at all, in `observations::find_in_window` and
 /// `control::events_in_window` alike.
@@ -43,10 +49,11 @@ const NANOSECONDS_PER_SECOND: u32 = 1_000_000_000;
 pub(crate) fn to_sql(at: DateTime<Utc>) -> Result<String, crate::StoreError> {
     let spelled = at.to_rfc3339_opts(SecondsFormat::Nanos, true);
     if at.nanosecond() >= NANOSECONDS_PER_SECOND {
-        // The spelling cannot stand for the value here, and it fails in two different ways.
-        // Mid-minute it is text an ordinary stored instant already owns, so reporting it alone
-        // names the wrong value; at second 59 it is a `:60` nothing owns and no window contains.
-        // Naming the field it came from is the only form that fits both.
+        // The spelling cannot stand for the value here, and it fails two different ways. Mid-minute
+        // it is text an ordinary stored instant already owns, so reporting it alone names the wrong
+        // value; at second 59 it is a `:60` no storable instant owns, which the half-open contract
+        // still places inside a window while the query misses it at both ends. Naming the field it
+        // came from is the only form that fits both.
         return Err(crate::StoreError::TimestampOutOfRange {
             at: format!(
                 "{spelled} spelled from a nanosecond field of {}",
@@ -280,8 +287,9 @@ mod tests {
         };
         assert_eq!(
             at, "2016-12-31T23:59:60.500000000Z spelled from a nanosecond field of 1500000000",
-            "unlike the mid-minute overflow, no instant owns this spelling — it is refused because \
-             no window can contain it, and both refusals report the field they were spelled from"
+            "no storable instant owns this spelling, and the half-open contract still places it \
+             inside a window the query then misses at both ends — the opposite failure from the \
+             mid-minute collision, and both refusals report the field they were spelled from"
         );
         let error = from_sql(&spelled).expect_err("the leap second spelling should be refused");
         assert!(matches!(

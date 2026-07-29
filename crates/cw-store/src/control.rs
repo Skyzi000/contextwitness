@@ -786,6 +786,36 @@ mod tests {
     }
 
     #[test]
+    fn two_events_at_one_instant_come_back_in_id_order() {
+        let (_dir, conn) = database();
+        let higher_id = ulid::Ulid::from(2u128);
+        let lower_id = ulid::Ulid::from(1u128);
+        assert!(higher_id > lower_id);
+        let instant = at(2026, 7, 30, 12, 0, 0);
+        let higher = ControlEvent {
+            id: higher_id,
+            kind: EventKind::BlacklistSkip,
+            at: instant,
+            detail: None,
+        };
+        let lower = ControlEvent {
+            id: lower_id,
+            kind: EventKind::BlacklistSkip,
+            at: instant,
+            detail: None,
+        };
+
+        record_event(&conn, &higher).expect("the higher-id audit event should be stored first");
+        record_event(&conn, &lower).expect("the lower-id audit event should be stored second");
+        // Without `, id` in the ORDER BY these come back in whatever order the query plan produced,
+        // which is the one thing a stable listing has to rule out.
+        let events = events_in_window(&conn, instant, instant + TimeDelta::seconds(1))
+            .expect("the tied audit events should be readable");
+
+        assert_eq!(events, [lower, higher]);
+    }
+
+    #[test]
     fn a_blacklist_skip_is_recorded_with_its_detail() {
         let (_dir, conn) = database();
         let event = ControlEvent {

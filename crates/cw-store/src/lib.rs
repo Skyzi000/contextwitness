@@ -103,9 +103,10 @@ pub enum StoreError {
     TimestampOutOfRange {
         /// What was refused: the spelling, when this schema simply does not write one like it, or a
         /// description naming the field it was spelled from, when the spelling cannot stand for the
-        /// value on its own. That happens for every overflowing nanosecond field, in two ways —
-        /// either the text is one an ordinary stored instant already owns, or it is a `:60` that no
-        /// instant owns and no window contains.
+        /// value on its own. That happens for every overflowing nanosecond field, two ways — either
+        /// the text is one an ordinary stored instant already owns, or it is a `:60` that no
+        /// storable instant owns and that a window query loses even though the half-open contract
+        /// places it inside the window.
         at: String,
     },
     /// Storing an observation failed in SQLite.
