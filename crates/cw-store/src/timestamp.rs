@@ -43,8 +43,10 @@ const NANOSECONDS_PER_SECOND: u32 = 1_000_000_000;
 pub(crate) fn to_sql(at: DateTime<Utc>) -> Result<String, crate::StoreError> {
     let spelled = at.to_rfc3339_opts(SecondsFormat::Nanos, true);
     if at.nanosecond() >= NANOSECONDS_PER_SECOND {
-        // Reporting `spelled` alone would name an ordinary instant this schema stores every day:
-        // that is the whole defect being refused here, the two values sharing one text.
+        // The spelling cannot stand for the value here, and it fails in two different ways.
+        // Mid-minute it is text an ordinary stored instant already owns, so reporting it alone
+        // names the wrong value; at second 59 it is a `:60` nothing owns and no window contains.
+        // Naming the field it came from is the only form that fits both.
         return Err(crate::StoreError::TimestampOutOfRange {
             at: format!(
                 "{spelled} spelled from a nanosecond field of {}",
@@ -273,7 +275,14 @@ mod tests {
         assert!(leap < next_window_start);
 
         let error = to_sql(leap).expect_err("the leap second should be refused");
-        assert!(matches!(error, StoreError::TimestampOutOfRange { .. }));
+        let StoreError::TimestampOutOfRange { at } = error else {
+            panic!("expected TimestampOutOfRange, got {error:?}")
+        };
+        assert_eq!(
+            at, "2016-12-31T23:59:60.500000000Z spelled from a nanosecond field of 1500000000",
+            "unlike the mid-minute overflow, no instant owns this spelling — it is refused because \
+             no window can contain it, and both refusals report the field they were spelled from"
+        );
         let error = from_sql(&spelled).expect_err("the leap second spelling should be refused");
         assert!(matches!(
             error.downcast_ref::<StoreError>(),
