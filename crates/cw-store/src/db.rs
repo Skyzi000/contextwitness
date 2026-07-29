@@ -166,19 +166,40 @@ pub fn open(path: &std::path::Path) -> Result<rusqlite::Connection, StoreError> 
             source,
         })?;
 
+    // One snapshot, not three reads. `ownership` asks three separate questions, and a statement
+    // outside a transaction is its own implicit transaction, so a first start in which another
+    // connection commits its migration between two of them combines an `application_id` of 0 read
+    // before the commit with a `sqlite_master` read after it — and calls a database this program
+    // has just created somebody else's. Measured 2026-07-30, eight connections opening 0.9 ms apart
+    // failed 52% of their opens that way; inside one read transaction it is 0% at every spacing
+    // tried, because a late connection either sees the file as it was and then blocks on `migrate`,
+    // or sees it already claimed.
+    //
     // Ownership before the version gate, because "whose file is this" has to be settled before
-    // "which schema is it at". Both are early refusals taken without asking SQLite for a lock: a
-    // file that is plainly not ours is turned away before this program starts a transaction on it.
-    // Neither is the decision anything rests on — `migrate` takes both again inside its write
-    // transaction, on the view its own writes land on.
-    ownership(&conn, path)?;
-    let current = read_user_version(&conn, path)?;
-    if !(0..=SCHEMA_VERSION).contains(&current) {
-        return Err(StoreError::UnsupportedSchema {
-            path: path.to_path_buf(),
-            found: current,
-            supported: SCHEMA_VERSION,
-        });
+    // "which schema is it at". Both are early refusals, and they earn their place by keeping this
+    // program from asking for a write lock on a stranger's database: a foreign file its real owner
+    // is writing to would otherwise make `migrate` wait out the busy timeout and report
+    // SQLITE_BUSY, which says much less than naming the owner. Neither is the decision anything
+    // rests on — `migrate` takes both again inside its write transaction, on the view its own
+    // writes land on.
+    {
+        let snapshot = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
+            .map_err(|source| StoreError::Open {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        ownership(&snapshot, path)?;
+        let current = read_user_version(&snapshot, path)?;
+        if !(0..=SCHEMA_VERSION).contains(&current) {
+            return Err(StoreError::UnsupportedSchema {
+                path: path.to_path_buf(),
+                found: current,
+                supported: SCHEMA_VERSION,
+            });
+        }
+        // Nothing was written, so there is nothing to commit and the rollback on drop is the end
+        // of it.
     }
 
     // Migrate first, switch second. Everything applied above is per-connection; the WAL switch is
@@ -239,8 +260,8 @@ fn migrate(conn: &mut rusqlite::Connection, path: &std::path::Path) -> Result<()
                     source,
                 })?;
         }
-        // Written only when something was applied, so an already-current database's open stays a
-        // read.
+        // Written only when something was applied, so an already-current database's open writes
+        // nothing.
         transaction
             .pragma_update(None, "user_version", SCHEMA_VERSION)
             .map_err(|source| StoreError::Migrate {
@@ -312,21 +333,34 @@ mod tests {
         // timeout: measured 2026-07-29, six connections opening together failed 83% of the time
         // before enable_wal waited on its own behalf.
         const CONNECTIONS: usize = 8;
-        // One simultaneous start is one sample of a race. Measured 2026-07-29 against the code
-        // before this fix, a single start caught it in 25 runs out of 30, so four independent
-        // starts put a miss below one run in five hundred.
-        const ROUNDS: usize = 4;
+        // Two races live here and they need different spacings to show up. Starting together, the
+        // connections collide on the WAL conversion. Starting about a millisecond apart, a later one
+        // runs its ownership reads while an earlier one is committing the migration. Measured
+        // 2026-07-30 against the code before these fixes, no spacing sees both: together caught the
+        // first in 25 runs out of 30 and never the second, 900 us lost 52% of its opens to the
+        // second and never met the first.
+        const SPACINGS: [std::time::Duration; 4] = [
+            std::time::Duration::ZERO,
+            std::time::Duration::from_micros(500),
+            std::time::Duration::from_micros(900),
+            std::time::Duration::from_micros(1500),
+        ];
 
         let dir = tempdir().expect("the temporary database directory should be creatable");
-        for round in 0..ROUNDS {
+        for (round, spacing) in SPACINGS.iter().enumerate() {
             let path = dir.path().join(format!("{round}.sqlite3"));
             let ready = std::sync::Arc::new(std::sync::Barrier::new(CONNECTIONS));
             let openers = (0..CONNECTIONS)
-                .map(|_| {
+                .map(|index| {
                     let path = path.clone();
                     let ready = std::sync::Arc::clone(&ready);
+                    let spacing = *spacing;
                     std::thread::spawn(move || {
                         ready.wait();
+                        // The barrier is where the spacing is measured from; without it the threads
+                        // would start whenever the runtime got round to them and the spacing would mean
+                        // nothing.
+                        std::thread::sleep(spacing * index as u32);
                         let conn = open(&path)?;
                         conn.pragma_query_value(None, "journal_mode", |row| row.get::<_, String>(0))
                             .map_err(|source| StoreError::Open { path, source })
@@ -470,10 +504,17 @@ mod tests {
         let journal_mode: String = conn
             .pragma_query_value(None, "journal_mode", |row| row.get(0))
             .expect("the refused database journal mode should be readable");
+        let application_id: i32 = conn
+            .pragma_query_value(None, "application_id", |row| row.get(0))
+            .expect("the refused database application id should be readable");
+        let user_version: i32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("the refused database version marker should be readable");
         assert_eq!(
-            journal_mode, "delete",
-            "refusing a file this build cannot handle means leaving it exactly as it was found, \
-             and the WAL switch is written into the database header"
+            (journal_mode.as_str(), application_id, user_version),
+            ("delete", APPLICATION_ID, SCHEMA_VERSION + 1),
+            "refusing a file this build cannot handle must leave these values as found, and a \
+             newer build's version marker is the one thing that build needs intact"
         );
     }
 
@@ -499,6 +540,9 @@ mod tests {
             let journal_mode: String = conn
                 .pragma_query_value(None, "journal_mode", |row| row.get(0))
                 .expect("the refused database journal mode should be readable");
+            let application_id: i32 = conn
+                .pragma_query_value(None, "application_id", |row| row.get(0))
+                .expect("the refused database application id should be readable");
             let user_version: i32 = conn
                 .pragma_query_value(None, "user_version", |row| row.get(0))
                 .expect("the refused database version marker should be readable");
@@ -511,8 +555,13 @@ mod tests {
                 .expect("the ContextWitness table count should be readable");
 
             assert_eq!(
-                (journal_mode.as_str(), user_version, observations),
-                ("delete", found, 0),
+                (
+                    journal_mode.as_str(),
+                    application_id,
+                    user_version,
+                    observations
+                ),
+                ("delete", 0, found, 0),
                 "SCHEMA_VERSION is the case that used to be accepted and handed back with no \
                  tables in it, and a marker that is not zero is one somebody wrote, so the file \
                  is not ours to take"
@@ -573,6 +622,9 @@ mod tests {
         let journal_mode: String = conn
             .pragma_query_value(None, "journal_mode", |row| row.get(0))
             .expect("the refused database journal mode should be readable");
+        let application_id: i32 = conn
+            .pragma_query_value(None, "application_id", |row| row.get(0))
+            .expect("the refused database application id should be readable");
         let user_version: i32 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("the refused database schema version should be readable");
@@ -588,11 +640,12 @@ mod tests {
             (
                 body.as_str(),
                 journal_mode.as_str(),
+                application_id,
                 user_version,
                 observations
             ),
-            ("someone else's data", "delete", 0, 0),
-            "a database another program owns must come back exactly as it was found, and \
+            ("someone else's data", "delete", 0, 0, 0),
+            "the values this program could have written must be exactly as they were found, and \
              user_version in particular is the field that program would be using for its own \
              migrations"
         );
@@ -614,5 +667,20 @@ mod tests {
             Err(error) => panic!("expected ForeignDatabase, got {error:?}"),
             Ok(_) => panic!("the other application's database was accepted"),
         }
+
+        let conn = rusqlite::Connection::open(&path)
+            .expect("the refused database should still be openable");
+        let application_id: i32 = conn
+            .pragma_query_value(None, "application_id", |row| row.get(0))
+            .expect("the refused database application id should be readable");
+        let journal_mode: String = conn
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .expect("the refused database journal mode should be readable");
+        assert_eq!(
+            (application_id, journal_mode.as_str()),
+            (0x0000_0001, "delete"),
+            "a file somebody else has put their name on must still carry their name afterwards, \
+             and refusing it must not switch its journal mode"
+        );
     }
 }
