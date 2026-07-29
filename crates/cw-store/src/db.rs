@@ -107,7 +107,9 @@ fn read_user_version(
 /// connection, so on first start several of them meet on this one conversion — six opening together
 /// failed 83% of the time without a retry here, and none with it. Reasserting WAL on a database that
 /// already has it needs no exclusive lock and succeeds even while another connection is writing, so
-/// only the very first open in the life of a database ever waits.
+/// no open waits here once the file is in WAL. During the first start itself more than one open can
+/// wait: whichever reaches the conversion first has to clear both the other connections' migration
+/// transactions and their own attempts at the same conversion.
 fn enable_wal(conn: &rusqlite::Connection, path: &std::path::Path) -> Result<(), StoreError> {
     let deadline = std::time::Instant::now() + WAL_SWITCH_DEADLINE;
     loop {
@@ -229,8 +231,10 @@ fn migrate(conn: &mut rusqlite::Connection, path: &std::path::Path) -> Result<()
     let ownership = ownership(&transaction, path)?;
     let current = read_user_version(&transaction, path)?;
 
-    // The lower bound is not decoration: current as usize on a negative number skips every
-    // migration and would hand back a database with no tables and no error.
+    // The lower bound is not decoration: `current as usize` on a negative number is an index far
+    // past the end of MIGRATIONS, and the slice below panics on it. Measured 2026-07-30, -1 becomes
+    // 18446744073709551615 against a list of length 1. A guard that only excluded values above
+    // SCHEMA_VERSION would leave the daemon a value that crashes it.
     if !(0..=SCHEMA_VERSION).contains(&current) {
         return Err(StoreError::UnsupportedSchema {
             path: path.to_path_buf(),
@@ -260,8 +264,10 @@ fn migrate(conn: &mut rusqlite::Connection, path: &std::path::Path) -> Result<()
                     source,
                 })?;
         }
-        // Written only when something was applied, so an already-current database's open writes
-        // nothing.
+        // Written only when something was applied, so an already-current database leaves this
+        // transaction without writing. That is a statement about this transaction and not about
+        // `open`: a run that committed a migration and stopped before the WAL switch leaves a
+        // database whose next open is schema-current and still changes its journal mode.
         transaction
             .pragma_update(None, "user_version", SCHEMA_VERSION)
             .map_err(|source| StoreError::Migrate {
@@ -449,8 +455,8 @@ mod tests {
 
     #[test]
     fn a_schema_version_this_build_cannot_migrate_from_is_rejected() {
-        // Above the range means a newer build has already written the file; below it would
-        // otherwise skip every migration and return an empty database as though it had succeeded.
+        // Above the range means a newer build has already written the file; below it would reach
+        // the migration slice with an index cast from a negative number and panic there.
         // The database has to be ours for the version to be the thing that refuses it.
         for found in [SCHEMA_VERSION + 1, -1] {
             let dir = tempdir().expect("the temporary database directory should be creatable");
