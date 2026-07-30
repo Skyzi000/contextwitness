@@ -11,9 +11,9 @@ const TEMPORARY_SHARE_MODE: u32 = 0x0000_0001 | 0x0000_0002 | 0x0000_0004;
 
 const INSERT_IMAGE: &str = "INSERT INTO images \
      (observation_id, relative_path, byte_size, created_at) VALUES (?1, ?2, ?3, ?4)";
-const SELECT_PATH_BY_ID: &str = "SELECT relative_path FROM images WHERE observation_id = ?1";
+const SELECT_PATH_BY_ID: &str =
+    "SELECT observation_id, relative_path, created_at FROM images WHERE observation_id = ?1";
 const DELETE_IMAGE: &str = "DELETE FROM images WHERE observation_id = ?1";
-const SELECT_REGISTERED_PATHS: &str = "SELECT relative_path FROM images";
 const SELECT_IMAGE_ROWS: &str = "SELECT observation_id, relative_path, created_at FROM images ORDER BY created_at, observation_id";
 
 /// Where an image for `id` taken at `at` is filed, relative to the image root.
@@ -51,6 +51,14 @@ pub fn save(
     use std::os::windows::fs::OpenOptionsExt;
 
     let id_text = id.to_string();
+    // 16,383 is the encoder's dimension limit, not one imposed by this program.
+    if !(1..=16_383).contains(&width)
+        || !(1..=16_383).contains(&height)
+        || !(0.0..=100.0).contains(&quality)
+    {
+        return Err(StoreError::Encode { id: id_text });
+    }
+
     let expected_len = u64::from(width) * u64::from(height) * 3;
     let actual_len = u64::try_from(pixels.len()).map_err(|_| StoreError::Encode {
         id: id_text.clone(),
@@ -59,12 +67,18 @@ pub fn save(
         return Err(StoreError::Encode { id: id_text });
     }
 
-    let encoded = webp::Encoder::from_rgb(pixels, width, height).encode(quality);
-    if encoded.is_empty() {
-        return Err(StoreError::Encode { id: id_text });
-    }
-
+    let created_at = timestamp::to_sql(at)?;
     let relative = relative_path(id, at);
+    // `encode` would unwrap this error and panic on the capture path.
+    let encoded = webp::Encoder::from_rgb(pixels, width, height)
+        .encode_simple(false, quality)
+        .map_err(|_| StoreError::Encode {
+            id: id_text.clone(),
+        })?;
+    let byte_size = i64::try_from(encoded.len()).map_err(|_| StoreError::Encode {
+        id: id_text.clone(),
+    })?;
+
     let destination = root.join(&relative);
     let parent = destination
         .parent()
@@ -98,7 +112,20 @@ pub fn save(
     }
 
     match cw_core::atomic_file::rename_without_replacing(&file, &destination) {
-        Ok(true) => drop(file),
+        Ok(true) => {
+            // The rename is a metadata change on this handle, and Windows buffers those; closing the
+            // handle does not push them. Without this the row can commit while the name it points at
+            // has not reached the disk, which is the one direction the write order exists to rule out.
+            if let Err(source) = file.sync_all() {
+                let _ = std::fs::remove_file(&destination);
+                drop(file);
+                return Err(StoreError::ImageWrite {
+                    path: destination,
+                    source,
+                });
+            }
+            drop(file);
+        }
         Ok(false) => {
             drop(file);
             remove_temporary(&temporary)?;
@@ -120,14 +147,29 @@ pub fn save(
         }
     }
 
-    let byte_size = i64::try_from(encoded.len()).map_err(|_| StoreError::Encode {
-        id: id_text.clone(),
-    })?;
-    conn.execute(
+    if let Err(source) = conn.execute(
         INSERT_IMAGE,
-        rusqlite::params![id_text, relative, byte_size, timestamp::to_sql(at)?],
-    )
-    .map_err(|source| StoreError::Sql { source })?;
+        rusqlite::params![id_text, relative, byte_size, created_at],
+    ) {
+        let already_registered = matches!(
+            source.sqlite_extended_error_code(),
+            Some(rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY)
+                | Some(rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE)
+        );
+        // Both unique indexes on this table carry the same fact: `observation_id` is the primary
+        // key and `relative_path` is derived from it, so one observation cannot collide with
+        // another's path and either violation means this observation already has an image.
+        // Measured 2026-07-30, a retry with the same id and instant reports the path index (2067),
+        // not the primary key (1555), so keying on the primary key alone never fired.
+        let _ = std::fs::remove_file(&destination);
+        if already_registered {
+            return Err(StoreError::ImageExists {
+                id: id_text,
+                path: destination,
+            });
+        }
+        return Err(StoreError::Sql { source });
+    }
 
     Ok(relative)
 }
@@ -135,7 +177,9 @@ pub fn save(
 /// Remove an image and the record that it existed.
 ///
 /// Leaves the observation row alone: the OCR text and the payload are the point of the record and
-/// outlive the picture.
+/// outlive the picture. Empty day directories are left behind on purpose: pruning one could race
+/// with [`save`] between creating that directory and opening its temporary file, while a few
+/// hundred empty entries a year cost nothing and only the startup sweep walks them.
 pub fn delete(
     conn: &rusqlite::Connection,
     root: &std::path::Path,
@@ -151,8 +195,7 @@ pub fn delete(
         let Some(row) = rows.next().map_err(|source| StoreError::Sql { source })? else {
             return Ok(());
         };
-        row.get::<_, String>(0)
-            .map_err(|source| StoreError::Sql { source })?
+        image_path_from_row(row)?
     };
     let path = root.join(relative);
 
@@ -169,10 +212,6 @@ pub fn delete(
 
     conn.execute(DELETE_IMAGE, [id.to_string()])
         .map_err(|source| StoreError::Sql { source })?;
-
-    for directory in path.ancestors().skip(1).take(3) {
-        let _ = std::fs::remove_dir(directory);
-    }
 
     Ok(())
 }
@@ -246,7 +285,7 @@ fn remove_temporary(path: &std::path::Path) -> Result<(), StoreError> {
 
 fn registered_paths(conn: &rusqlite::Connection) -> Result<HashSet<String>, StoreError> {
     let mut statement = conn
-        .prepare(SELECT_REGISTERED_PATHS)
+        .prepare(SELECT_IMAGE_ROWS)
         .map_err(|source| StoreError::Sql { source })?;
     let mut rows = statement
         .query([])
@@ -254,10 +293,7 @@ fn registered_paths(conn: &rusqlite::Connection) -> Result<HashSet<String>, Stor
     let mut paths = HashSet::new();
 
     while let Some(row) = rows.next().map_err(|source| StoreError::Sql { source })? {
-        paths.insert(
-            row.get::<_, String>(0)
-                .map_err(|source| StoreError::Sql { source })?,
-        );
+        paths.insert(image_path_from_row(row)?);
     }
 
     Ok(paths)
@@ -311,19 +347,53 @@ fn path_relative_to_root(
     Ok(relative.to_string_lossy().replace('\\', "/"))
 }
 
-/// Read and validate the columns needed by [`orphan_rows`].
+/// The path a row claims, checked against the one this program would have written for it.
+///
+/// `relative_path` is TEXT and the schema constrains nothing, so a row edited by hand or damaged
+/// can name anything at all — including a path that climbs out of the image root, which `delete`
+/// would then remove. The write side has had one spelling since this file was written; this is the
+/// read side finally agreeing with it.
+fn checked_path(
+    id: ulid::Ulid,
+    created_at: chrono::DateTime<chrono::Utc>,
+    stored: &str,
+) -> Result<String, StoreError> {
+    if stored == relative_path(id, created_at) {
+        Ok(stored.to_owned())
+    } else {
+        Err(StoreError::Encoding {
+            id: id.to_string(),
+            source: Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "the row names a path this program would not have written",
+            )),
+        })
+    }
+}
+
+/// Read and validate the columns needed by image-row readers.
 fn image_path_from_row(row: &rusqlite::Row<'_>) -> Result<String, StoreError> {
-    let id: String = row.get(0).map_err(|source| StoreError::Sql { source })?;
-    decode_image_path(row).map_err(|source| StoreError::Encoding { id, source })
+    let stored_id: String = row.get(0).map_err(|source| StoreError::Sql { source })?;
+    let (id, relative, created_at) =
+        decode_image_path(row).map_err(|source| StoreError::Encoding {
+            id: stored_id,
+            source,
+        })?;
+    checked_path(id, created_at, &relative)
 }
 
 fn decode_image_path(
     row: &rusqlite::Row<'_>,
-) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<
+    (ulid::Ulid, String, chrono::DateTime<chrono::Utc>),
+    Box<dyn std::error::Error + Send + Sync>,
+> {
+    let stored_id: String = row.get(0)?;
+    let id = ulid::Ulid::from_string(&stored_id)?;
     let relative: String = row.get(1)?;
     let created_at: String = row.get(2)?;
-    timestamp::from_sql(&created_at)?;
-    Ok(relative)
+    let created_at = timestamp::from_sql(&created_at)?;
+    Ok((id, relative, created_at))
 }
 
 #[cfg(test)]
@@ -502,6 +572,65 @@ mod tests {
     }
 
     #[test]
+    fn a_frame_larger_than_the_encoder_allows_is_refused_rather_than_panicking() {
+        let (_dir, conn, root) = database();
+        let taken_at = at(2026, 7, 30);
+        let oversized_id = ulid::Ulid::new();
+        let oversized = vec![0; 49_152];
+
+        // This length passes the pixel check and would reach the encoder's `unwrap`.
+        let oversized_error = save(
+            &conn,
+            &root,
+            oversized_id,
+            &oversized,
+            16_384,
+            1,
+            75.0,
+            taken_at,
+        )
+        .expect_err("the frame above the encoder's dimension limit should be refused");
+        assert!(matches!(oversized_error, StoreError::Encode { .. }));
+
+        let zero_width_error = save(&conn, &root, ulid::Ulid::new(), &[], 0, 1, 75.0, taken_at)
+            .expect_err("a zero-width frame should be refused");
+        assert!(matches!(zero_width_error, StoreError::Encode { .. }));
+
+        let quality_error = save(
+            &conn,
+            &root,
+            ulid::Ulid::new(),
+            &pixels(41),
+            WIDTH,
+            HEIGHT,
+            -1.0,
+            taken_at,
+        )
+        .expect_err("a quality below the encoder's range should be refused");
+        assert!(matches!(quality_error, StoreError::Encode { .. }));
+    }
+
+    #[test]
+    fn a_timestamp_this_schema_cannot_store_is_refused_before_anything_is_written() {
+        let (_dir, conn, root) = database();
+
+        let error = save(
+            &conn,
+            &root,
+            ulid::Ulid::new(),
+            &pixels(42),
+            WIDTH,
+            HEIGHT,
+            75.0,
+            DateTime::<Utc>::MAX_UTC,
+        )
+        .expect_err("the timestamp this schema cannot store should be refused");
+
+        assert!(matches!(error, StoreError::TimestampOutOfRange { .. }));
+        assert!(!root.exists());
+    }
+
+    #[test]
     fn delete_removes_file_and_images_row() {
         let (_dir, conn, root) = database();
         let id = ulid::Ulid::new();
@@ -540,21 +669,48 @@ mod tests {
     }
 
     #[test]
-    fn delete_prunes_the_directories_it_emptied() {
+    fn a_row_naming_a_path_this_program_would_not_write_is_refused() {
         let (_dir, conn, root) = database();
         let id = ulid::Ulid::new();
-        save_test_image(&conn, &root, id, at(2026, 7, 30), 70);
-        let year = root.join("2026");
-        let month = year.join("07");
-        let day = month.join("30");
-        assert!(day.is_dir());
+        let taken_at = at(2026, 7, 30);
+        insert_observation(&conn, id, taken_at);
+        let canonical = super::relative_path(id, taken_at);
+        let path = root.join(&canonical);
+        std::fs::create_dir_all(
+            path.parent()
+                .expect("the hand-placed image should have a parent"),
+        )
+        .expect("the hand-placed image directory should be creatable");
+        let contents = b"registered image";
+        std::fs::write(&path, contents).expect("the hand-placed image should be writable");
+        let stored = canonical.replace('/', "\\");
+        conn.execute(
+            "INSERT INTO images (observation_id, relative_path, byte_size, created_at) \
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                id.to_string(),
+                stored,
+                i64::try_from(contents.len()).expect("the test file size should fit SQLite"),
+                timestamp::to_sql(taken_at).expect("the test timestamp should be spellable"),
+            ],
+        )
+        .expect("the malformed image row should be inserted by hand");
 
-        delete(&conn, &root, id).expect("the image should be deleted");
+        let errors = [
+            delete(&conn, &root, id).expect_err("delete should refuse the malformed path"),
+            sweep_orphan_files(&conn, &root)
+                .expect_err("the sweep should refuse the malformed path"),
+            orphan_rows(&conn, &root)
+                .expect_err("the orphan report should refuse the malformed path"),
+        ];
 
-        assert!(!day.exists());
-        assert!(!month.exists());
-        assert!(!year.exists());
-        assert!(root.is_dir());
+        for error in errors {
+            match error {
+                StoreError::Encoding { id: actual, .. } => assert_eq!(actual, id.to_string()),
+                other => panic!("expected Encoding, got {other:?}"),
+            }
+        }
+        assert!(path.is_file());
     }
 
     #[test]
@@ -603,6 +759,47 @@ mod tests {
             )
             .expect("the image count should be readable");
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn saving_again_over_a_row_whose_file_is_gone_leaves_the_row_and_no_new_file() {
+        let (_dir, conn, root) = database();
+        let id = ulid::Ulid::new();
+        let taken_at = at(2026, 7, 30);
+        let relative = save_test_image(&conn, &root, id, taken_at, 91);
+        let path = root.join(&relative);
+        let original_byte_size: i64 = conn
+            .query_row(
+                "SELECT byte_size FROM images WHERE observation_id = ?1",
+                [id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("the original byte size should be readable");
+        std::fs::remove_file(&path)
+            .expect("the saved file should be removable without touching its row");
+
+        let error = save(
+            &conn,
+            &root,
+            id,
+            &pixels(201),
+            WIDTH,
+            HEIGHT,
+            75.0,
+            taken_at,
+        )
+        .expect_err("the existing image row should refuse another file");
+
+        assert!(matches!(error, StoreError::ImageExists { .. }));
+        let stored_byte_size: i64 = conn
+            .query_row(
+                "SELECT byte_size FROM images WHERE observation_id = ?1",
+                [id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("the original byte size should remain readable");
+        assert_eq!(stored_byte_size, original_byte_size);
+        assert!(!path.exists());
     }
 
     #[test]
