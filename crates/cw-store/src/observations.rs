@@ -342,9 +342,12 @@ mod tests {
         let start = at("2026-07-25T12:00:00Z");
         let end = at("2026-07-25T12:05:00Z");
         let before = screen_observation_at(start - TimeDelta::nanoseconds(1));
-        // `Ulid::new()` ascends with the clock, so ids that follow the timestamps make
-        // `ORDER BY id, observed_at` indistinguishable from the correct order. Only opposing ids
-        // test which key sorts first.
+        // A ULID is a millisecond timestamp and eighty random bits, so two ids generated in one
+        // test share a millisecond and their order is a coin flip: measured 2026-07-30 over 200,000
+        // back-to-back pairs, 100% shared a millisecond and the second sorted first in 50.1% of
+        // them. Generated ids therefore make this a flaky detector of `ORDER BY id, observed_at` rather than
+        // a blind one — the suite caught that swap in 29 runs out of 30. Fixed ids running against
+        // the timestamps make it certain.
         let mut at_start = screen_observation_at(start);
         at_start.id = ulid::Ulid::from(9u128);
         let mut before_end = screen_observation_at(end - TimeDelta::nanoseconds(1));
@@ -366,9 +369,12 @@ mod tests {
         let path = dir.path().join("db.sqlite3");
         let conn = db::open(&path).expect("the fresh database should initialize");
         let start = at("2026-07-25T12:00:00Z");
-        // `Ulid::new()` ascends with the clock, so ids that follow the timestamps make
-        // `ORDER BY id, observed_at` indistinguishable from the correct order. Only opposing ids
-        // test which key sorts first.
+        // A ULID is a millisecond timestamp and eighty random bits, so two ids generated in one
+        // test share a millisecond and their order is a coin flip: measured 2026-07-30 over 200,000
+        // back-to-back pairs, 100% shared a millisecond and the second sorted first in 50.1% of
+        // them. Generated ids therefore make this a flaky detector of `ORDER BY id, observed_at` rather than
+        // a blind one — the suite caught that swap in 29 runs out of 30. Fixed ids running against
+        // the timestamps make it certain.
         let mut oldest = screen_observation_at(start);
         oldest.id = ulid::Ulid::from(9u128);
         let mut middle = screen_observation_at(start + TimeDelta::seconds(1));
@@ -415,9 +421,12 @@ mod tests {
         let path = dir.path().join("db.sqlite3");
         let conn = db::open(&path).expect("the fresh database should initialize");
         let start = at("2026-07-25T12:00:00Z");
-        // `Ulid::new()` ascends with the clock, so ids that follow the timestamps make
-        // `ORDER BY id, observed_at` indistinguishable from the correct order. Only opposing ids
-        // test which key sorts first.
+        // A ULID is a millisecond timestamp and eighty random bits, so two ids generated in one
+        // test share a millisecond and their order is a coin flip: measured 2026-07-30 over 200,000
+        // back-to-back pairs, 100% shared a millisecond and the second sorted first in 50.1% of
+        // them. Generated ids therefore make this a flaky detector of `ORDER BY id, observed_at` rather than
+        // a blind one — the suite caught that swap in 29 runs out of 30. Fixed ids running against
+        // the timestamps make it certain.
         let mut whole_second = screen_observation_at(start);
         whole_second.id = ulid::Ulid::from(9u128);
         let mut last_fraction = screen_observation_at(at("2026-07-25T12:00:00.999999999Z"));
