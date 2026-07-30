@@ -27,7 +27,8 @@ pub enum HealthKey {
 pub enum EventKind {
     /// Capture was stopped.
     Paused,
-    /// Capture was started again.
+    /// Capture was asked to start again. A resume with nothing to resume records this too, so a row
+    /// is a request rather than proof that anything moved.
     Resumed,
     /// A tick captured nothing because the foreground process is blacklisted.
     BlacklistSkip,
@@ -192,7 +193,7 @@ pub fn set_pause(
         .map_err(|source| StoreError::Sql { source })
 }
 
-/// Start capture again, and record that it happened.
+/// Start capture again, and record that it was asked for.
 pub fn resume(
     conn: &mut rusqlite::Connection,
     event_id: ulid::Ulid,
@@ -362,8 +363,13 @@ fn event_from_row(row: &rusqlite::Row<'_>) -> Result<ControlEvent, StoreError> {
 fn decode_event(
     row: &rusqlite::Row<'_>,
 ) -> Result<ControlEvent, Box<dyn std::error::Error + Send + Sync>> {
-    let id: String = row.get(0)?;
-    let id = ulid::Ulid::from_string(&id)?;
+    let stored_id: String = row.get(0)?;
+    let id = ulid::Ulid::from_string(&stored_id)?;
+    if id.to_string() != stored_id {
+        return Err(invalid_data(
+            "the id is not spelled the way this program writes a ULID",
+        ));
+    }
     let kind: String = row.get(1)?;
     let kind = EventKind::from_spelling(&kind)
         .ok_or_else(|| invalid_data("the control event kind is not known to this build"))?;
@@ -761,6 +767,10 @@ mod tests {
         resume(&mut conn, resume_id, resumed_at)
             .expect("the resume and its event should be stored");
 
+        // This pause is a deadline rather than an endless one here. Without this line, an
+        // implementation clearing only `pause_indefinite` passes every test in this file.
+        assert!(matches!(get_pause(&conn), Ok(None)));
+
         let events = events_in_window(&conn, at(2026, 7, 30, 12, 0, 0), at(2026, 7, 30, 12, 3, 0))
             .expect("the audit window should be readable");
         assert_eq!(
@@ -901,5 +911,29 @@ mod tests {
         let error = events_in_window(&conn, at, at + TimeDelta::seconds(1))
             .expect_err("the unknown event kind should be refused");
         assert_control_subject(error, &id);
+    }
+
+    #[test]
+    fn an_event_id_spelled_any_other_way_is_refused() {
+        let (_dir, conn) = database();
+        let stored_id = "0000000000000128ggyhyyk08n";
+        let at = at(2026, 7, 30, 12, 0, 0);
+
+        // This lower-cased spelling of a canonical ULID cannot be produced by this program, so
+        // write it with plain SQL; every other column uses its canonical spelling.
+        conn.execute(
+            INSERT_EVENT,
+            rusqlite::params![
+                stored_id,
+                EventKind::BlacklistSkip.spelling(),
+                timestamp::to_sql(at).expect("the event timestamp should be spellable"),
+                Option::<String>::None,
+            ],
+        )
+        .expect("the lower-cased event id should be writable");
+
+        let error = events_in_window(&conn, at, at + TimeDelta::seconds(1))
+            .expect_err("the lower-cased event id should be refused");
+        assert_control_subject(error, stored_id);
     }
 }

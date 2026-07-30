@@ -146,6 +146,13 @@ fn payload_json(
     )?)
 }
 
+fn invalid_data(message: &'static str) -> Box<dyn std::error::Error + Send + Sync> {
+    Box::new(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        message,
+    ))
+}
+
 /// Rebuild an observation from one row.
 ///
 /// The id is read as text first and kept, because it is what names the row in every error below —
@@ -159,8 +166,13 @@ fn from_row(row: &rusqlite::Row<'_>) -> Result<Observation, StoreError> {
 fn decode(
     row: &rusqlite::Row<'_>,
 ) -> Result<Observation, Box<dyn std::error::Error + Send + Sync>> {
-    let id: String = row.get(0)?;
-    let id = ulid::Ulid::from_string(&id)?;
+    let stored_id: String = row.get(0)?;
+    let id = ulid::Ulid::from_string(&stored_id)?;
+    if id.to_string() != stored_id {
+        return Err(invalid_data(
+            "the id is not spelled the way this program writes a ULID",
+        ));
+    }
     let source: String = row.get(1)?;
     let observed_at: String = row.get(2)?;
     let observed_at = timestamp::from_sql(&observed_at)?;
@@ -185,7 +197,7 @@ fn decode(
 #[cfg(test)]
 mod tests {
     use super::{find_by_id, find_in_window, insert, payload_json};
-    use crate::{StoreError, db};
+    use crate::{StoreError, db, timestamp};
     use chrono::{DateTime, TimeDelta, TimeZone, Timelike, Utc};
     use cw_core::model::{
         CURRENT_SCHEMA_VERSION, Observation, OcrStatus, ScreenPayload, SourcePayload,
@@ -581,5 +593,49 @@ mod tests {
             StoreError::Encoding { id: actual, .. } => assert_eq!(actual, id),
             other => panic!("expected Encoding, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn an_observation_id_spelled_any_other_way_is_refused() {
+        let dir = tempdir().expect("the temporary database directory should be creatable");
+        let path = dir.path().join("db.sqlite3");
+        let conn = db::open(&path).expect("the fresh database should initialize");
+        let stored_id = "0000000000000128ggyhyyk08n";
+        let id = ulid::Ulid::from_string(stored_id)
+            .expect("the lower-cased observation id should still parse");
+        let observed_at = at("2026-07-25T12:34:56Z");
+        let mut observation = screen_observation_at(observed_at);
+        observation.id = id;
+        let payload = payload_json(&observation).expect("the valid payload should serialize");
+
+        // This lower-cased spelling of a canonical ULID cannot be produced by this program, so
+        // write it with plain SQL; every other column uses its canonical spelling.
+        conn.execute(
+            "INSERT INTO observations \
+             (id, source, observed_at, duration_ms, schema_version, payload) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                stored_id,
+                observation.payload.kind(),
+                timestamp::to_sql(observed_at)
+                    .expect("the observation timestamp should be spellable"),
+                Option::<i64>::None,
+                i64::from(observation.schema_version),
+                payload,
+            ],
+        )
+        .expect("the lower-cased observation id should be writable");
+
+        let error = find_in_window(&conn, observed_at, observed_at + TimeDelta::seconds(1))
+            .expect_err("the lower-cased observation id should be refused");
+        match error {
+            StoreError::Encoding { id: actual, .. } => assert_eq!(actual, stored_id),
+            other => panic!("expected Encoding, got {other:?}"),
+        }
+
+        // This is the contradiction being closed: the row was reachable by the window query and
+        // invisible to this lookup under the one id that the window query reported.
+        let found = find_by_id(&conn, id).expect("the canonical observation id lookup should work");
+        assert_eq!(found, None);
     }
 }

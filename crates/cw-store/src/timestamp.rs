@@ -91,10 +91,18 @@ pub(crate) fn to_sql(at: DateTime<Utc>) -> Result<String, crate::StoreError> {
 /// value that came back from parsing, and what has to be repaired is the text in the column. An
 /// error naming `-0001-12-31T23:59:00.000000000Z` for a row that reads
 /// `0000-01-01T00:00:00.000000000+00:01` points at nothing anyone can find.
+/// A parse failure is reported the same way and for the same reason: chrono's message describes the
+/// text it was handed, which the caller already has to be told about, and the one thing worth
+/// carrying up is which value in which row has to be repaired.
 pub(crate) fn from_sql(
     text: &str,
 ) -> Result<DateTime<Utc>, Box<dyn std::error::Error + Send + Sync>> {
-    let at = DateTime::parse_from_rfc3339(text)?.with_timezone(&Utc);
+    let Ok(parsed) = DateTime::parse_from_rfc3339(text) else {
+        return Err(Box::new(crate::StoreError::TimestampOutOfRange {
+            at: text.to_owned(),
+        }));
+    };
+    let at = parsed.with_timezone(&Utc);
     if to_sql(at).is_ok_and(|spelled| spelled == text) {
         Ok(at)
     } else {
