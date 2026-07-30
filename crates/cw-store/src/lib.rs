@@ -148,20 +148,18 @@ pub enum StoreError {
         /// Observation the frame belongs to.
         id: String,
     },
-    /// Writing an image file failed.
-    #[error("failed to write image {path}: {source}")]
-    ImageWrite {
-        /// Path that could not be written, created or removed.
+    /// Reading or writing an image file failed.
+    #[error("image file {path} could not be read or written: {source}")]
+    ImageIo {
+        /// Path that could not be read, written, created or removed.
         path: PathBuf,
         /// Underlying filesystem error.
         source: std::io::Error,
     },
-    /// An image file already exists where a new one was to be written.
-    #[error("observation {id} already has an image at {path}")]
-    ImageExists {
+    /// An image is already registered for an observation.
+    #[error("observation {id} already has an image registered")]
+    ImageAlreadyRegistered {
         /// Observation whose image was to be written.
         id: String,
-        /// Path that is already taken.
-        path: PathBuf,
     },
 }

@@ -32,14 +32,14 @@ fn relative_path(id: ulid::Ulid, at: chrono::DateTime<chrono::Utc>) -> String {
     )
 }
 
-/// Encode `pixels` as WebP, put the file in place, and record that it exists.
+/// Encode `pixels` as WebP, register it, and put the file in place.
 ///
-/// The file is written to a temporary name, flushed, renamed into place, and only then registered.
-/// A crash before the registration leaves a file [`sweep_orphan_files`] removes; a crash after it
-/// leaves nothing to clean.
+/// The file is written to a temporary name and flushed before a transaction registers it, renames
+/// it into place, flushes the rename and commits. A crash before the commit leaves at most a file
+/// [`sweep_orphan_files`] removes; a crash after it leaves nothing to clean.
 #[allow(clippy::too_many_arguments)]
 pub fn save(
-    conn: &rusqlite::Connection,
+    conn: &mut rusqlite::Connection,
     root: &std::path::Path,
     id: ulid::Ulid,
     pixels: &[u8],
@@ -83,7 +83,7 @@ pub fn save(
     let parent = destination
         .parent()
         .expect("an image path with date directories always has a parent");
-    std::fs::create_dir_all(parent).map_err(|source| StoreError::ImageWrite {
+    std::fs::create_dir_all(parent).map_err(|source| StoreError::ImageIo {
         path: parent.to_path_buf(),
         source,
     })?;
@@ -96,7 +96,7 @@ pub fn save(
         .access_mode(RENAMABLE_WRITE_ACCESS)
         .share_mode(TEMPORARY_SHARE_MODE)
         .open(&temporary)
-        .map_err(|source| StoreError::ImageWrite {
+        .map_err(|source| StoreError::ImageIo {
             path: temporary.clone(),
             source,
         })?;
@@ -104,50 +104,27 @@ pub fn save(
         std::io::Write::write_all(&mut file, &encoded).and_then(|()| file.sync_all());
     if let Err(source) = write_result {
         drop(file);
-        let _ = std::fs::remove_file(&temporary);
-        return Err(StoreError::ImageWrite {
+        remove_image_file(&temporary)?;
+        return Err(StoreError::ImageIo {
             path: temporary,
             source,
         });
     }
 
-    match cw_core::atomic_file::rename_without_replacing(&file, &destination) {
-        Ok(true) => {
-            // The rename is a metadata change on this handle, and Windows buffers those; closing the
-            // handle does not push them. Without this the row can commit while the name it points at
-            // has not reached the disk, which is the one direction the write order exists to rule out.
-            if let Err(source) = file.sync_all() {
-                let _ = std::fs::remove_file(&destination);
-                drop(file);
-                return Err(StoreError::ImageWrite {
-                    path: destination,
-                    source,
-                });
-            }
-            drop(file);
-        }
-        Ok(false) => {
-            drop(file);
-            remove_temporary(&temporary)?;
-            // A taken name means the same observation is being saved twice or two ULIDs collided.
-            // Either way, the second write must not overwrite the first: the row already written
-            // records a byte_size that would no longer describe the file.
-            return Err(StoreError::ImageExists {
-                id: id_text,
-                path: destination,
-            });
-        }
+    // The INSERT decides a conflict before anything is published. The handle stays open through
+    // the commit so the destination remains removable while anything can still fail. A crash
+    // before the commit leaves at most an unregistered file, which is what the sweep exists for.
+    // `delete` takes the same IMMEDIATE lock, so the database row and file cannot cross each other.
+    let transaction = match conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+    {
+        Ok(transaction) => transaction,
         Err(source) => {
-            drop(file);
-            remove_temporary(&temporary)?;
-            return Err(StoreError::ImageWrite {
-                path: destination,
-                source,
-            });
+            remove_image_file(&temporary)?;
+            return Err(StoreError::Sql { source });
         }
-    }
+    };
 
-    if let Err(source) = conn.execute(
+    if let Err(source) = transaction.execute(
         INSERT_IMAGE,
         rusqlite::params![id_text, relative, byte_size, created_at],
     ) {
@@ -157,19 +134,45 @@ pub fn save(
                 | Some(rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE)
         );
         // Both unique indexes on this table carry the same fact: `observation_id` is the primary
-        // key and `relative_path` is derived from it, so one observation cannot collide with
-        // another's path and either violation means this observation already has an image.
-        // Measured 2026-07-30, a retry with the same id and instant reports the path index (2067),
-        // not the primary key (1555), so keying on the primary key alone never fired.
-        let _ = std::fs::remove_file(&destination);
+        // key and `relative_path` is derived from it, so either violation means this observation
+        // already has an image. The path index is the one SQLite reports for an identical retry.
+        remove_image_file(&temporary)?;
         if already_registered {
-            return Err(StoreError::ImageExists {
-                id: id_text,
-                path: destination,
-            });
+            return Err(StoreError::ImageAlreadyRegistered { id: id_text });
         }
         return Err(StoreError::Sql { source });
     }
+
+    match cw_core::atomic_file::rename_without_replacing(&file, &destination) {
+        Ok(true) => {}
+        Ok(false) => {
+            remove_image_file(&temporary)?;
+            return Err(StoreError::ImageAlreadyRegistered { id: id_text });
+        }
+        Err(source) => {
+            remove_image_file(&temporary)?;
+            return Err(StoreError::ImageIo {
+                path: destination,
+                source,
+            });
+        }
+    }
+
+    // The rename is a metadata change on this handle, and Windows buffers those; closing the
+    // handle does not push them.
+    if let Err(source) = file.sync_all() {
+        remove_image_file(&destination)?;
+        return Err(StoreError::ImageIo {
+            path: destination,
+            source,
+        });
+    }
+
+    if let Err(source) = transaction.commit() {
+        remove_image_file(&destination)?;
+        return Err(StoreError::Sql { source });
+    }
+    drop(file);
 
     Ok(relative)
 }
@@ -181,21 +184,30 @@ pub fn save(
 /// with [`save`] between creating that directory and opening its temporary file, while a few
 /// hundred empty entries a year cost nothing and only the startup sweep walks them.
 pub fn delete(
-    conn: &rusqlite::Connection,
+    conn: &mut rusqlite::Connection,
     root: &std::path::Path,
     id: ulid::Ulid,
 ) -> Result<(), StoreError> {
+    let transaction = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|source| StoreError::Sql { source })?;
     let relative = {
-        let mut statement = conn
+        let mut statement = transaction
             .prepare(SELECT_PATH_BY_ID)
             .map_err(|source| StoreError::Sql { source })?;
         let mut rows = statement
             .query([id.to_string()])
             .map_err(|source| StoreError::Sql { source })?;
-        let Some(row) = rows.next().map_err(|source| StoreError::Sql { source })? else {
-            return Ok(());
-        };
-        image_path_from_row(row)?
+        rows.next()
+            .map_err(|source| StoreError::Sql { source })?
+            .map(image_path_from_row)
+            .transpose()?
+    };
+    let Some(relative) = relative else {
+        transaction
+            .commit()
+            .map_err(|source| StoreError::Sql { source })?;
+        return Ok(());
     };
     let path = root.join(relative);
 
@@ -203,14 +215,18 @@ pub fn delete(
         Ok(()) => {}
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
         Err(source) => {
-            return Err(StoreError::ImageWrite {
+            return Err(StoreError::ImageIo {
                 path: path.clone(),
                 source,
             });
         }
     }
 
-    conn.execute(DELETE_IMAGE, [id.to_string()])
+    transaction
+        .execute(DELETE_IMAGE, [id.to_string()])
+        .map_err(|source| StoreError::Sql { source })?;
+    transaction
+        .commit()
         .map_err(|source| StoreError::Sql { source })?;
 
     Ok(())
@@ -232,7 +248,7 @@ pub fn sweep_orphan_files(
     for path in files {
         let relative = path_relative_to_root(root, &path)?;
         if !registered.contains(&relative) {
-            std::fs::remove_file(&path).map_err(|source| StoreError::ImageWrite {
+            std::fs::remove_file(&path).map_err(|source| StoreError::ImageIo {
                 path: path.clone(),
                 source,
             })?;
@@ -265,7 +281,7 @@ pub fn orphan_rows(
                 orphaned.push(relative);
             }
             Err(source) => {
-                return Err(StoreError::ImageWrite {
+                return Err(StoreError::ImageIo {
                     path: root.join(relative),
                     source,
                 });
@@ -276,8 +292,8 @@ pub fn orphan_rows(
     Ok(orphaned)
 }
 
-fn remove_temporary(path: &std::path::Path) -> Result<(), StoreError> {
-    std::fs::remove_file(path).map_err(|source| StoreError::ImageWrite {
+fn remove_image_file(path: &std::path::Path) -> Result<(), StoreError> {
+    std::fs::remove_file(path).map_err(|source| StoreError::ImageIo {
         path: path.to_path_buf(),
         source,
     })
@@ -307,7 +323,7 @@ fn collect_files(
         Ok(entries) => entries,
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(source) => {
-            return Err(StoreError::ImageWrite {
+            return Err(StoreError::ImageIo {
                 path: directory.to_path_buf(),
                 source,
             });
@@ -315,12 +331,12 @@ fn collect_files(
     };
 
     for entry in entries {
-        let entry = entry.map_err(|source| StoreError::ImageWrite {
+        let entry = entry.map_err(|source| StoreError::ImageIo {
             path: directory.to_path_buf(),
             source,
         })?;
         let path = entry.path();
-        let file_type = entry.file_type().map_err(|source| StoreError::ImageWrite {
+        let file_type = entry.file_type().map_err(|source| StoreError::ImageIo {
             path: path.clone(),
             source,
         })?;
@@ -340,7 +356,7 @@ fn path_relative_to_root(
 ) -> Result<String, StoreError> {
     let relative = path
         .strip_prefix(root)
-        .map_err(|source| StoreError::ImageWrite {
+        .map_err(|source| StoreError::ImageIo {
             path: path.to_path_buf(),
             source: std::io::Error::new(std::io::ErrorKind::InvalidData, source),
         })?;
@@ -390,6 +406,16 @@ fn decode_image_path(
 > {
     let stored_id: String = row.get(0)?;
     let id = ulid::Ulid::from_string(&stored_id)?;
+    // The observation and control stores have had this check since they were written, but this one
+    // did not: a lower-cased id was accepted everywhere except by `delete`, which looked it up in
+    // canonical spelling and silently matched nothing.
+    if id.to_string() != stored_id {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "the id is not spelled the way this program writes a ULID",
+        )
+        .into());
+    }
     let relative: String = row.get(1)?;
     let created_at: String = row.get(2)?;
     let created_at = timestamp::from_sql(&created_at)?;
@@ -449,7 +475,7 @@ mod tests {
     }
 
     fn save_test_image(
-        conn: &rusqlite::Connection,
+        conn: &mut rusqlite::Connection,
         root: &std::path::Path,
         id: ulid::Ulid,
         taken_at: DateTime<Utc>,
@@ -462,11 +488,11 @@ mod tests {
 
     #[test]
     fn save_writes_webp_atomically_and_registers_in_images_table() {
-        let (_dir, conn, root) = database();
+        let (_dir, mut conn, root) = database();
         let id = ulid::Ulid::new();
         let taken_at = at(2026, 7, 30);
 
-        let relative = save_test_image(&conn, &root, id, taken_at, 10);
+        let relative = save_test_image(&mut conn, &root, id, taken_at, 10);
         let path = root.join(&relative);
         let bytes = std::fs::read(&path).expect("the saved WebP should be readable");
         let metadata =
@@ -497,10 +523,10 @@ mod tests {
 
     #[test]
     fn the_stored_path_is_the_same_string_on_every_platform() {
-        let (_dir, conn, root) = database();
+        let (_dir, mut conn, root) = database();
         let id = ulid::Ulid::from(1u128);
 
-        let stored = save_test_image(&conn, &root, id, at(2026, 7, 30), 20);
+        let stored = save_test_image(&mut conn, &root, id, at(2026, 7, 30), 20);
 
         assert!(stored.contains('/'));
         assert!(!stored.contains('\\'));
@@ -509,15 +535,15 @@ mod tests {
 
     #[test]
     fn a_second_save_for_one_observation_is_refused_and_keeps_the_first() {
-        let (_dir, conn, root) = database();
+        let (_dir, mut conn, root) = database();
         let id = ulid::Ulid::new();
         let taken_at = at(2026, 7, 30);
-        let relative = save_test_image(&conn, &root, id, taken_at, 30);
+        let relative = save_test_image(&mut conn, &root, id, taken_at, 30);
         let path = root.join(&relative);
         let first = std::fs::read(&path).expect("the first WebP should be readable");
 
         let error = save(
-            &conn,
+            &mut conn,
             &root,
             id,
             &pixels(200),
@@ -529,14 +555,10 @@ mod tests {
         .expect_err("the second image should be refused");
 
         match error {
-            StoreError::ImageExists {
-                id: actual,
-                path: actual_path,
-            } => {
+            StoreError::ImageAlreadyRegistered { id: actual } => {
                 assert_eq!(actual, id.to_string());
-                assert_eq!(actual_path, path);
             }
-            other => panic!("expected ImageExists, got {other:?}"),
+            other => panic!("expected ImageAlreadyRegistered, got {other:?}"),
         }
         assert_eq!(
             std::fs::read(&path).expect("the first WebP should remain readable"),
@@ -550,14 +572,14 @@ mod tests {
 
     #[test]
     fn a_frame_whose_pixels_do_not_match_its_size_is_refused() {
-        let (_dir, conn, root) = database();
+        let (_dir, mut conn, root) = database();
         let id = ulid::Ulid::new();
         let taken_at = at(2026, 7, 30);
         insert_observation(&conn, id, taken_at);
         let mut short = pixels(40);
         short.pop();
 
-        let error = save(&conn, &root, id, &short, WIDTH, HEIGHT, 75.0, taken_at)
+        let error = save(&mut conn, &root, id, &short, WIDTH, HEIGHT, 75.0, taken_at)
             .expect_err("the short frame should be refused");
 
         match error {
@@ -573,14 +595,14 @@ mod tests {
 
     #[test]
     fn a_frame_larger_than_the_encoder_allows_is_refused_rather_than_panicking() {
-        let (_dir, conn, root) = database();
+        let (_dir, mut conn, root) = database();
         let taken_at = at(2026, 7, 30);
         let oversized_id = ulid::Ulid::new();
         let oversized = vec![0; 49_152];
 
         // This length passes the pixel check and would reach the encoder's `unwrap`.
         let oversized_error = save(
-            &conn,
+            &mut conn,
             &root,
             oversized_id,
             &oversized,
@@ -592,12 +614,21 @@ mod tests {
         .expect_err("the frame above the encoder's dimension limit should be refused");
         assert!(matches!(oversized_error, StoreError::Encode { .. }));
 
-        let zero_width_error = save(&conn, &root, ulid::Ulid::new(), &[], 0, 1, 75.0, taken_at)
-            .expect_err("a zero-width frame should be refused");
+        let zero_width_error = save(
+            &mut conn,
+            &root,
+            ulid::Ulid::new(),
+            &[],
+            0,
+            1,
+            75.0,
+            taken_at,
+        )
+        .expect_err("a zero-width frame should be refused");
         assert!(matches!(zero_width_error, StoreError::Encode { .. }));
 
         let quality_error = save(
-            &conn,
+            &mut conn,
             &root,
             ulid::Ulid::new(),
             &pixels(41),
@@ -612,10 +643,10 @@ mod tests {
 
     #[test]
     fn a_timestamp_this_schema_cannot_store_is_refused_before_anything_is_written() {
-        let (_dir, conn, root) = database();
+        let (_dir, mut conn, root) = database();
 
         let error = save(
-            &conn,
+            &mut conn,
             &root,
             ulid::Ulid::new(),
             &pixels(42),
@@ -632,12 +663,12 @@ mod tests {
 
     #[test]
     fn delete_removes_file_and_images_row() {
-        let (_dir, conn, root) = database();
+        let (_dir, mut conn, root) = database();
         let id = ulid::Ulid::new();
-        let relative = save_test_image(&conn, &root, id, at(2026, 7, 30), 50);
+        let relative = save_test_image(&mut conn, &root, id, at(2026, 7, 30), 50);
         let path = root.join(relative);
 
-        delete(&conn, &root, id).expect("the image should be deleted");
+        delete(&mut conn, &root, id).expect("the image should be deleted");
 
         assert!(!path.exists());
         let count: i64 = conn
@@ -652,11 +683,11 @@ mod tests {
 
     #[test]
     fn delete_leaves_the_observation_row_untouched() {
-        let (_dir, conn, root) = database();
+        let (_dir, mut conn, root) = database();
         let id = ulid::Ulid::new();
-        save_test_image(&conn, &root, id, at(2026, 7, 30), 60);
+        save_test_image(&mut conn, &root, id, at(2026, 7, 30), 60);
 
-        delete(&conn, &root, id).expect("the image should be deleted");
+        delete(&mut conn, &root, id).expect("the image should be deleted");
 
         let count: i64 = conn
             .query_row(
@@ -670,7 +701,7 @@ mod tests {
 
     #[test]
     fn a_row_naming_a_path_this_program_would_not_write_is_refused() {
-        let (_dir, conn, root) = database();
+        let (_dir, mut conn, root) = database();
         let id = ulid::Ulid::new();
         let taken_at = at(2026, 7, 30);
         insert_observation(&conn, id, taken_at);
@@ -697,7 +728,7 @@ mod tests {
         .expect("the malformed image row should be inserted by hand");
 
         let errors = [
-            delete(&conn, &root, id).expect_err("delete should refuse the malformed path"),
+            delete(&mut conn, &root, id).expect_err("delete should refuse the malformed path"),
             sweep_orphan_files(&conn, &root)
                 .expect_err("the sweep should refuse the malformed path"),
             orphan_rows(&conn, &root)
@@ -714,10 +745,63 @@ mod tests {
     }
 
     #[test]
-    fn orphan_files_without_db_row_are_swept_on_startup() {
+    fn a_row_whose_id_is_spelled_any_other_way_is_refused() {
         let (_dir, conn, root) = database();
+        let stored_id = "0000000000000128ggyhyyk08n";
+        let id = ulid::Ulid::from_string(stored_id)
+            .expect("the lower-cased observation id should still parse");
+        let taken_at = at(2026, 7, 30);
+        insert_observation(&conn, id, taken_at);
+        conn.execute(
+            "UPDATE observations SET id = ?1 WHERE id = ?2",
+            rusqlite::params![stored_id, id.to_string()],
+        )
+        .expect("the observation id should be made non-canonical before it has children");
+
+        let relative = super::relative_path(id, taken_at);
+        let path = root.join(&relative);
+        std::fs::create_dir_all(
+            path.parent()
+                .expect("the hand-placed image should have a parent"),
+        )
+        .expect("the hand-placed image directory should be creatable");
+        let contents = b"registered image";
+        std::fs::write(&path, contents).expect("the hand-placed image should be writable");
+
+        // This lower-cased spelling of a canonical ULID cannot be produced by this program, so
+        // write the image row with plain SQL; every other column uses its canonical spelling.
+        conn.execute(
+            "INSERT INTO images (observation_id, relative_path, byte_size, created_at) \
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                stored_id,
+                relative,
+                i64::try_from(contents.len()).expect("the test file size should fit SQLite"),
+                timestamp::to_sql(taken_at).expect("the test timestamp should be spellable"),
+            ],
+        )
+        .expect("the non-canonical image row should be inserted by hand");
+
+        let errors = [
+            sweep_orphan_files(&conn, &root)
+                .expect_err("the sweep should refuse the non-canonical id"),
+            orphan_rows(&conn, &root)
+                .expect_err("the orphan report should refuse the non-canonical id"),
+        ];
+        for error in errors {
+            match error {
+                StoreError::Encoding { id: actual, .. } => assert_eq!(actual, stored_id),
+                other => panic!("expected Encoding for {stored_id}, got {other:?}"),
+            }
+        }
+        assert!(path.is_file());
+    }
+
+    #[test]
+    fn orphan_files_without_db_row_are_swept_on_startup() {
+        let (_dir, mut conn, root) = database();
         let id = ulid::Ulid::new();
-        let relative = save_test_image(&conn, &root, id, at(2026, 7, 30), 80);
+        let relative = save_test_image(&mut conn, &root, id, at(2026, 7, 30), 80);
         let saved = root.join(relative);
         let unregistered = root.join("2026").join("07").join("29").join("orphan.webp");
         std::fs::create_dir_all(
@@ -742,9 +826,9 @@ mod tests {
 
     #[test]
     fn orphan_rows_without_file_are_reported_and_kept() {
-        let (_dir, conn, root) = database();
+        let (_dir, mut conn, root) = database();
         let id = ulid::Ulid::new();
-        let relative = save_test_image(&conn, &root, id, at(2026, 7, 30), 90);
+        let relative = save_test_image(&mut conn, &root, id, at(2026, 7, 30), 90);
         std::fs::remove_file(root.join(&relative))
             .expect("the saved file should be removable without touching its row");
 
@@ -763,10 +847,10 @@ mod tests {
 
     #[test]
     fn saving_again_over_a_row_whose_file_is_gone_leaves_the_row_and_no_new_file() {
-        let (_dir, conn, root) = database();
+        let (_dir, mut conn, root) = database();
         let id = ulid::Ulid::new();
         let taken_at = at(2026, 7, 30);
-        let relative = save_test_image(&conn, &root, id, taken_at, 91);
+        let relative = save_test_image(&mut conn, &root, id, taken_at, 91);
         let path = root.join(&relative);
         let original_byte_size: i64 = conn
             .query_row(
@@ -779,7 +863,7 @@ mod tests {
             .expect("the saved file should be removable without touching its row");
 
         let error = save(
-            &conn,
+            &mut conn,
             &root,
             id,
             &pixels(201),
@@ -790,7 +874,7 @@ mod tests {
         )
         .expect_err("the existing image row should refuse another file");
 
-        assert!(matches!(error, StoreError::ImageExists { .. }));
+        assert!(matches!(error, StoreError::ImageAlreadyRegistered { .. }));
         let stored_byte_size: i64 = conn
             .query_row(
                 "SELECT byte_size FROM images WHERE observation_id = ?1",
@@ -800,18 +884,34 @@ mod tests {
             .expect("the original byte size should remain readable");
         assert_eq!(stored_byte_size, original_byte_size);
         assert!(!path.exists());
+        let mut files = Vec::new();
+        super::collect_files(&root, &mut files)
+            .expect("the image root should remain readable after the refusal");
+        assert!(!files.iter().any(|candidate| {
+            candidate
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().contains(".tmp-"))
+        }));
     }
 
     #[test]
     fn a_failed_rename_leaves_no_temporary_behind() {
-        let (_dir, conn, root) = database();
+        let (_dir, mut conn, root) = database();
         let id = ulid::Ulid::new();
         let taken_at = at(2026, 7, 30);
-        let relative = save_test_image(&conn, &root, id, taken_at, 100);
-        let destination = root.join(relative);
+        insert_observation(&conn, id, taken_at);
+        let destination = root.join(super::relative_path(id, taken_at));
+        std::fs::create_dir_all(
+            destination
+                .parent()
+                .expect("the image destination should have a parent"),
+        )
+        .expect("the image directory should be creatable");
+        std::fs::write(&destination, b"a file already owns the destination")
+            .expect("the taken destination should be writable");
 
         let error = save(
-            &conn,
+            &mut conn,
             &root,
             id,
             &pixels(210),
@@ -820,8 +920,8 @@ mod tests {
             75.0,
             taken_at,
         )
-        .expect_err("the second image should be refused");
-        assert!(matches!(error, StoreError::ImageExists { .. }));
+        .expect_err("the taken destination should be refused");
+        assert!(matches!(error, StoreError::ImageAlreadyRegistered { .. }));
 
         let entries = std::fs::read_dir(
             destination

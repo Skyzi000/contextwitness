@@ -17,6 +17,22 @@ pub fn temporary_path_beside(destination: &std::path::Path) -> std::path::PathBu
     std::path::PathBuf::from(temporary)
 }
 
+/// The `io::Error` for a Win32 failure reported as an `HRESULT`.
+///
+/// `from_raw_os_error` wants the raw Win32 code, and an HRESULT is not one: a Win32 error arrives
+/// wrapped as `0x8007_0000 | code`, so handing it over whole loses the classification — access
+/// denied stops being `PermissionDenied` and becomes a number no documentation lists. Anything from
+/// another facility has no Win32 code to recover and is carried across whole.
+fn io_error(error: windows::core::Error) -> std::io::Error {
+    const FACILITY_WIN32: i32 = 0x8007_0000u32 as i32;
+    let code = error.code().0;
+    if code & 0xFFFF_0000u32 as i32 == FACILITY_WIN32 {
+        std::io::Error::from_raw_os_error(code & 0xFFFF)
+    } else {
+        std::io::Error::other(error)
+    }
+}
+
 /// Rename the open file to `destination`, failing instead of replacing when that name is taken.
 /// `Ok(true)` when the file now lives at `destination`, `Ok(false)` when something else already
 /// does.
@@ -63,7 +79,7 @@ pub fn rename_without_replacing(
     match result {
         Ok(()) => Ok(true),
         Err(error) if error.code() == already_exists => Ok(false),
-        Err(error) => Err(std::io::Error::from_raw_os_error(error.code().0)),
+        Err(error) => Err(io_error(error)),
     }
 }
 
@@ -131,5 +147,25 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&temp_dir).expect("the rename test directory should be removable");
+    }
+
+    #[test]
+    fn a_win32_failure_keeps_the_kind_the_operating_system_gave_it() {
+        let access_denied = io_error(windows::core::Error::from_hresult(windows::core::HRESULT(
+            0x8007_0005u32 as i32,
+        )));
+        assert_eq!(access_denied.raw_os_error(), Some(5));
+        assert_eq!(access_denied.kind(), std::io::ErrorKind::PermissionDenied);
+
+        let file_not_found = io_error(windows::core::Error::from_hresult(windows::core::HRESULT(
+            0x8007_0002u32 as i32,
+        )));
+        assert_eq!(file_not_found.raw_os_error(), Some(2));
+        assert_eq!(file_not_found.kind(), std::io::ErrorKind::NotFound);
+
+        let other_facility = io_error(windows::core::Error::from_hresult(windows::core::HRESULT(
+            0x8004_0005u32 as i32,
+        )));
+        assert_eq!(other_facility.raw_os_error(), None);
     }
 }
