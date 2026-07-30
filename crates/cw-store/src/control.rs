@@ -25,7 +25,8 @@ pub enum HealthKey {
 /// What an audit row records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventKind {
-    /// Capture was stopped.
+    /// Capture was asked to stop. Asking again for a pause already in force records this too, so a
+    /// row is a request rather than proof that anything moved.
     Paused,
     /// Capture was asked to start again. A resume with nothing to resume records this too, so a row
     /// is a request rather than proof that anything moved.
@@ -151,7 +152,7 @@ pub fn get_pause(conn: &rusqlite::Connection) -> Result<Option<Pause>, StoreErro
     }
 }
 
-/// Stop capture, and record that it happened.
+/// Stop capture, and record that it was asked for.
 ///
 /// One transaction, because the two keys are one fact: a crash between writing the new key and
 /// clearing the old one would leave a pair no reader is allowed to resolve.

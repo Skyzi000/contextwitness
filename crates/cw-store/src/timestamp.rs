@@ -114,7 +114,7 @@ pub(crate) fn from_sql(
 
 #[cfg(test)]
 mod tests {
-    use super::{SPELLED_LENGTH, from_sql, to_sql};
+    use super::{NANOSECONDS_PER_SECOND, SPELLED_LENGTH, from_sql, to_sql};
     use crate::StoreError;
     use chrono::{DateTime, SecondsFormat, TimeDelta, TimeZone, Timelike, Utc};
 
@@ -199,6 +199,19 @@ mod tests {
     }
 
     #[test]
+    fn a_stored_value_that_is_not_a_timestamp_at_all_names_itself() {
+        // Returning the parser's error instead would leave the caller told which row to repair and
+        // never told what is in it. This is the only test that can tell the two apart.
+        let error = from_sql("not a timestamp")
+            .expect_err("a value that is not a timestamp should be refused");
+        let Some(StoreError::TimestampOutOfRange { at }) = error.downcast_ref::<StoreError>()
+        else {
+            panic!("expected TimestampOutOfRange, got {error:?}")
+        };
+        assert_eq!(at, "not a timestamp");
+    }
+
+    #[test]
     fn every_year_the_spelling_accepts_has_the_same_width_and_round_trips() {
         for year in 0..=9999 {
             let original = Utc
@@ -241,6 +254,42 @@ mod tests {
 
     #[test]
     fn an_overflowing_nanosecond_would_name_another_instant_and_is_refused() {
+        // This is the smallest value the guard rejects; every other case in this file is
+        // comfortably above it. A guard written `>` instead of `>=` would let exactly this one
+        // through.
+        let boundary = Utc
+            .with_ymd_and_hms(2026, 7, 25, 12, 34, 58)
+            .single()
+            .expect("the test timestamp should be valid")
+            .with_nanosecond(NANOSECONDS_PER_SECOND)
+            .expect("the boundary nanosecond should be valid");
+        let boundary_spelling = boundary.to_rfc3339_opts(SecondsFormat::Nanos, true);
+
+        assert_eq!(boundary_spelling, "2026-07-25T12:34:59.000000000Z");
+
+        let boundary_ordinary = Utc
+            .with_ymd_and_hms(2026, 7, 25, 12, 34, 59)
+            .single()
+            .expect("the test timestamp should be valid")
+            .with_nanosecond(0)
+            .expect("the ordinary nanosecond should be valid");
+
+        assert_eq!(
+            boundary_spelling,
+            to_sql(boundary_ordinary).expect("the ordinary instant should be spellable")
+        );
+        assert_ne!(boundary, boundary_ordinary);
+
+        let boundary_error =
+            to_sql(boundary).expect_err("the boundary timestamp should be refused");
+        let StoreError::TimestampOutOfRange { at } = boundary_error else {
+            panic!("expected TimestampOutOfRange, got {boundary_error:?}")
+        };
+        assert_eq!(
+            at,
+            "2026-07-25T12:34:59.000000000Z spelled from a nanosecond field of 1000000000"
+        );
+
         let overflowing = Utc
             .with_ymd_and_hms(2026, 7, 25, 12, 34, 58)
             .single()

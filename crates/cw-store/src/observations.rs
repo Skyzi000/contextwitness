@@ -437,7 +437,7 @@ mod tests {
     }
 
     #[test]
-    fn a_leap_second_no_window_query_could_return_never_reaches_the_database() {
+    fn a_leap_second_its_own_window_would_lose_never_reaches_the_database() {
         let dir = tempdir().expect("the temporary database directory should be creatable");
         let path = dir.path().join("db.sqlite3");
         let conn = db::open(&path).expect("the fresh database should initialize");
@@ -453,8 +453,9 @@ mod tests {
         let ordinary = screen_observation_at(at("2016-12-31T23:59:59.999999999Z"));
         insert(&conn, &ordinary).expect("the ordinary observation should be stored");
 
-        // The row is refused because a window query would lose it even though the half-open
-        // contract places it inside.
+        // The window this test queries is the one that loses the value silently. A wider window
+        // would instead select the text and fail on decoding it. Either way there is no good
+        // outcome, which is why the row is refused on the way in.
         let error = insert(&conn, &observation)
             .expect_err("the timestamp no window query could return should be refused");
         assert!(matches!(error, StoreError::TimestampOutOfRange { .. }));
