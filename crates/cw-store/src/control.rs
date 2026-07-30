@@ -902,6 +902,38 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_or_reversed_event_window_is_empty_rather_than_an_error() {
+        let (_dir, conn) = database();
+        let t = at(2026, 7, 30, 12, 34, 56);
+        let event = ControlEvent {
+            id: ulid::Ulid::new(),
+            kind: EventKind::BlacklistSkip,
+            at: t,
+            detail: None,
+        };
+
+        record_event(&conn, &event).expect("the ordinary event should be stored");
+
+        let empty = events_in_window(&conn, t, t).expect("the empty window should be readable");
+        assert_eq!(empty, Vec::new());
+        let reversed = events_in_window(&conn, t + TimeDelta::seconds(1), t)
+            .expect("the reversed window should be readable");
+        assert_eq!(reversed, Vec::new());
+        let unspellable =
+            events_in_window(&conn, DateTime::<Utc>::MAX_UTC, DateTime::<Utc>::MAX_UTC)
+                .expect("the unspellable empty window should be readable");
+        assert_eq!(unspellable, Vec::new());
+
+        // Reversed *and* unspellable, which is the only combination that needs the guard: with the
+        // start at MAX_UTC, anything reaching `to_sql(start)` answers TimestampOutOfRange where the
+        // contract says empty. Each half alone is covered above and neither half alone would notice
+        // the guard weakening to `end == start`.
+        let reversed_and_unspellable = events_in_window(&conn, DateTime::<Utc>::MAX_UTC, t)
+            .expect("the reversed unspellable window should be readable");
+        assert_eq!(reversed_and_unspellable, Vec::new());
+    }
+
+    #[test]
     fn adjacent_event_windows_tile_without_sharing_an_event() {
         let (_dir, conn) = database();
         // A ULID is a millisecond timestamp and eighty random bits, so two ids generated in one

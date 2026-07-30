@@ -521,6 +521,14 @@ mod tests {
         let unspellable = find_in_window(&conn, DateTime::<Utc>::MAX_UTC, DateTime::<Utc>::MAX_UTC)
             .expect("the unspellable empty window should be readable");
         assert_eq!(unspellable, Vec::new());
+
+        // Reversed *and* unspellable, which is the only combination that needs the guard: with the
+        // start at MAX_UTC, anything reaching `to_sql(start)` answers TimestampOutOfRange where the
+        // contract says empty. Each half alone is covered above and neither half alone would notice
+        // the guard weakening to `end == start`.
+        let reversed_and_unspellable = find_in_window(&conn, DateTime::<Utc>::MAX_UTC, t)
+            .expect("the reversed unspellable window should be readable");
+        assert_eq!(reversed_and_unspellable, Vec::new());
     }
 
     #[test]
