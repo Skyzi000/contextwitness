@@ -342,8 +342,13 @@ mod tests {
         let start = at("2026-07-25T12:00:00Z");
         let end = at("2026-07-25T12:05:00Z");
         let before = screen_observation_at(start - TimeDelta::nanoseconds(1));
-        let at_start = screen_observation_at(start);
-        let before_end = screen_observation_at(end - TimeDelta::nanoseconds(1));
+        // `Ulid::new()` ascends with the clock, so ids that follow the timestamps make
+        // `ORDER BY id, observed_at` indistinguishable from the correct order. Only opposing ids
+        // test which key sorts first.
+        let mut at_start = screen_observation_at(start);
+        at_start.id = ulid::Ulid::from(9u128);
+        let mut before_end = screen_observation_at(end - TimeDelta::nanoseconds(1));
+        before_end.id = ulid::Ulid::from(1u128);
         let at_end = screen_observation_at(end);
 
         for observation in [&before, &at_start, &before_end, &at_end] {
@@ -361,9 +366,15 @@ mod tests {
         let path = dir.path().join("db.sqlite3");
         let conn = db::open(&path).expect("the fresh database should initialize");
         let start = at("2026-07-25T12:00:00Z");
-        let oldest = screen_observation_at(start);
-        let middle = screen_observation_at(start + TimeDelta::seconds(1));
-        let newest = screen_observation_at(start + TimeDelta::seconds(2));
+        // `Ulid::new()` ascends with the clock, so ids that follow the timestamps make
+        // `ORDER BY id, observed_at` indistinguishable from the correct order. Only opposing ids
+        // test which key sorts first.
+        let mut oldest = screen_observation_at(start);
+        oldest.id = ulid::Ulid::from(9u128);
+        let mut middle = screen_observation_at(start + TimeDelta::seconds(1));
+        middle.id = ulid::Ulid::from(2u128);
+        let mut newest = screen_observation_at(start + TimeDelta::seconds(2));
+        newest.id = ulid::Ulid::from(1u128);
 
         for observation in [&newest, &oldest, &middle] {
             insert(&conn, observation).expect("the out-of-order observation should be stored");
@@ -404,8 +415,13 @@ mod tests {
         let path = dir.path().join("db.sqlite3");
         let conn = db::open(&path).expect("the fresh database should initialize");
         let start = at("2026-07-25T12:00:00Z");
-        let whole_second = screen_observation_at(start);
-        let last_fraction = screen_observation_at(at("2026-07-25T12:00:00.999999999Z"));
+        // `Ulid::new()` ascends with the clock, so ids that follow the timestamps make
+        // `ORDER BY id, observed_at` indistinguishable from the correct order. Only opposing ids
+        // test which key sorts first.
+        let mut whole_second = screen_observation_at(start);
+        whole_second.id = ulid::Ulid::from(9u128);
+        let mut last_fraction = screen_observation_at(at("2026-07-25T12:00:00.999999999Z"));
+        last_fraction.id = ulid::Ulid::from(1u128);
 
         insert(&conn, &last_fraction).expect("the fractional observation should be stored");
         insert(&conn, &whole_second).expect("the whole-second observation should be stored");

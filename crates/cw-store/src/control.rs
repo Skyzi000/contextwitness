@@ -505,6 +505,51 @@ mod tests {
     }
 
     #[test]
+    fn asking_again_for_a_pause_already_in_force_records_the_request() {
+        let (_dir, mut conn) = database();
+        let first_at = at(2026, 7, 30, 12, 0, 0);
+        let second_at = at(2026, 7, 30, 12, 1, 0);
+        // `Ulid::new()` ascends with the clock, so ids that follow the timestamps make
+        // `ORDER BY id, at` indistinguishable from the correct order. Only opposing ids test
+        // which key sorts first.
+        let first_id = ulid::Ulid::from(9u128);
+        let second_id = ulid::Ulid::from(1u128);
+
+        set_pause(&mut conn, Pause::Indefinite, first_id, first_at)
+            .expect("the first endless pause should be stored");
+        set_pause(&mut conn, Pause::Indefinite, second_id, second_at)
+            .expect("the second endless pause should be stored");
+
+        assert_eq!(
+            get_pause(&conn).expect("the endless pause should be readable"),
+            Some(Pause::Indefinite)
+        );
+        assert_eq!(pause_key_count(&conn), 1);
+
+        // The second request moved nothing. Its row exists because the trail records what was
+        // asked for, exactly as `EventKind::Paused` documents; nothing else here checks that.
+        let events = events_in_window(&conn, first_at, second_at + TimeDelta::seconds(1))
+            .expect("the audit window should be readable");
+        assert_eq!(
+            events,
+            [
+                ControlEvent {
+                    id: first_id,
+                    kind: EventKind::Paused,
+                    at: first_at,
+                    detail: None,
+                },
+                ControlEvent {
+                    id: second_id,
+                    kind: EventKind::Paused,
+                    at: second_at,
+                    detail: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn changing_the_kind_of_pause_leaves_only_one_key() {
         let (_dir, mut conn) = database();
         let first_deadline = at(2026, 8, 1, 12, 0, 0);
@@ -760,8 +805,11 @@ mod tests {
         let paused_at = at(2026, 7, 30, 12, 1, 0);
         let resumed_at = at(2026, 7, 30, 12, 2, 0);
         let deadline = at(2026, 7, 30, 13, 0, 0);
-        let pause_id = ulid::Ulid::new();
-        let resume_id = ulid::Ulid::new();
+        // `Ulid::new()` ascends with the clock, so ids that follow the timestamps make
+        // `ORDER BY id, at` indistinguishable from the correct order. Only opposing ids test
+        // which key sorts first.
+        let pause_id = ulid::Ulid::from(9u128);
+        let resume_id = ulid::Ulid::from(1u128);
 
         set_pause(&mut conn, Pause::Until(deadline), pause_id, paused_at)
             .expect("the pause and its event should be stored");
@@ -846,14 +894,17 @@ mod tests {
     #[test]
     fn adjacent_event_windows_tile_without_sharing_an_event() {
         let (_dir, conn) = database();
+        // `Ulid::new()` ascends with the clock, so ids that follow the timestamps make
+        // `ORDER BY id, at` indistinguishable from the correct order. Only opposing ids test
+        // which key sorts first.
         let first = ControlEvent {
-            id: ulid::Ulid::new(),
+            id: ulid::Ulid::from(4u128),
             kind: EventKind::BlacklistSkip,
             at: at(2026, 7, 30, 12, 1, 0),
             detail: Some("first.exe".to_owned()),
         };
         let middle = ControlEvent {
-            id: ulid::Ulid::new(),
+            id: ulid::Ulid::from(2u128),
             kind: EventKind::BlacklistSkip,
             at: at(2026, 7, 30, 12, 2, 0),
             detail: Some("middle.exe".to_owned()),
@@ -861,7 +912,7 @@ mod tests {
         // This boundary row is what tells `<= end - 1 ns` apart from `< end - 1 ns`; without it,
         // that change passes every test while losing the event at the window's last nanosecond.
         let boundary = ControlEvent {
-            id: ulid::Ulid::new(),
+            id: ulid::Ulid::from(3u128),
             kind: EventKind::BlacklistSkip,
             at: middle
                 .at
@@ -870,7 +921,7 @@ mod tests {
             detail: Some("boundary.exe".to_owned()),
         };
         let last = ControlEvent {
-            id: ulid::Ulid::new(),
+            id: ulid::Ulid::from(1u128),
             kind: EventKind::BlacklistSkip,
             at: at(2026, 7, 30, 12, 3, 0),
             detail: Some("last.exe".to_owned()),
@@ -889,6 +940,33 @@ mod tests {
         let mut tiled = earlier;
         tiled.extend(later);
         assert_eq!(tiled, [first, boundary, middle, last]);
+    }
+
+    #[test]
+    fn every_event_the_schema_can_store_is_inside_a_window_it_can_search() {
+        let (_dir, conn) = database();
+        let event = ControlEvent {
+            id: ulid::Ulid::new(),
+            kind: EventKind::BlacklistSkip,
+            at: at(9999, 12, 31, 23, 59, 59) + TimeDelta::nanoseconds(999_999_999),
+            detail: None,
+        };
+        let start = at(9999, 12, 31, 23, 55, 0);
+        let end = Utc
+            .with_ymd_and_hms(10_000, 1, 1, 0, 0, 0)
+            .single()
+            .expect("year 10000 should be valid");
+
+        record_event(&conn, &event).expect("the last spellable event should be stored");
+        // The exclusive end has no spelling of its own. This is what tells `end - 1 ns` apart
+        // from comparing against `end` itself.
+        let events = events_in_window(&conn, start, end)
+            .expect("the last spellable event should be searchable");
+        assert_eq!(events, [event]);
+
+        let events = events_in_window(&conn, DateTime::<Utc>::MIN_UTC, DateTime::<Utc>::MIN_UTC)
+            .expect("a window ending at the earliest instant should be empty");
+        assert!(events.is_empty());
     }
 
     #[test]
