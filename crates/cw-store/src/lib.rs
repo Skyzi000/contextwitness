@@ -3,6 +3,7 @@
 
 pub mod control;
 pub mod db;
+pub mod images;
 pub mod observations;
 mod timestamp;
 
@@ -140,5 +141,27 @@ pub enum StoreError {
         id: String,
         /// Underlying SQLite error.
         source: rusqlite::Error,
+    },
+    /// Encoding a frame to WebP failed.
+    #[error("failed to encode the image for observation {id}")]
+    Encode {
+        /// Observation the frame belongs to.
+        id: String,
+    },
+    /// Writing an image file failed.
+    #[error("failed to write image {path}: {source}")]
+    ImageWrite {
+        /// Path that could not be written, created or removed.
+        path: PathBuf,
+        /// Underlying filesystem error.
+        source: std::io::Error,
+    },
+    /// An image file already exists where a new one was to be written.
+    #[error("observation {id} already has an image at {path}")]
+    ImageExists {
+        /// Observation whose image was to be written.
+        id: String,
+        /// Path that is already taken.
+        path: PathBuf,
     },
 }

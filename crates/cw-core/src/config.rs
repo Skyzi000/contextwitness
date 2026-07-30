@@ -1,3 +1,4 @@
+use crate::atomic_file::{rename_without_replacing, temporary_path_beside};
 use serde::{Deserialize, Serialize};
 
 /// Commented TOML listing every setting at its built-in default. Written on first run so the
@@ -53,73 +54,6 @@ enabled = false
 const RENAMABLE_WRITE_ACCESS: u32 = 0x4000_0000 | 0x0001_0000;
 /// FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE.
 const TEMPORARY_SHARE_MODE: u32 = 0x0000_0001 | 0x0000_0002 | 0x0000_0004;
-
-/// Distinguishes concurrent publish attempts within one process; the process id distinguishes
-/// processes.
-static NEXT_TEMPORARY_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// A temporary path beside `destination`, distinct for every call.
-///
-/// Sharing one temporary between two publish attempts is not a near miss: the share mode lets the
-/// second `open` succeed, its `truncate` discards bytes the first has already flushed, and the
-/// loser's handle goes on writing into the file after the winner has published it under the
-/// destination name (all measured 2026-07-27).
-fn temporary_path_beside(destination: &std::path::Path) -> std::path::PathBuf {
-    let id = NEXT_TEMPORARY_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let mut temporary = destination.as_os_str().to_os_string();
-    temporary.push(format!(".tmp-{}-{id}", std::process::id()));
-    std::path::PathBuf::from(temporary)
-}
-
-/// Rename the open file to `destination`, failing instead of replacing when that name is taken.
-/// `Ok(true)` when the file now lives at `destination`, `Ok(false)` when something else already
-/// does.
-fn rename_without_replacing(
-    file: &std::fs::File,
-    destination: &std::path::Path,
-) -> Result<bool, windows::core::Error> {
-    use std::os::windows::{ffi::OsStrExt, io::AsRawHandle};
-    use windows::Win32::{
-        Foundation::{ERROR_ALREADY_EXISTS, HANDLE},
-        Storage::FileSystem::{FILE_RENAME_INFO, FileRenameInfo, SetFileInformationByHandle},
-    };
-
-    // `fs::rename` cannot be used to publish a config: on Windows it is MoveFileExW with
-    // MOVEFILE_REPLACE_EXISTING and silently replaces the destination (measured 2026-07-27).
-    // Creating the destination first and filling it afterwards is no better — the name exists
-    // before the content does, so a concurrent `setup` is told the config is ready, writes the
-    // user's settings into the empty shell, and has them replaced a moment later. Renaming by
-    // handle with ReplaceIfExists = FALSE is the only operation that makes the name appear
-    // already holding the full template, and it works on exFAT as well as NTFS (both measured).
-    let destination = std::path::absolute(destination)?;
-    let destination: Vec<u16> = destination.as_os_str().encode_wide().collect();
-    let name_bytes = destination.len() * std::mem::size_of::<u16>();
-    let mut buf = vec![0u64; (std::mem::size_of::<FILE_RENAME_INFO>() + name_bytes).div_ceil(8)];
-    let result = unsafe {
-        let info = buf.as_mut_ptr().cast::<FILE_RENAME_INFO>();
-        (*info).Anonymous.ReplaceIfExists = false;
-        (*info).RootDirectory = HANDLE::default();
-        (*info).FileNameLength = name_bytes as u32;
-        std::ptr::copy_nonoverlapping(
-            destination.as_ptr(),
-            std::ptr::addr_of_mut!((*info).FileName).cast::<u16>(),
-            destination.len(),
-        );
-        SetFileInformationByHandle(
-            HANDLE(file.as_raw_handle()),
-            FileRenameInfo,
-            buf.as_ptr().cast(),
-            (buf.len() * 8) as u32,
-        )
-    };
-    let already_exists = windows::core::HRESULT::from_win32(ERROR_ALREADY_EXISTS.0); // 0x800700B7
-
-    match result {
-        Ok(()) => Ok(true),
-        Err(error) if error.code() == already_exists => Ok(false),
-        Err(error) => Err(error),
-    }
-}
 
 /// Complete ContextWitness configuration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -421,7 +355,7 @@ impl Config {
                 let _ = std::fs::remove_file(&temporary);
                 Err(ConfigError::Write {
                     path: path.to_path_buf(),
-                    source: std::io::Error::from(error),
+                    source: error,
                 })
             }
         }
@@ -618,51 +552,6 @@ mod tests {
 
         std::fs::remove_dir_all(&temp_dir)
             .expect("the default config test directory should be removable");
-    }
-
-    #[test]
-    fn rename_without_replacing_reports_a_taken_name_and_leaves_both_files() {
-        use std::os::windows::fs::OpenOptionsExt;
-
-        let temp_dir = unique_temp_path("rename-without-replacing-taken");
-        assert!(!temp_dir.exists());
-        std::fs::create_dir(&temp_dir)
-            .expect("the unique rename test directory should be creatable");
-        let destination = temp_dir.join("config.toml");
-        let temporary = temp_dir.join("config.toml.tmp-test");
-        std::fs::write(&destination, "a config another process finished first")
-            .expect("the winning config should be writable");
-
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .access_mode(RENAMABLE_WRITE_ACCESS)
-            .share_mode(TEMPORARY_SHARE_MODE)
-            .open(&temporary)
-            .expect("the temporary config should be openable");
-        std::io::Write::write_all(&mut file, DEFAULT_CONFIG_TOML.as_bytes())
-            .expect("the default config should be writable to the temporary");
-
-        // The public entry point takes a fast path when a config is already present, so target the
-        // helper directly: this is the branch where the config appears after that test, which
-        // cannot be reached through the public entry point deterministically.
-        let renamed = rename_without_replacing(&file, &destination)
-            .expect("a taken destination should be reported without an error");
-        drop(file);
-
-        assert!(!renamed, "a taken destination should be reported as false");
-        assert_eq!(
-            std::fs::read_to_string(&destination)
-                .expect("the winning config should remain readable"),
-            "a config another process finished first"
-        );
-        assert!(
-            temporary.exists(),
-            "the rename should leave temporary cleanup to its caller"
-        );
-
-        std::fs::remove_dir_all(&temp_dir).expect("the rename test directory should be removable");
     }
 
     #[test]
