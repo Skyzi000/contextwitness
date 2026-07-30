@@ -510,11 +510,13 @@ mod tests {
         let first_at = at(2026, 7, 30, 12, 0, 0);
         let second_at = at(2026, 7, 30, 12, 1, 0);
         // A ULID is a millisecond timestamp and eighty random bits, so two ids generated in one
-        // test share a millisecond and their order is a coin flip: measured 2026-07-30 over 200,000
-        // back-to-back pairs, 100% shared a millisecond and the second sorted first in 50.1% of
-        // them. Generated ids therefore make this a flaky detector of `ORDER BY id, at` rather than
-        // a blind one — the suite caught that swap in 29 runs out of 30. Fixed ids running against
-        // the timestamps make it certain.
+        // test almost always share a millisecond, and their order is then a coin flip: measured
+        // 2026-07-30 over 200,000 back-to-back pairs, 199,995 shared one and the second sorted
+        // first in 50.1% of those. The five that crossed a millisecond are the only pairs whose ids
+        // follow the clock, and they are far too rare to account for anything here. Generated ids
+        // therefore make this a flaky detector of `ORDER BY id, at` rather than a blind one — six
+        // tests are sensitive to that swap, and the suite caught it in 29 runs out of 30. Fixed ids
+        // running against the timestamps make it certain.
         let first_id = ulid::Ulid::from(9u128);
         let second_id = ulid::Ulid::from(1u128);
 
@@ -809,11 +811,13 @@ mod tests {
         let resumed_at = at(2026, 7, 30, 12, 2, 0);
         let deadline = at(2026, 7, 30, 13, 0, 0);
         // A ULID is a millisecond timestamp and eighty random bits, so two ids generated in one
-        // test share a millisecond and their order is a coin flip: measured 2026-07-30 over 200,000
-        // back-to-back pairs, 100% shared a millisecond and the second sorted first in 50.1% of
-        // them. Generated ids therefore make this a flaky detector of `ORDER BY id, at` rather than
-        // a blind one — the suite caught that swap in 29 runs out of 30. Fixed ids running against
-        // the timestamps make it certain.
+        // test almost always share a millisecond, and their order is then a coin flip: measured
+        // 2026-07-30 over 200,000 back-to-back pairs, 199,995 shared one and the second sorted
+        // first in 50.1% of those. The five that crossed a millisecond are the only pairs whose ids
+        // follow the clock, and they are far too rare to account for anything here. Generated ids
+        // therefore make this a flaky detector of `ORDER BY id, at` rather than a blind one — six
+        // tests are sensitive to that swap, and the suite caught it in 29 runs out of 30. Fixed ids
+        // running against the timestamps make it certain.
         let pause_id = ulid::Ulid::from(9u128);
         let resume_id = ulid::Ulid::from(1u128);
 
@@ -901,11 +905,13 @@ mod tests {
     fn adjacent_event_windows_tile_without_sharing_an_event() {
         let (_dir, conn) = database();
         // A ULID is a millisecond timestamp and eighty random bits, so two ids generated in one
-        // test share a millisecond and their order is a coin flip: measured 2026-07-30 over 200,000
-        // back-to-back pairs, 100% shared a millisecond and the second sorted first in 50.1% of
-        // them. Generated ids therefore make this a flaky detector of `ORDER BY id, at` rather than
-        // a blind one — the suite caught that swap in 29 runs out of 30. Fixed ids running against
-        // the timestamps make it certain.
+        // test almost always share a millisecond, and their order is then a coin flip: measured
+        // 2026-07-30 over 200,000 back-to-back pairs, 199,995 shared one and the second sorted
+        // first in 50.1% of those. The five that crossed a millisecond are the only pairs whose ids
+        // follow the clock, and they are far too rare to account for anything here. Generated ids
+        // therefore make this a flaky detector of `ORDER BY id, at` rather than a blind one — six
+        // tests are sensitive to that swap, and the suite caught it in 29 runs out of 30. Fixed ids
+        // running against the timestamps make it certain.
         let first = ControlEvent {
             id: ulid::Ulid::from(4u128),
             kind: EventKind::BlacklistSkip,
