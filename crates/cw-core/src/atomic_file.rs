@@ -1,7 +1,11 @@
 //! Atomic file publication without replacing an existing destination.
 
-/// GENERIC_WRITE | DELETE. The DELETE right is what lets a handle rename its own file.
-const RENAMABLE_WRITE_ACCESS: u32 = 0x4000_0000 | 0x0001_0000;
+/// GENERIC_READ | GENERIC_WRITE | DELETE. The DELETE right is what lets a handle rename its own
+/// file. Read is asked for because Microsoft documents that creating a file across a network with
+/// write alone sends more and smaller writes, since the redirector cannot use the cache manager,
+/// and can occasionally answer `ERROR_ACCESS_DENIED`; `storage.data_dir` may be a share and
+/// `%APPDATA%` may be redirected to one.
+const RENAMABLE_WRITE_ACCESS: u32 = 0x8000_0000 | 0x4000_0000 | 0x0001_0000;
 /// FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE.
 const TEMPORARY_SHARE_MODE: u32 = 0x0000_0001 | 0x0000_0002 | 0x0000_0004;
 
@@ -36,7 +40,18 @@ pub fn create_temporary_beside(
             .open(&temporary)
         {
             Ok(file) => return Ok((temporary, file)),
-            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => last = source,
+            // Not only `AlreadyExists`: measured 2026-08-01, a name held by a directory answers
+            // `PermissionDenied`, and so does a deleted name on a filesystem that keeps it until
+            // its last handle closes. Either way this call did not get the name, which is the only
+            // thing it needs to know before trying the next one.
+            Err(source)
+                if matches!(
+                    source.kind(),
+                    std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                last = source;
+            }
             Err(source) => return Err(source),
         }
     }
@@ -218,6 +233,30 @@ mod tests {
             std::fs::read_to_string(&victim).expect("the victim should remain readable"),
             contents
         );
+
+        drop(file);
+        std::fs::remove_dir_all(&temp_dir).expect("the test directory should be removable");
+    }
+
+    #[test]
+    fn a_temporary_name_held_by_a_directory_is_stepped_past() {
+        let temp_dir = unique_temp_path("temporary-name-directory");
+        std::fs::create_dir(&temp_dir).expect("the unique test directory should be creatable");
+        let destination = temp_dir.join("config.toml");
+
+        // Measured 2026-08-01: a reserving open on a name a directory holds answers
+        // `PermissionDenied`, not `AlreadyExists`, so a loop that steps past only the latter gives
+        // up here while every later name is free.
+        let mut planted = destination.as_os_str().to_os_string();
+        planted.push(format!(".tmp-{}-0", std::process::id()));
+        let planted = std::path::PathBuf::from(planted);
+        std::fs::create_dir(&planted).expect("the planted directory should be creatable");
+
+        let (temporary, file) = create_temporary_beside(&destination)
+            .expect("a name a directory holds should not stop the publish");
+
+        assert_ne!(temporary, planted);
+        assert!(temporary.is_file());
 
         drop(file);
         std::fs::remove_dir_all(&temp_dir).expect("the test directory should be removable");

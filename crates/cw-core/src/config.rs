@@ -318,10 +318,12 @@ impl Config {
         let write_result = std::io::Write::write_all(&mut file, DEFAULT_CONFIG_TOML.as_bytes())
             .and_then(|()| file.sync_all());
         if let Err(source) = write_result {
-            drop(file);
             // Left behind, this looks like a stale config to anyone reading the directory, and it
-            // accumulates on every failed first run.
+            // accumulates on every failed first run. The handle holds the DELETE right, so
+            // unlinking while it is open leaves no moment in which another opener can keep the
+            // name.
             let _ = std::fs::remove_file(&temporary);
+            drop(file);
             return Err(ConfigError::Write {
                 path: path.to_path_buf(),
                 source,
@@ -331,13 +333,13 @@ impl Config {
         match rename_without_replacing(&file, path) {
             Ok(true) => Ok(true),
             Ok(false) => {
-                drop(file);
                 let _ = std::fs::remove_file(&temporary);
+                drop(file);
                 Ok(false)
             }
             Err(error) => {
-                drop(file);
                 let _ = std::fs::remove_file(&temporary);
+                drop(file);
                 Err(ConfigError::Write {
                     path: path.to_path_buf(),
                     source: error,
