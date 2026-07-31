@@ -1,20 +1,46 @@
 //! Atomic file publication without replacing an existing destination.
 
-/// Distinguishes concurrent publish attempts within one process; the process id distinguishes
-/// processes.
-static NEXT_TEMPORARY_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// GENERIC_WRITE | DELETE. The DELETE right is what lets a handle rename its own file.
+const RENAMABLE_WRITE_ACCESS: u32 = 0x4000_0000 | 0x0001_0000;
+/// FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE.
+const TEMPORARY_SHARE_MODE: u32 = 0x0000_0001 | 0x0000_0002 | 0x0000_0004;
 
-/// A temporary path beside `destination`, distinct for every call.
+/// How many names are tried before giving up. Each attempt costs one failed `open`, and only
+/// something creating entries as fast as this loop can consume them gets this far.
+const TEMPORARY_ATTEMPTS: u32 = 64;
+
+/// Create a file beside `destination` under a name this call has to itself, and return both.
 ///
-/// Sharing one temporary between two publish attempts is not a near miss: the share mode lets the
-/// second `open` succeed, its `truncate` discards bytes the first has already flushed, and the
-/// loser's handle goes on writing into the file after the winner has published it under the
-/// destination name (all measured 2026-07-27).
-pub fn temporary_path_beside(destination: &std::path::Path) -> std::path::PathBuf {
-    let id = NEXT_TEMPORARY_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let mut temporary = destination.as_os_str().to_os_string();
-    temporary.push(format!(".tmp-{}-{id}", std::process::id()));
-    std::path::PathBuf::from(temporary)
+/// Beside the destination, never elsewhere: a cross-volume rename is not atomic. The name is
+/// reserved by creating it, not chosen by hoping — `create_new` fails rather than opening what is
+/// already there, and what is already there may be a link, in which case a truncating open empties
+/// the file at the other end of it, with this program's rights and before the destination's
+/// no-clobber rename can refuse anything. A taken name is therefore a reason to try the next one.
+/// The filesystem is also the only party that can keep two attempts apart, since the other one may
+/// be in another process: two callers both start at zero and exactly one of them gets it.
+pub fn create_temporary_beside(
+    destination: &std::path::Path,
+) -> std::io::Result<(std::path::PathBuf, std::fs::File)> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let mut last = std::io::Error::from(std::io::ErrorKind::AlreadyExists);
+    for attempt in 0..TEMPORARY_ATTEMPTS {
+        let mut temporary = destination.as_os_str().to_os_string();
+        temporary.push(format!(".tmp-{}-{attempt}", std::process::id()));
+        let temporary = std::path::PathBuf::from(temporary);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .access_mode(RENAMABLE_WRITE_ACCESS)
+            .share_mode(TEMPORARY_SHARE_MODE)
+            .open(&temporary)
+        {
+            Ok(file) => return Ok((temporary, file)),
+            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => last = source,
+            Err(source) => return Err(source),
+        }
+    }
+    Err(last)
 }
 
 /// The `io::Error` for a Win32 failure reported as an `HRESULT`.
@@ -89,11 +115,6 @@ mod tests {
     use crate::config::DEFAULT_CONFIG_TOML;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    /// GENERIC_WRITE | DELETE. The DELETE right is what lets a handle rename its own file.
-    const RENAMABLE_WRITE_ACCESS: u32 = 0x4000_0000 | 0x0001_0000;
-    /// FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE.
-    const TEMPORARY_SHARE_MODE: u32 = 0x0000_0001 | 0x0000_0002 | 0x0000_0004;
-
     static TEMP_PATH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn unique_temp_path(test_name: &str) -> std::path::PathBuf {
@@ -167,5 +188,65 @@ mod tests {
             0x8004_0005u32 as i32,
         )));
         assert_eq!(other_facility.raw_os_error(), None);
+    }
+
+    #[test]
+    fn an_occupied_temporary_name_is_left_untouched() {
+        let temp_dir = unique_temp_path("temporary-name-occupied");
+        std::fs::create_dir(&temp_dir).expect("the unique test directory should be creatable");
+        let destination = temp_dir.join("config.toml");
+        let victim = temp_dir.join("victim");
+        let contents = "bytes that were not this program's to empty";
+        std::fs::write(&victim, contents).expect("the victim file should be writable");
+
+        // The name a fresh call tries first, planted as another name for a file this program has
+        // no business touching. Opening it to truncate would empty the victim through the link.
+        let mut planted = destination.as_os_str().to_os_string();
+        planted.push(format!(".tmp-{}-0", std::process::id()));
+        let planted = std::path::PathBuf::from(planted);
+        std::fs::hard_link(&victim, &planted)
+            .expect("a hard link on one volume should be creatable");
+
+        let (temporary, file) = create_temporary_beside(&destination)
+            .expect("a taken name should not stop the publish");
+
+        assert_ne!(
+            temporary, planted,
+            "the planted name should have been left alone"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&victim).expect("the victim should remain readable"),
+            contents
+        );
+
+        drop(file);
+        std::fs::remove_dir_all(&temp_dir).expect("the test directory should be removable");
+    }
+
+    #[test]
+    fn two_attempts_at_one_destination_get_different_names() {
+        let temp_dir = unique_temp_path("temporary-name-shared");
+        std::fs::create_dir(&temp_dir).expect("the unique test directory should be creatable");
+        let destination = temp_dir.join("config.toml");
+
+        let (first_path, mut first) =
+            create_temporary_beside(&destination).expect("the first temporary should be creatable");
+        std::io::Write::write_all(&mut first, b"first")
+            .expect("the first temporary should be writable");
+        let (second_path, second) = create_temporary_beside(&destination)
+            .expect("the second temporary should be creatable while the first is open");
+
+        assert_ne!(first_path, second_path);
+        assert_eq!(first_path.parent(), destination.parent());
+        assert_eq!(second_path.parent(), destination.parent());
+        drop(first);
+        drop(second);
+        assert_eq!(
+            std::fs::read(&first_path).expect("the first temporary should remain readable"),
+            b"first".as_slice(),
+            "a shared temporary would have let the second attempt empty the first"
+        );
+
+        std::fs::remove_dir_all(&temp_dir).expect("the test directory should be removable");
     }
 }

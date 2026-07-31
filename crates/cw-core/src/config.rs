@@ -1,4 +1,4 @@
-use crate::atomic_file::{rename_without_replacing, temporary_path_beside};
+use crate::atomic_file::{create_temporary_beside, rename_without_replacing};
 use serde::{Deserialize, Serialize};
 
 /// Commented TOML listing every setting at its built-in default. Written on first run so the
@@ -49,11 +49,6 @@ window_minutes = 5
 # Reserved for a future release; ActivityWatch is not part of v1.
 enabled = false
 "#;
-
-/// GENERIC_WRITE | DELETE. The DELETE right is what lets a handle rename its own file.
-const RENAMABLE_WRITE_ACCESS: u32 = 0x4000_0000 | 0x0001_0000;
-/// FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE.
-const TEMPORARY_SHARE_MODE: u32 = 0x0000_0001 | 0x0000_0002 | 0x0000_0004;
 
 /// Complete ContextWitness configuration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -294,8 +289,6 @@ impl Config {
     /// still free, so the config never exists in a half-written or empty state that another
     /// process could mistake for a finished one.
     pub fn write_default_if_missing(path: &std::path::Path) -> Result<bool, ConfigError> {
-        use std::os::windows::fs::OpenOptionsExt;
-
         // A fast path, not the check. Every startup after the first lands here, and the answer is
         // already on disk — without this the common case creates a temporary, writes the template,
         // flushes it to disk and deletes it again to learn what one `exists()` already said.
@@ -317,17 +310,8 @@ impl Config {
             })?;
         }
 
-        // Beside the destination, never across volumes: a cross-volume rename is not atomic.
-        let temporary = temporary_path_beside(path);
-
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .access_mode(RENAMABLE_WRITE_ACCESS)
-            .share_mode(TEMPORARY_SHARE_MODE)
-            .open(&temporary)
-            .map_err(|source| ConfigError::Write {
+        let (temporary, mut file) =
+            create_temporary_beside(path).map_err(|source| ConfigError::Write {
                 path: path.to_path_buf(),
                 source,
             })?;
@@ -479,28 +463,6 @@ mod tests {
             config,
             Config::default(),
             "the built-in config template should stay aligned with the defaults"
-        );
-    }
-
-    #[test]
-    fn every_publish_attempt_gets_its_own_temporary() {
-        let destination = std::path::Path::new("dir").join("config.toml");
-        let first = temporary_path_beside(&destination);
-        let second = temporary_path_beside(&destination);
-
-        assert_ne!(
-            first, second,
-            "two publish attempts sharing a temporary would let one truncate what the other has already flushed"
-        );
-        assert_eq!(
-            first.parent(),
-            destination.parent(),
-            "the publishing rename is only atomic within one volume"
-        );
-        assert_eq!(
-            second.parent(),
-            destination.parent(),
-            "the publishing rename is only atomic within one volume"
         );
     }
 

@@ -4,11 +4,6 @@ use crate::{StoreError, timestamp};
 use chrono::Datelike;
 use std::collections::HashSet;
 
-/// GENERIC_WRITE | DELETE. The DELETE right is what lets a handle rename its own file.
-const RENAMABLE_WRITE_ACCESS: u32 = 0x4000_0000 | 0x0001_0000;
-/// FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE.
-const TEMPORARY_SHARE_MODE: u32 = 0x0000_0001 | 0x0000_0002 | 0x0000_0004;
-
 const INSERT_IMAGE: &str = "INSERT INTO images \
      (observation_id, relative_path, byte_size, created_at) VALUES (?1, ?2, ?3, ?4)";
 const COUNT_IMAGE_BY_ID: &str = "SELECT count(*) FROM images WHERE observation_id = ?1";
@@ -49,8 +44,6 @@ pub fn save(
     quality: f32,
     at: chrono::DateTime<chrono::Utc>,
 ) -> Result<String, StoreError> {
-    use std::os::windows::fs::OpenOptionsExt;
-
     let id_text = id.to_string();
     // 16,383 is the encoder's dimension limit, not one imposed by this program.
     if !(1..=16_383).contains(&width)
@@ -89,16 +82,9 @@ pub fn save(
         source,
     })?;
 
-    let temporary = cw_core::atomic_file::temporary_path_beside(&destination);
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .access_mode(RENAMABLE_WRITE_ACCESS)
-        .share_mode(TEMPORARY_SHARE_MODE)
-        .open(&temporary)
+    let (temporary, mut file) = cw_core::atomic_file::create_temporary_beside(&destination)
         .map_err(|source| StoreError::ImageIo {
-            path: temporary.clone(),
+            path: destination.clone(),
             source,
         })?;
     let write_result =
