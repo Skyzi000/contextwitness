@@ -299,9 +299,10 @@ impl Config {
         // A fast path, not the check. Every startup after the first lands here, and the answer is
         // already on disk — without this the common case creates a temporary, writes the template,
         // flushes it to disk and deletes it again to learn what one `exists()` already said.
-        // Correctness does not rest on it: `rename_without_replacing` below refuses to replace a
-        // config that appears after this test, so removing this line would change only how much
-        // work a normal startup does.
+        // A config that appears after this test is still refused by `rename_without_replacing`
+        // below, so nothing is overwritten either way. Removing this line would not be free,
+        // though: when the config is there and its directory refuses new files, this is what
+        // answers `Ok(false)` rather than reporting a write error for a file that needs nothing.
         if path.exists() {
             return Ok(false);
         }

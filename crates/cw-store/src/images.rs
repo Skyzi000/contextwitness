@@ -11,6 +11,7 @@ const TEMPORARY_SHARE_MODE: u32 = 0x0000_0001 | 0x0000_0002 | 0x0000_0004;
 
 const INSERT_IMAGE: &str = "INSERT INTO images \
      (observation_id, relative_path, byte_size, created_at) VALUES (?1, ?2, ?3, ?4)";
+const COUNT_IMAGE_BY_ID: &str = "SELECT count(*) FROM images WHERE observation_id = ?1";
 const SELECT_PATH_BY_ID: &str =
     "SELECT observation_id, relative_path, created_at FROM images WHERE observation_id = ?1";
 const DELETE_IMAGE: &str = "DELETE FROM images WHERE observation_id = ?1";
@@ -128,14 +129,18 @@ pub fn save(
         INSERT_IMAGE,
         rusqlite::params![id_text, relative, byte_size, created_at],
     ) {
+        // Measured 2026-07-31: an identical retry violates both indexes and SQLite reports the path
+        // index, `SQLITE_CONSTRAINT_UNIQUE` — and so does another observation's row already holding
+        // this path, which is a database that disagrees with itself rather than a retry. The code
+        // alone cannot separate them, so the row is asked for instead; a constraint violation aborts
+        // the statement and leaves the transaction usable. A count that cannot be taken leaves the
+        // original error to speak for itself, because nothing has established that anything is
+        // registered.
         let already_registered = matches!(
-            source.sqlite_extended_error_code(),
-            Some(rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY)
-                | Some(rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE)
+            transaction.query_one(COUNT_IMAGE_BY_ID, [id_text.as_str()], |row| row
+                .get::<_, i64>(0)),
+            Ok(1..)
         );
-        // Both unique indexes on this table carry the same fact: `observation_id` is the primary
-        // key and `relative_path` is derived from it, so either violation means this observation
-        // already has an image. The path index is the one SQLite reports for an identical retry.
         remove_image_file(&temporary)?;
         if already_registered {
             return Err(StoreError::ImageAlreadyRegistered { id: id_text });
@@ -190,7 +195,10 @@ pub fn save(
 /// This is an explicit request for one image, so it removes the row even when the file has already
 /// gone: the rule that a row without its file is reported and kept binds [`orphan_rows`] and
 /// [`sweep_orphan_files`], which run on their own and must never decide a picture is expendable.
-/// That the observation happened, and that it had an image, is in the observation row either way.
+/// The observation, its OCR text and its payload are untouched. Nothing records that the image
+/// existed once this row is gone, and that is the point: retention removes an image to reclaim
+/// space, and a row kept for a file that is gone would keep charging its `byte_size` against a
+/// budget that is already free.
 ///
 /// The row is committed before the file is removed, so a failure in between leaves an unregistered
 /// file for the next sweep rather than a row whose file is gone. That releases the transaction's
@@ -635,6 +643,70 @@ mod tests {
     }
 
     #[test]
+    fn a_path_another_observation_holds_is_not_reported_as_this_one_being_registered() {
+        let (_dir, mut conn, root) = database();
+        let first_id = ulid::Ulid::new();
+        let second_id = ulid::Ulid::new();
+        let taken_at = at(2026, 7, 30);
+        let relative = save_test_image(&mut conn, &root, first_id, taken_at, 31);
+        let destination = root.join(&relative);
+        conn.execute(
+            "DELETE FROM images WHERE observation_id = ?1",
+            [first_id.to_string()],
+        )
+        .expect("the first image row should be removable without touching its file");
+        insert_observation(&conn, second_id, taken_at);
+        conn.execute(
+            "INSERT INTO images (observation_id, relative_path, byte_size, created_at) \
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                second_id.to_string(),
+                relative,
+                1_i64,
+                timestamp::to_sql(taken_at).expect("the test timestamp should be spellable"),
+            ],
+        )
+        .expect("the conflicting image row should be planted");
+
+        // An identical retry and this planted path share one extended error code; the ID count is
+        // what separates them.
+        let error = save(
+            &mut conn,
+            &root,
+            first_id,
+            &pixels(32),
+            WIDTH,
+            HEIGHT,
+            75.0,
+            taken_at,
+        )
+        .expect_err("the path held by another observation should be refused");
+
+        assert!(
+            matches!(&error, StoreError::Sql { .. }),
+            "expected Sql, got {error:?}"
+        );
+        let count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM images WHERE observation_id = ?1",
+                [first_id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("the first observation's image count should be readable");
+        assert_eq!(count, 0);
+        let entries = std::fs::read_dir(
+            destination
+                .parent()
+                .expect("the image destination should have a parent"),
+        )
+        .expect("the image day directory should be readable")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("the image day directory entries should be readable");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path(), destination);
+    }
+
+    #[test]
     fn a_frame_whose_pixels_do_not_match_its_size_is_refused() {
         let (_dir, mut conn, root) = database();
         let id = ulid::Ulid::new();
@@ -664,7 +736,9 @@ mod tests {
         let oversized_id = ulid::Ulid::new();
         let oversized = vec![0; 49_152];
 
-        // This length passes the pixel check and would reach the encoder's `unwrap`.
+        // This length passes the pixel check, so the dimension guard is what refuses it.
+        // `encode_simple` returns an error rather than panicking, which is why it is called instead
+        // of `encode`.
         let oversized_error = save(
             &mut conn,
             &root,
@@ -703,6 +777,30 @@ mod tests {
         )
         .expect_err("a quality below the encoder's range should be refused");
         assert!(matches!(quality_error, StoreError::Encode { .. }));
+    }
+
+    #[test]
+    fn a_frame_at_the_encoders_dimension_limit_is_accepted() {
+        let (_dir, mut conn, root) = database();
+        let id = ulid::Ulid::new();
+        let taken_at = at(2026, 7, 30);
+        insert_observation(&conn, id, taken_at);
+        let pixels = vec![0_u8; 49_149];
+
+        // The refusal case above cannot pin this bound: a frame one pixel wider fails the encoder
+        // as well as the guard. Only this accepted side distinguishes the correct limit from one
+        // narrowed by a pixel.
+        save(&mut conn, &root, id, &pixels, 16_383, 1, 75.0, taken_at)
+            .expect("a frame at the encoder's dimension limit should be accepted");
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM images WHERE observation_id = ?1",
+                [id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("the image count should be readable");
+        assert_eq!(count, 1);
     }
 
     #[test]
