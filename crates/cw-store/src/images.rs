@@ -93,8 +93,10 @@ pub fn save(
     let write_result =
         std::io::Write::write_all(&mut file, &encoded).and_then(|()| file.sync_all());
     if let Err(source) = write_result {
-        drop(file);
+        // The handle holds the DELETE right, so unlinking while it is open leaves no moment in
+        // which another opener can keep the name.
         remove_image_file(&temporary)?;
+        drop(file);
         return Err(StoreError::ImageIo {
             path: temporary,
             source,
@@ -248,7 +250,8 @@ pub fn delete(
     // Measured 2026-07-31: for a symlink whose target is gone, `try_exists` reports the name as
     // empty while `create_new` on it still fails with `AlreadyExists` and `remove_file` still has
     // an entry to remove — so following the link would leave that entry standing in the way of
-    // every later save for this observation until a startup sweep collected it.
+    // every later save for this observation — and not until the next startup either, because the
+    // sweep collects only entries the filesystem calls files and a link is not one.
     let occupied = match path.symlink_metadata() {
         Ok(_) => true,
         Err(source) => source.kind() != std::io::ErrorKind::NotFound,
@@ -321,6 +324,16 @@ fn sweep_collected_files(
         return Ok(0);
     }
 
+    // Every name here is resolved once to enumerate it and again to act on it, and a directory
+    // above it can be replaced in between: Windows follows a reparse point met partway along a
+    // path. `checked_path` refuses a stored path that names anything outside the image root, and
+    // the enumerated side needs the same rule, checked against the only spelling that cannot lie —
+    // the one the filesystem answers with. A root that will not resolve leaves nothing that can be
+    // shown to be inside it.
+    let Ok(canonical_root) = std::fs::canonicalize(root) else {
+        return Ok(0);
+    };
+
     let spelled: HashSet<&str> = enumerated
         .iter()
         .map(|(_, relative)| relative.as_str())
@@ -349,22 +362,22 @@ fn sweep_collected_files(
         if registered.contains(relative) {
             continue;
         }
-        let orphan = match std::fs::canonicalize(path) {
-            Ok(identity) => !unspelled_identities.contains(&identity),
-            Err(_) => false,
+        let Ok(identity) = std::fs::canonicalize(path) else {
+            continue;
         };
-        if !orphan {
+        if !identity.starts_with(&canonical_root) || unspelled_identities.contains(&identity) {
             continue;
         }
 
-        match std::fs::remove_file(path) {
+        // Addressed to the spelling that was checked, not to the one that was enumerated.
+        match std::fs::remove_file(&identity) {
             Ok(()) => removed += 1,
             // Two startups can collect the same orphan. The one that loses the removal race
             // has nothing left to do, rather than a reason to abort.
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
             Err(source) => {
                 return Err(StoreError::ImageIo {
-                    path: path.to_path_buf(),
+                    path: identity,
                     source,
                 });
             }
@@ -546,10 +559,11 @@ fn decode_image_path(
 
 #[cfg(test)]
 mod tests {
-    use super::{delete, orphan_rows, save, sweep_orphan_files};
+    use super::{delete, orphan_rows, save, sweep_collected_files, sweep_orphan_files};
     use crate::{StoreError, db, observations, timestamp};
     use chrono::{DateTime, TimeZone, Utc};
     use cw_core::model::{Observation, OcrStatus, ScreenPayload};
+    use std::collections::HashSet;
     use tempfile::{TempDir, tempdir};
 
     const WIDTH: u32 = 4;
@@ -632,6 +646,14 @@ mod tests {
         assert!(bytes.len() >= 12);
         assert_eq!(&bytes[0..4], b"RIFF");
         assert_eq!(&bytes[8..12], b"WEBP");
+        // Decoding here is a test reading back what this test just wrote; the program itself still
+        // only encodes. Without this, handing the encoder its height and width the other way round
+        // stores a transposed picture and every assertion above still holds.
+        let decoded = webp::Decoder::new(&bytes)
+            .decode()
+            .expect("the saved WebP should decode");
+        assert_eq!(decoded.width(), WIDTH);
+        assert_eq!(decoded.height(), HEIGHT);
         assert_eq!(stored_path, relative);
         assert_eq!(
             byte_size,
@@ -851,26 +873,24 @@ mod tests {
 
         // The configuration allows the whole range, so the refusal of -1 says nothing about where
         // the accepted range actually ends.
+        // A four-by-three block of three repeating colours compresses to the same handful of bytes
+        // at either end of the range, so a `quality` the encoder never sees would go unnoticed.
+        const DETAILED: u32 = 64;
+        let detailed: Vec<u8> = (0..DETAILED * DETAILED * 3)
+            .map(|index| {
+                let index = u64::from(index);
+                let pixel = index / 3;
+                let x = pixel % u64::from(DETAILED);
+                let y = pixel / u64::from(DETAILED);
+                (x * 7 + y * 13 + index % 3 * 61) as u8
+            })
+            .collect();
         save(
-            &mut conn,
-            &root,
-            zero_id,
-            &pixels(42),
-            WIDTH,
-            HEIGHT,
-            0.0,
-            taken_at,
+            &mut conn, &root, zero_id, &detailed, DETAILED, DETAILED, 0.0, taken_at,
         )
         .expect("quality zero should be accepted");
         save(
-            &mut conn,
-            &root,
-            hundred_id,
-            &pixels(43),
-            WIDTH,
-            HEIGHT,
-            100.0,
-            taken_at,
+            &mut conn, &root, hundred_id, &detailed, DETAILED, DETAILED, 100.0, taken_at,
         )
         .expect("quality one hundred should be accepted");
 
@@ -884,6 +904,22 @@ mod tests {
                 .expect("the image count should be readable");
             assert_eq!(count, 1);
         }
+
+        let sizes: Vec<i64> = [zero_id, hundred_id]
+            .iter()
+            .map(|id| {
+                conn.query_row(
+                    "SELECT byte_size FROM images WHERE observation_id = ?1",
+                    [id.to_string()],
+                    |row| row.get(0),
+                )
+                .expect("the image size should be readable")
+            })
+            .collect();
+        assert!(
+            sizes[0] < sizes[1],
+            "the configured quality reached the encoder: {sizes:?}"
+        );
     }
 
     #[test]
@@ -1368,6 +1404,33 @@ mod tests {
     }
 
     #[test]
+    fn a_name_that_now_leads_outside_the_root_is_not_removed() {
+        let (dir, _conn, root) = database();
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).expect("the outside directory should be creatable");
+        let victim = outside.join("orphan.webp");
+        std::fs::write(&victim, b"a file this program has no business touching")
+            .expect("the outside file should be writable");
+        std::fs::create_dir_all(&root).expect("the image root should be creatable");
+        let redirected = root.join("2026");
+
+        // Creating a directory link needs Developer Mode or SeCreateSymbolicLinkPrivilege, so this
+        // case cannot be built everywhere the suite runs.
+        let Ok(()) = std::os::windows::fs::symlink_dir(&outside, &redirected) else {
+            return;
+        };
+
+        // The name as it was enumerated, before the directory above it became a link. Nothing here
+        // needs a race: the link can be in place before the sweep starts.
+        let enumerated = vec![redirected.join("orphan.webp")];
+        let removed = super::sweep_collected_files(&root, &HashSet::new(), &enumerated)
+            .expect("the sweep should succeed without removing anything");
+
+        assert_eq!(removed, 0);
+        assert!(victim.is_file());
+    }
+
+    #[test]
     fn a_sweep_whose_orphan_was_already_removed_still_succeeds() {
         let (_dir, mut conn, root) = database();
         let id = ulid::Ulid::new();
@@ -1393,12 +1456,12 @@ mod tests {
             .expect("the image tree should be collectable for both startups");
 
         assert_eq!(
-            super::sweep_collected_files(&root, &registered, &files)
+            sweep_collected_files(&root, &registered, &files)
                 .expect("the first startup sweep should succeed"),
             1
         );
         assert_eq!(
-            super::sweep_collected_files(&root, &registered, &files)
+            sweep_collected_files(&root, &registered, &files)
                 .expect("the second startup sweep should succeed"),
             0
         );

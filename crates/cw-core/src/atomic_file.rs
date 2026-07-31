@@ -9,8 +9,10 @@ const RENAMABLE_WRITE_ACCESS: u32 = 0x8000_0000 | 0x4000_0000 | 0x0001_0000;
 /// FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE.
 const TEMPORARY_SHARE_MODE: u32 = 0x0000_0001 | 0x0000_0002 | 0x0000_0004;
 
-/// How many names are tried before giving up. Each attempt costs one failed `open`, and only
-/// something creating entries as fast as this loop can consume them gets this far.
+/// How many names are tried before giving up. Each attempt costs one failed `open`. Sixty-four
+/// leftovers from earlier runs — the process id in the name repeats — would exhaust it with nothing
+/// racing at all, which is why what it returns then is the platform's own answer about the last
+/// name rather than an error this module invented.
 const TEMPORARY_ATTEMPTS: u32 = 64;
 
 /// Create a file beside `destination` under a name this call has to itself, and return both.
