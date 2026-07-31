@@ -10,7 +10,10 @@ const COUNT_IMAGE_BY_ID: &str = "SELECT count(*) FROM images WHERE observation_i
 const SELECT_PATH_BY_ID: &str =
     "SELECT observation_id, relative_path, created_at FROM images WHERE observation_id = ?1";
 const DELETE_IMAGE: &str = "DELETE FROM images WHERE observation_id = ?1";
+// The report `orphan_rows` produces is read by a person and its order is the order the pictures were
+// taken; the sweep collects into a set and pays for a sort no index serves.
 const SELECT_IMAGE_ROWS: &str = "SELECT observation_id, relative_path, created_at FROM images ORDER BY created_at, observation_id";
+const SELECT_IMAGE_PATHS: &str = "SELECT observation_id, relative_path, created_at FROM images";
 
 /// Where an image for `id` taken at `at` is filed, relative to the image root.
 ///
@@ -196,8 +199,9 @@ pub fn save(
 ///
 /// Whether there is a file to remove is decided while the transaction still holds the lock. If the
 /// name is occupied, a `save` for the same observation racing this call finds it held and fails
-/// with [`StoreError::ImageIo`], because the rename refuses to replace; it succeeds on a retry once
-/// the removal is through. If the name is empty — a row whose file has already gone — nothing is
+/// with [`StoreError::ImageIo`], because the rename refuses to replace. What that guarantees is only
+/// that no save can take the name before the removal is through; one arriving afterwards succeeds
+/// the first time. If the name is empty — a row whose file has already gone — nothing is
 /// removed at all, so a save that follows this commit keeps the file it renames into that name.
 ///
 /// Leaves the observation row alone: the OCR text and the payload are the point of the record and
@@ -310,24 +314,41 @@ fn sweep_collected_files(
         let relative = path_relative_to_root(root, path)?;
         enumerated.push((path, relative));
     }
+    if enumerated
+        .iter()
+        .all(|(_, relative)| registered.contains(relative))
+    {
+        return Ok(0);
+    }
+
     let spelled: HashSet<&str> = enumerated
         .iter()
         .map(|(_, relative)| relative.as_str())
         .collect();
-    let mut unspelled_identities = None;
+    let mut unspelled_identities = HashSet::new();
+    for unspelled in registered
+        .iter()
+        .filter(|registered| !spelled.contains(registered.as_str()))
+    {
+        match std::fs::canonicalize(root.join(unspelled)) {
+            Ok(identity) => {
+                unspelled_identities.insert(identity);
+            }
+            // Nothing under the name, so no enumerated file can be what it names. This is the
+            // ordinary state of a row whose file is gone, which the sweep must not let stop it.
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+            // The name is there and will not say which file it reaches. Any candidate might be
+            // that file, so this pass has nothing it can safely remove. Measured 2026-08-01: a
+            // symlink pointing at itself answers `FilesystemLoop` here while its entry exists.
+            Err(_) => return Ok(0),
+        }
+    }
     let mut removed = 0;
 
     for (path, relative) in &enumerated {
         if registered.contains(relative) {
             continue;
         }
-        let unspelled_identities = unspelled_identities.get_or_insert_with(|| {
-            registered
-                .iter()
-                .filter(|registered| !spelled.contains(registered.as_str()))
-                .filter_map(|registered| std::fs::canonicalize(root.join(registered)).ok())
-                .collect::<HashSet<_>>()
-        });
         let orphan = match std::fs::canonicalize(path) {
             Ok(identity) => !unspelled_identities.contains(&identity),
             Err(_) => false,
@@ -395,7 +416,7 @@ fn remove_image_file(path: &std::path::Path) -> Result<(), StoreError> {
 
 fn registered_paths(conn: &rusqlite::Connection) -> Result<HashSet<String>, StoreError> {
     let mut statement = conn
-        .prepare(SELECT_IMAGE_ROWS)
+        .prepare(SELECT_IMAGE_PATHS)
         .map_err(|source| StoreError::Sql { source })?;
     let mut rows = statement
         .query([])
@@ -409,35 +430,42 @@ fn registered_paths(conn: &rusqlite::Connection) -> Result<HashSet<String>, Stor
     Ok(paths)
 }
 
+/// Walks with an explicit worklist. Recursion here would put one `ReadDir` per level on the stack —
+/// on Windows each holds a `WIN32_FIND_DATAW` by value — and this walk reads whatever is under the
+/// image root rather than only what this program wrote there, so its depth is not this program's
+/// to assume. Running out of stack aborts the process, and this runs at startup.
 fn collect_files(
     directory: &std::path::Path,
     files: &mut Vec<std::path::PathBuf>,
 ) -> Result<(), StoreError> {
-    let entries = match std::fs::read_dir(directory) {
-        Ok(entries) => entries,
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(source) => {
-            return Err(StoreError::ImageIo {
-                path: directory.to_path_buf(),
-                source,
-            });
-        }
-    };
+    let mut worklist: Vec<std::path::PathBuf> = vec![directory.to_path_buf()];
+    while let Some(directory) = worklist.pop() {
+        let entries = match std::fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(source) => {
+                return Err(StoreError::ImageIo {
+                    path: directory,
+                    source,
+                });
+            }
+        };
 
-    for entry in entries {
-        let entry = entry.map_err(|source| StoreError::ImageIo {
-            path: directory.to_path_buf(),
-            source,
-        })?;
-        let path = entry.path();
-        let file_type = entry.file_type().map_err(|source| StoreError::ImageIo {
-            path: path.clone(),
-            source,
-        })?;
-        if file_type.is_dir() {
-            collect_files(&path, files)?;
-        } else if file_type.is_file() {
-            files.push(path);
+        for entry in entries {
+            let entry = entry.map_err(|source| StoreError::ImageIo {
+                path: directory.clone(),
+                source,
+            })?;
+            let path = entry.path();
+            let file_type = entry.file_type().map_err(|source| StoreError::ImageIo {
+                path: path.clone(),
+                source,
+            })?;
+            if file_type.is_dir() {
+                worklist.push(path);
+            } else if file_type.is_file() {
+                files.push(path);
+            }
         }
     }
 
@@ -1090,6 +1118,51 @@ mod tests {
     }
 
     #[test]
+    fn a_row_whose_timestamp_is_spelled_any_other_way_is_refused() {
+        let (_dir, mut conn, root) = database();
+        let id = ulid::Ulid::new();
+        let taken_at = at(2026, 7, 30);
+        insert_observation(&conn, id, taken_at);
+        let canonical = super::relative_path(id, taken_at);
+        let path = root.join(&canonical);
+        std::fs::create_dir_all(
+            path.parent()
+                .expect("the hand-placed image should have a parent"),
+        )
+        .expect("the hand-placed image directory should be creatable");
+        let contents = b"registered image";
+        std::fs::write(&path, contents).expect("the hand-placed image should be writable");
+        conn.execute(
+            "INSERT INTO images (observation_id, relative_path, byte_size, created_at) \
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                id.to_string(),
+                canonical,
+                i64::try_from(contents.len()).expect("the test file size should fit SQLite"),
+                "2026-07-30T12:34:56+00:00",
+            ],
+        )
+        .expect("the non-canonical timestamp image row should be inserted by hand");
+
+        let errors = [
+            delete(&mut conn, &root, id)
+                .expect_err("delete should refuse the non-canonical timestamp"),
+            sweep_orphan_files(&conn, &root)
+                .expect_err("the sweep should refuse the non-canonical timestamp"),
+            orphan_rows(&conn, &root)
+                .expect_err("the orphan report should refuse the non-canonical timestamp"),
+        ];
+
+        for error in errors {
+            match error {
+                StoreError::Encoding { id: actual, .. } => assert_eq!(actual, id.to_string()),
+                other => panic!("expected Encoding, got {other:?}"),
+            }
+        }
+        assert!(path.is_file());
+    }
+
+    #[test]
     fn a_row_whose_id_is_spelled_any_other_way_is_refused() {
         let (_dir, mut conn, root) = database();
         let stored_id = "0000000000000128ggyhyyk08n";
@@ -1175,6 +1248,37 @@ mod tests {
     }
 
     #[test]
+    fn an_unrelated_orphan_is_still_swept_when_a_registered_file_is_missing() {
+        let (_dir, mut conn, root) = database();
+        let first_id = ulid::Ulid::new();
+        let second_id = ulid::Ulid::new();
+        let first_relative = save_test_image(&mut conn, &root, first_id, at(2026, 7, 30), 83);
+        let second_relative = save_test_image(&mut conn, &root, second_id, at(2026, 7, 31), 84);
+        std::fs::remove_file(root.join(&first_relative))
+            .expect("the first saved file should be removable without touching its row");
+        let left_behind = root.join("2026/07/31/left-behind.webp");
+        std::fs::create_dir_all(
+            left_behind
+                .parent()
+                .expect("the hand-placed file should have a parent"),
+        )
+        .expect("the hand-placed file directory should be creatable");
+        std::fs::write(&left_behind, b"not registered")
+            .expect("the hand-placed file should be writable");
+
+        // A row whose file is missing must not make the sweep keep everything.
+        let removed = sweep_orphan_files(&conn, &root).expect("the orphan sweep should succeed");
+
+        assert_eq!(removed, 1);
+        assert!(!left_behind.exists());
+        assert!(root.join(second_relative).is_file());
+        assert_eq!(
+            orphan_rows(&conn, &root).expect("orphan rows should be reportable"),
+            [first_relative]
+        );
+    }
+
+    #[test]
     fn a_registered_image_spelled_in_another_case_is_not_swept() {
         let (_dir, mut conn, root) = database();
         let id = ulid::Ulid::from_string("0000000000000128GGYHYYK08N")
@@ -1228,6 +1332,39 @@ mod tests {
                 .expect("the registered link should still reach the moved image")
                 .is_file()
         );
+    }
+
+    #[test]
+    fn an_orphan_is_kept_while_a_registered_name_will_not_say_what_it_reaches() {
+        let (_dir, mut conn, root) = database();
+        let id = ulid::Ulid::new();
+        let relative = save_test_image(&mut conn, &root, id, at(2026, 7, 30), 85);
+        let path = root.join(relative);
+        std::fs::remove_file(&path)
+            .expect("the saved file should be removable before replacement with a symlink");
+
+        // Creating a symlink needs Developer Mode or SeCreateSymbolicLinkPrivilege, so this case
+        // cannot be built everywhere the suite runs.
+        let Ok(()) = std::os::windows::fs::symlink_file(&path, &path) else {
+            return;
+        };
+
+        let left_behind = root.join("2026/07/31/left-behind.webp");
+        std::fs::create_dir_all(
+            left_behind
+                .parent()
+                .expect("the hand-placed file should have a parent"),
+        )
+        .expect("the hand-placed file directory should be creatable");
+        std::fs::write(&left_behind, b"not registered")
+            .expect("the hand-placed file should be writable");
+
+        // The registered entry exists and answers `FilesystemLoop`, so nothing rules out that the
+        // left-behind file is what that row names.
+        let removed = sweep_orphan_files(&conn, &root).expect("the orphan sweep should succeed");
+
+        assert_eq!(removed, 0);
+        assert!(left_behind.is_file());
     }
 
     #[test]
