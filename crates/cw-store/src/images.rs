@@ -187,6 +187,18 @@ pub fn save(
 
 /// Remove an image and the record that it existed.
 ///
+/// This is an explicit request for one image, so it removes the row even when the file has already
+/// gone: the rule that a row without its file is reported and kept binds [`orphan_rows`] and
+/// [`sweep_orphan_files`], which run on their own and must never decide a picture is expendable.
+/// That the observation happened, and that it had an image, is in the observation row either way.
+///
+/// The row is committed before the file is removed, so a failure in between leaves an unregistered
+/// file for the next sweep rather than a row whose file is gone. That releases the transaction's
+/// lock while the old file is still on disk, so a `save` for the same observation racing this call
+/// can find the destination held and fail with [`StoreError::ImageIo`]; it succeeds on a retry, and
+/// no ordering loses a newly saved file, since a rename into that name can only succeed once the
+/// removal is through.
+///
 /// Leaves the observation row alone: the OCR text and the payload are the point of the record and
 /// outlive the picture. Empty day directories are left behind on purpose: pruning one could race
 /// with [`save`] between creating that directory and opening its temporary file, while a few
@@ -219,23 +231,23 @@ pub fn delete(
     };
     let path = root.join(relative);
 
-    match std::fs::remove_file(&path) {
-        Ok(()) => {}
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
-        Err(source) => {
-            return Err(StoreError::ImageIo {
-                path: path.clone(),
-                source,
-            });
-        }
-    }
-
     transaction
         .execute(DELETE_IMAGE, [id.to_string()])
         .map_err(|source| StoreError::Sql { source })?;
     transaction
         .commit()
         .map_err(|source| StoreError::Sql { source })?;
+
+    // A file removal cannot be rolled back, so the two media cannot commit together and one of them
+    // is left over on failure. A leftover file is unregistered and the next sweep takes it; a
+    // leftover row is one `orphan_rows` reports and nothing removes, and retention would keep
+    // charging its `byte_size` against a disk budget that is already free.
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        // Nothing left to remove is the outcome this was asked for.
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+        Err(source) => return Err(StoreError::ImageIo { path, source }),
+    }
 
     Ok(())
 }
@@ -749,6 +761,62 @@ mod tests {
             )
             .expect("the observation count should be readable");
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn deleting_a_row_whose_file_is_already_gone_still_removes_the_row() {
+        let (_dir, mut conn, root) = database();
+        let id = ulid::Ulid::new();
+        let relative = save_test_image(&mut conn, &root, id, at(2026, 7, 30), 51);
+        std::fs::remove_file(root.join(relative))
+            .expect("the saved file should be removable without touching its row");
+
+        // This is an explicit request rather than one of the automatic paths. Keeping such a row
+        // is `orphan_rows`' rule, not this one's.
+        delete(&mut conn, &root, id).expect("the explicit deletion should succeed");
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM images WHERE observation_id = ?1",
+                [id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("the image count should be readable");
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_removed_leaves_no_row_behind() {
+        let (_dir, mut conn, root) = database();
+        let id = ulid::Ulid::new();
+        let relative = save_test_image(&mut conn, &root, id, at(2026, 7, 30), 52);
+        let path = root.join(relative);
+
+        // Measured 2026-07-31 on this machine: `remove_file` against a directory fails with
+        // `PermissionDenied` (raw OS error 5) and leaves it in place, while a missing file and a
+        // missing parent directory both come back as `NotFound`. That is the deterministic
+        // non-`NotFound` failure this needs, and the absent row is what tells this order apart from
+        // removing the file first — that one returns before the row is ever touched.
+        std::fs::remove_file(&path).expect("the saved file should be removable before replacement");
+        std::fs::create_dir(&path).expect("a directory should be creatable at the image path");
+
+        let error = delete(&mut conn, &root, id)
+            .expect_err("removing a directory as an image file should fail");
+        match error {
+            StoreError::ImageIo { source, .. } => {
+                assert_eq!(source.kind(), std::io::ErrorKind::PermissionDenied);
+            }
+            other => panic!("expected ImageIo with PermissionDenied, got {other:?}"),
+        }
+        let count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM images WHERE observation_id = ?1",
+                [id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("the image count should be readable");
+        assert_eq!(count, 0);
+        assert!(path.is_dir());
     }
 
     #[test]
