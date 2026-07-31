@@ -2,7 +2,7 @@
 
 use crate::{StoreError, timestamp};
 use chrono::Datelike;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 /// GENERIC_WRITE | DELETE. The DELETE right is what lets a handle rename its own file.
 const RENAMABLE_WRITE_ACCESS: u32 = 0x4000_0000 | 0x0001_0000;
@@ -309,48 +309,57 @@ fn sweep_collected_files(
 ) -> Result<usize, StoreError> {
     // Whether two spellings name one file is the filesystem's rule, not this program's. A byte
     // comparison deletes a registered image on the case-insensitive directory this normally runs
-    // on, and folding case spares a real orphan on a case-sensitive one — `storage.data_dir` can be
-    // either, since NTFS can be made case-sensitive per directory and a share need not be NTFS at
-    // all. Measured 2026-07-30 on a case-insensitive directory, `canonicalize` answers with the
-    // name actually on disk, so two spellings of one file agree; the case-sensitive side is not
-    // measured here, which is why an unanswerable comparison keeps the file rather than removing
-    // it. Leaving a leftover costs disk; removing a registered image costs the picture.
-    let registered_by_folded: HashMap<_, _> = registered
-        .iter()
-        .map(|relative| (relative.to_ascii_lowercase(), relative.as_str()))
-        .collect();
-    let mut removed = 0;
-
+    // on, and case is not the only way one file answers to two names: a registered name can be a
+    // link to a file this loop enumerates under the name it really has, and that file is what the
+    // picture is. So the question asked of every candidate is not how it is spelled but which file
+    // it reaches, and it is asked against every registered name that no enumerated file spelled —
+    // the rows whose file, if it is there at all, is under some other name. On the ordinary
+    // directory nothing reaches this point, because every enumerated file is registered under the
+    // name it was enumerated with. Measured 2026-07-30, `canonicalize` answers with the name
+    // actually on disk, so two spellings of one file agree. A candidate whose identity cannot be
+    // established is kept: leaving a leftover costs disk, and removing a registered image costs the
+    // picture.
+    let mut enumerated = Vec::with_capacity(files.len());
     for path in files {
         let relative = path_relative_to_root(root, path)?;
-        let should_remove = if registered.contains(&relative) {
-            false
-        } else if let Some(registered_relative) =
-            registered_by_folded.get(&relative.to_ascii_lowercase())
-        {
-            match (
-                std::fs::canonicalize(path),
-                std::fs::canonicalize(root.join(*registered_relative)),
-            ) {
-                (Ok(enumerated), Ok(registered)) => enumerated != registered,
-                _ => false,
-            }
-        } else {
-            true
-        };
+        enumerated.push((path, relative));
+    }
+    let spelled: HashSet<&str> = enumerated
+        .iter()
+        .map(|(_, relative)| relative.as_str())
+        .collect();
+    let mut unspelled_identities = None;
+    let mut removed = 0;
 
-        if should_remove {
-            match std::fs::remove_file(path) {
-                Ok(()) => removed += 1,
-                // Two startups can collect the same orphan. The one that loses the removal race
-                // has nothing left to do, rather than a reason to abort.
-                Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
-                Err(source) => {
-                    return Err(StoreError::ImageIo {
-                        path: path.clone(),
-                        source,
-                    });
-                }
+    for (path, relative) in &enumerated {
+        if registered.contains(relative) {
+            continue;
+        }
+        let unspelled_identities = unspelled_identities.get_or_insert_with(|| {
+            registered
+                .iter()
+                .filter(|registered| !spelled.contains(registered.as_str()))
+                .filter_map(|registered| std::fs::canonicalize(root.join(registered)).ok())
+                .collect::<HashSet<_>>()
+        });
+        let orphan = match std::fs::canonicalize(path) {
+            Ok(identity) => !unspelled_identities.contains(&identity),
+            Err(_) => false,
+        };
+        if !orphan {
+            continue;
+        }
+
+        match std::fs::remove_file(path) {
+            Ok(()) => removed += 1,
+            // Two startups can collect the same orphan. The one that loses the removal race
+            // has nothing left to do, rather than a reason to abort.
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(StoreError::ImageIo {
+                    path: path.to_path_buf(),
+                    source,
+                });
             }
         }
     }
@@ -1204,6 +1213,35 @@ mod tests {
                 .path()
                 .is_file()
         }));
+    }
+
+    #[test]
+    fn a_registered_image_reached_through_a_link_is_not_swept() {
+        let (_dir, mut conn, root) = database();
+        let id = ulid::Ulid::new();
+        let relative = save_test_image(&mut conn, &root, id, at(2026, 7, 31), 82);
+        let path = root.join(relative);
+        let moved = path.with_file_name("moved-by-something-else.webp");
+        std::fs::rename(&path, &moved)
+            .expect("the saved image should be movable under another name");
+
+        // Creating a symlink needs Developer Mode or SeCreateSymbolicLinkPrivilege, so this case
+        // cannot be built everywhere the suite runs.
+        let Ok(()) = std::os::windows::fs::symlink_file(&moved, &path) else {
+            return;
+        };
+
+        // Before this change the moved file was the only thing the sweep could see and it deleted
+        // it, leaving the row pointing at a link to nothing.
+        let removed = sweep_orphan_files(&conn, &root).expect("the orphan sweep should succeed");
+
+        assert_eq!(removed, 0);
+        assert!(moved.exists());
+        assert!(
+            std::fs::metadata(&path)
+                .expect("the registered link should still reach the moved image")
+                .is_file()
+        );
     }
 
     #[test]
