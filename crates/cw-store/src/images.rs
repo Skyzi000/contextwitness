@@ -253,7 +253,16 @@ pub fn delete(
     // reach it first — the rename refuses to replace, so it fails until this removal is through.
     // A name that cannot even be asked about counts as occupied, so the removal below reports the
     // real error rather than this line inventing one.
-    let occupied = path.try_exists().unwrap_or(true);
+    // The question is whether a directory entry exists under this name, which is the question
+    // `rename_without_replacing` answers, and not whether anything can be read through it.
+    // Measured 2026-07-31: for a symlink whose target is gone, `try_exists` reports the name as
+    // empty while `create_new` on it still fails with `AlreadyExists` and `remove_file` still has
+    // an entry to remove — so following the link would leave that entry standing in the way of
+    // every later save for this observation until a startup sweep collected it.
+    let occupied = match path.symlink_metadata() {
+        Ok(_) => true,
+        Err(source) => source.kind() != std::io::ErrorKind::NotFound,
+    };
 
     transaction
         .execute(DELETE_IMAGE, [id.to_string()])
@@ -973,6 +982,37 @@ mod tests {
             )
             .expect("the image count should be readable");
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn an_entry_whose_target_is_gone_is_still_removed() {
+        let (_dir, mut conn, root) = database();
+        let id = ulid::Ulid::new();
+        let relative = save_test_image(&mut conn, &root, id, at(2026, 7, 30), 53);
+        let path = root.join(relative);
+        let missing_target = path.with_file_name("missing-target.webp");
+        std::fs::remove_file(&path)
+            .expect("the saved file should be removable before replacement with a symlink");
+
+        // Creating a symlink needs Developer Mode or SeCreateSymbolicLinkPrivilege, so this case
+        // cannot be built everywhere the suite runs. It was measured on the development machine,
+        // and the predicate it pins is justified there independently: `create_new` on such a name
+        // fails with `AlreadyExists`, which is exactly what the publishing rename would meet.
+        let Ok(()) = std::os::windows::fs::symlink_file(&missing_target, &path) else {
+            return;
+        };
+
+        delete(&mut conn, &root, id).expect("the dangling symlink should be deleted");
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM images WHERE observation_id = ?1",
+                [id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("the image count should be readable");
+        assert_eq!(count, 0);
+        assert!(path.symlink_metadata().is_err());
     }
 
     #[test]
