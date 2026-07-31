@@ -148,10 +148,10 @@ pub enum StoreError {
         /// Observation the frame belongs to.
         id: String,
     },
-    /// Reading or writing an image file failed.
-    #[error("image file {path} could not be read or written: {source}")]
+    /// Reading, writing or enumerating something under the image root failed.
+    #[error("image path {path} could not be read, written or enumerated: {source}")]
     ImageIo {
-        /// Path that could not be read, written, created or removed.
+        /// File or directory the operation was refused on.
         path: PathBuf,
         /// Underlying filesystem error.
         source: std::io::Error,

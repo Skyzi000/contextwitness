@@ -115,7 +115,10 @@ pub fn save(
     // The INSERT decides a conflict before anything is published. The handle stays open through
     // the commit so the destination remains removable while anything can still fail. A crash
     // before the commit leaves at most an unregistered file, which is what the sweep exists for.
-    // `delete` takes the same IMMEDIATE lock, so the database row and file cannot cross each other.
+    // `delete` takes the same IMMEDIATE lock, so no two decisions about this observation's row can
+    // be made at once. Its file removal happens after its commit and cannot take this file: it
+    // removes nothing unless the name was occupied while it still held the lock, and while the name
+    // is occupied this rename cannot have put anything there.
     let transaction = match conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
     {
         Ok(transaction) => transaction,
@@ -201,11 +204,15 @@ pub fn save(
 /// budget that is already free.
 ///
 /// The row is committed before the file is removed, so a failure in between leaves an unregistered
-/// file for the next sweep rather than a row whose file is gone. That releases the transaction's
-/// lock while the old file is still on disk, so a `save` for the same observation racing this call
-/// can find the destination held and fail with [`StoreError::ImageIo`]; it succeeds on a retry, and
-/// no ordering loses a newly saved file, since a rename into that name can only succeed once the
-/// removal is through.
+/// file for the next sweep rather than a row whose file is gone. That is the residue worth having:
+/// the failure this has to survive is a full disk during retention, and a row kept for a file that
+/// is gone would charge its `byte_size` against a budget that is already free.
+///
+/// Whether there is a file to remove is decided while the transaction still holds the lock. If the
+/// name is occupied, a `save` for the same observation racing this call finds it held and fails
+/// with [`StoreError::ImageIo`], because the rename refuses to replace; it succeeds on a retry once
+/// the removal is through. If the name is empty — a row whose file has already gone — nothing is
+/// removed at all, so a save that follows this commit keeps the file it renames into that name.
 ///
 /// Leaves the observation row alone: the OCR text and the payload are the point of the record and
 /// outlive the picture. Empty day directories are left behind on purpose: pruning one could race
@@ -238,6 +245,15 @@ pub fn delete(
         return Ok(());
     };
     let path = root.join(relative);
+    // Decided while the transaction still holds the lock, because after the commit this name stops
+    // being this call's business. A row whose file is already gone is a state this store tolerates,
+    // and there the whole of the work left is nothing: a `save` for this observation that follows
+    // the commit renames its new file into this very name, and a removal running afterwards would
+    // take it away while its fresh row said it was there. When the name is occupied, no save can
+    // reach it first — the rename refuses to replace, so it fails until this removal is through.
+    // A name that cannot even be asked about counts as occupied, so the removal below reports the
+    // real error rather than this line inventing one.
+    let occupied = path.try_exists().unwrap_or(true);
 
     transaction
         .execute(DELETE_IMAGE, [id.to_string()])
@@ -250,11 +266,13 @@ pub fn delete(
     // is left over on failure. A leftover file is unregistered and the next sweep takes it; a
     // leftover row is one `orphan_rows` reports and nothing removes, and retention would keep
     // charging its `byte_size` against a disk budget that is already free.
-    match std::fs::remove_file(&path) {
-        Ok(()) => {}
-        // Nothing left to remove is the outcome this was asked for.
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
-        Err(source) => return Err(StoreError::ImageIo { path, source }),
+    if occupied {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            // Nothing left to remove is the outcome this was asked for.
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => return Err(StoreError::ImageIo { path, source }),
+        }
     }
 
     Ok(())
@@ -722,6 +740,17 @@ mod tests {
             StoreError::Encode { id: actual } => assert_eq!(actual, id.to_string()),
             other => panic!("expected Encode, got {other:?}"),
         }
+
+        let mut long = pixels(40);
+        long.push(0);
+        // The encoder ignores trailing bytes, so only this side of the check catches a length test
+        // weakened to accept a buffer that is merely large enough.
+        let error = save(&mut conn, &root, id, &long, WIDTH, HEIGHT, 75.0, taken_at)
+            .expect_err("the long frame should be refused");
+        match error {
+            StoreError::Encode { id: actual } => assert_eq!(actual, id.to_string()),
+            other => panic!("expected Encode, got {other:?}"),
+        }
         assert!(!root.exists());
         let count: i64 = conn
             .query_row("SELECT count(*) FROM images", [], |row| row.get(0))
@@ -780,6 +809,52 @@ mod tests {
     }
 
     #[test]
+    fn quality_at_both_ends_of_the_allowed_range_is_accepted() {
+        let (_dir, mut conn, root) = database();
+        let zero_id = ulid::Ulid::new();
+        let hundred_id = ulid::Ulid::new();
+        let taken_at = at(2026, 7, 30);
+        insert_observation(&conn, zero_id, taken_at);
+        insert_observation(&conn, hundred_id, taken_at);
+
+        // The configuration allows the whole range, so the refusal of -1 says nothing about where
+        // the accepted range actually ends.
+        save(
+            &mut conn,
+            &root,
+            zero_id,
+            &pixels(42),
+            WIDTH,
+            HEIGHT,
+            0.0,
+            taken_at,
+        )
+        .expect("quality zero should be accepted");
+        save(
+            &mut conn,
+            &root,
+            hundred_id,
+            &pixels(43),
+            WIDTH,
+            HEIGHT,
+            100.0,
+            taken_at,
+        )
+        .expect("quality one hundred should be accepted");
+
+        for id in [zero_id, hundred_id] {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM images WHERE observation_id = ?1",
+                    [id.to_string()],
+                    |row| row.get(0),
+                )
+                .expect("the image count should be readable");
+            assert_eq!(count, 1);
+        }
+    }
+
+    #[test]
     fn a_frame_at_the_encoders_dimension_limit_is_accepted() {
         let (_dir, mut conn, root) = database();
         let id = ulid::Ulid::new();
@@ -793,6 +868,14 @@ mod tests {
         save(&mut conn, &root, id, &pixels, 16_383, 1, 75.0, taken_at)
             .expect("a frame at the encoder's dimension limit should be accepted");
 
+        let second_id = ulid::Ulid::new();
+        insert_observation(&conn, second_id, taken_at);
+        // Width and height are separate bounds, so a test of one says nothing about the other.
+        save(
+            &mut conn, &root, second_id, &pixels, 1, 16_383, 75.0, taken_at,
+        )
+        .expect("a tall frame at the encoder's dimension limit should be accepted");
+
         let count: i64 = conn
             .query_row(
                 "SELECT count(*) FROM images WHERE observation_id = ?1",
@@ -800,6 +883,15 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("the image count should be readable");
+        assert_eq!(count, 1);
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM images WHERE observation_id = ?1",
+                [second_id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("the second image count should be readable");
         assert_eq!(count, 1);
     }
 
