@@ -151,7 +151,9 @@ pub enum StoreError {
     /// Reading, writing or enumerating something under the image root failed.
     #[error("image path {path} could not be read, written or enumerated: {source}")]
     ImageIo {
-        /// File or directory the operation was refused on.
+        /// The file this call was about. Where a name was reserved rather than chosen — the
+        /// temporary a publish writes into — this is the destination, which is the only name the
+        /// caller can act on.
         path: PathBuf,
         /// Underlying filesystem error.
         source: std::io::Error,

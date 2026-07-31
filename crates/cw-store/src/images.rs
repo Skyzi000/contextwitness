@@ -311,7 +311,13 @@ fn sweep_collected_files(
     // name it was enumerated with. Measured 2026-07-30, `canonicalize` answers with the name
     // actually on disk, so two spellings of one file agree. A candidate whose identity cannot be
     // established is kept: leaving a leftover costs disk, and removing a registered image costs the
-    // picture.
+    // picture. Asking only about the names no enumerated file spelled is a cost decision and it
+    // leaves something out — a registered name that was an ordinary file when it was enumerated and
+    // has become a link by the time this runs is not asked about, so the file it now reaches can be
+    // taken as an orphan. Asking about every registered name instead is what that would cost:
+    // measured 2026-08-01 on this machine, `canonicalize` takes 169 µs and `symlink_metadata`
+    // 107 µs, which is seventeen seconds of startup at a hundred thousand images, paid whenever
+    // anything unregistered is under the root at all.
     let mut enumerated = Vec::with_capacity(files.len());
     for path in files {
         let relative = path_relative_to_root(root, path)?;
@@ -326,10 +332,10 @@ fn sweep_collected_files(
 
     // Every name here is resolved once to enumerate it and again to act on it, and a directory
     // above it can be replaced in between: Windows follows a reparse point met partway along a
-    // path. `checked_path` refuses a stored path that names anything outside the image root, and
-    // the enumerated side needs the same rule, checked against the only spelling that cannot lie —
-    // the one the filesystem answers with. A root that will not resolve leaves nothing that can be
-    // shown to be inside it.
+    // path. No spelling protects against that. `checked_path` keeps a stored path from naming
+    // anything outside the image root, which is a statement about the string and not about where
+    // the string leads, so the only thing worth checking is what the filesystem answers with. A
+    // root that will not resolve leaves nothing that can be shown to be inside it.
     let Ok(canonical_root) = std::fs::canonicalize(root) else {
         return Ok(0);
     };

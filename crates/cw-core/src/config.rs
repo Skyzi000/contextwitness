@@ -597,6 +597,20 @@ mod tests {
     }
 
     #[test]
+    fn validate_accepts_the_smallest_and_largest_values_each_bound_allows() {
+        // Each refusal above says only that one value is out; it cannot tell the intended bound
+        // from one narrowed by a step, and a user is entitled to every value asserted here.
+        let mut config = Config::default();
+        config.capture.interval_secs = 1;
+        config.episode.window_minutes = 1;
+        config.capture.webp_quality = 100;
+
+        config
+            .validate()
+            .expect("the tightest capture interval, window and highest quality should be accepted");
+    }
+
+    #[test]
     fn validate_rejects_zero_window_minutes() {
         let mut config = Config::default();
         config.episode.window_minutes = 0;
