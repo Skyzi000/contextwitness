@@ -147,7 +147,15 @@ pub fn save(
         Ok(true) => {}
         Ok(false) => {
             remove_image_file(&temporary)?;
-            return Err(StoreError::ImageAlreadyRegistered { id: id_text });
+            // Not `ImageAlreadyRegistered`: the insert above has already succeeded, so this
+            // observation has no row. Whatever holds the name is unregistered — the file a
+            // crash between this rename and the commit leaves behind, or something this
+            // program did not write — and saying the database already knows about it would
+            // point recovery the wrong way.
+            return Err(StoreError::ImageIo {
+                path: destination,
+                source: std::io::Error::from(std::io::ErrorKind::AlreadyExists),
+            });
         }
         Err(source) => {
             remove_image_file(&temporary)?;
@@ -240,19 +248,38 @@ pub fn sweep_orphan_files(
     conn: &rusqlite::Connection,
     root: &std::path::Path,
 ) -> Result<usize, StoreError> {
+    // Compared case-insensitively because the filesystem this runs on is: the same file answers to
+    // `…/01J….webp` and `…/01j….WEBP`, so a byte comparison would call a registered image an orphan
+    // and delete it. Only ASCII case folding is needed — every character this program puts in one of
+    // these names is a digit, an upper-case Crockford letter, a slash or a dot.
     let registered = registered_paths(conn)?;
     let mut files = Vec::new();
     collect_files(root, &mut files)?;
+    sweep_collected_files(root, &registered, &files)
+}
+
+fn sweep_collected_files(
+    root: &std::path::Path,
+    registered: &HashSet<String>,
+    files: &[std::path::PathBuf],
+) -> Result<usize, StoreError> {
     let mut removed = 0;
 
     for path in files {
-        let relative = path_relative_to_root(root, &path)?;
-        if !registered.contains(&relative) {
-            std::fs::remove_file(&path).map_err(|source| StoreError::ImageIo {
-                path: path.clone(),
-                source,
-            })?;
-            removed += 1;
+        let relative = path_relative_to_root(root, path)?;
+        if !registered.contains(&relative.to_ascii_lowercase()) {
+            match std::fs::remove_file(path) {
+                Ok(()) => removed += 1,
+                // Two startups can collect the same orphan. The one that loses the removal race
+                // has nothing left to do, rather than a reason to abort.
+                Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+                Err(source) => {
+                    return Err(StoreError::ImageIo {
+                        path: path.clone(),
+                        source,
+                    });
+                }
+            }
         }
     }
 
@@ -309,7 +336,7 @@ fn registered_paths(conn: &rusqlite::Connection) -> Result<HashSet<String>, Stor
     let mut paths = HashSet::new();
 
     while let Some(row) = rows.next().map_err(|source| StoreError::Sql { source })? {
-        paths.insert(image_path_from_row(row)?);
+        paths.insert(image_path_from_row(row)?.to_ascii_lowercase());
     }
 
     Ok(paths)
@@ -746,7 +773,7 @@ mod tests {
 
     #[test]
     fn a_row_whose_id_is_spelled_any_other_way_is_refused() {
-        let (_dir, conn, root) = database();
+        let (_dir, mut conn, root) = database();
         let stored_id = "0000000000000128ggyhyyk08n";
         let id = ulid::Ulid::from_string(stored_id)
             .expect("the lower-cased observation id should still parse");
@@ -781,6 +808,11 @@ mod tests {
             ],
         )
         .expect("the non-canonical image row should be inserted by hand");
+
+        // `delete` answers the question asked: no row exists under the canonical id. The sweep is
+        // what refuses this row; searching for equivalent spellings would put an unindexed scan on
+        // the retention path.
+        delete(&mut conn, &root, id).expect("the canonical id should have nothing to delete");
 
         let errors = [
             sweep_orphan_files(&conn, &root)
@@ -822,6 +854,71 @@ mod tests {
             .query_row("SELECT count(*) FROM images", [], |row| row.get(0))
             .expect("the image count should be readable");
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn a_registered_image_spelled_in_another_case_is_not_swept() {
+        let (_dir, mut conn, root) = database();
+        let id = ulid::Ulid::from_string("0000000000000128GGYHYYK08N")
+            .expect("the fixed image id should parse");
+        let relative = save_test_image(&mut conn, &root, id, at(2026, 7, 30), 81);
+        let differently_spelled = relative.to_ascii_lowercase();
+        std::fs::rename(root.join(&relative), root.join(&differently_spelled))
+            .expect("the saved image should be renameable to another case");
+
+        let removed = sweep_orphan_files(&conn, &root).expect("the orphan sweep should succeed");
+
+        assert_eq!(removed, 0);
+        let mut entries = std::fs::read_dir(
+            root.join(&differently_spelled)
+                .parent()
+                .expect("the differently-spelled image should have a day directory"),
+        )
+        .expect("the day directory should remain readable");
+        assert!(entries.any(|entry| {
+            entry
+                .expect("the day directory entry should be readable")
+                .path()
+                .is_file()
+        }));
+    }
+
+    #[test]
+    fn a_sweep_whose_orphan_was_already_removed_still_succeeds() {
+        let (_dir, mut conn, root) = database();
+        let id = ulid::Ulid::new();
+        let relative = save_test_image(&mut conn, &root, id, at(2026, 7, 30), 82);
+        let saved = root.join(relative);
+        let unregistered = root.join("2026").join("07").join("30").join("orphan.webp");
+        std::fs::write(&unregistered, b"not registered")
+            .expect("the hand-placed file should be writable");
+        std::fs::remove_file(&unregistered)
+            .expect("the hand-placed file should be removable before the sweep");
+
+        assert_eq!(
+            sweep_orphan_files(&conn, &root).expect("the orphan sweep should still succeed"),
+            0
+        );
+
+        std::fs::write(&unregistered, b"not registered")
+            .expect("the hand-placed file should be writable again");
+        let registered =
+            super::registered_paths(&conn).expect("the registered paths should be readable");
+        let mut files = Vec::new();
+        super::collect_files(&root, &mut files)
+            .expect("the image tree should be collectable for both startups");
+
+        assert_eq!(
+            super::sweep_collected_files(&root, &registered, &files)
+                .expect("the first startup sweep should succeed"),
+            1
+        );
+        assert_eq!(
+            super::sweep_collected_files(&root, &registered, &files)
+                .expect("the second startup sweep should succeed"),
+            0
+        );
+        assert!(saved.is_file());
     }
 
     #[test]
@@ -895,6 +992,43 @@ mod tests {
     }
 
     #[test]
+    fn a_destination_held_by_an_unregistered_file_is_not_reported_as_registered() {
+        let (_dir, mut conn, root) = database();
+        let id = ulid::Ulid::new();
+        let taken_at = at(2026, 7, 30);
+        let relative = save_test_image(&mut conn, &root, id, taken_at, 209);
+        conn.execute(
+            "DELETE FROM images WHERE observation_id = ?1",
+            [id.to_string()],
+        )
+        .expect("the image row should be removable without touching its file");
+
+        let error = save(
+            &mut conn,
+            &root,
+            id,
+            &pixels(210),
+            WIDTH,
+            HEIGHT,
+            75.0,
+            taken_at,
+        )
+        .expect_err("the unregistered file should keep its destination");
+
+        match error {
+            StoreError::ImageIo { path, source } => {
+                assert_eq!(path, root.join(relative));
+                assert_eq!(source.kind(), std::io::ErrorKind::AlreadyExists);
+            }
+            other => panic!("expected ImageIo with AlreadyExists, got {other:?}"),
+        }
+        let count: i64 = conn
+            .query_row("SELECT count(*) FROM images", [], |row| row.get(0))
+            .expect("the image count should be readable");
+        assert_eq!(count, 0);
+    }
+
+    #[test]
     fn a_failed_rename_leaves_no_temporary_behind() {
         let (_dir, mut conn, root) = database();
         let id = ulid::Ulid::new();
@@ -921,7 +1055,23 @@ mod tests {
             taken_at,
         )
         .expect_err("the taken destination should be refused");
-        assert!(matches!(error, StoreError::ImageAlreadyRegistered { .. }));
+        match error {
+            StoreError::ImageIo { path, source } => {
+                assert_eq!(path, destination);
+                assert_eq!(source.kind(), std::io::ErrorKind::AlreadyExists);
+            }
+            other => panic!("expected ImageIo with AlreadyExists, got {other:?}"),
+        }
+
+        // No row is what tells this transaction apart from three autocommitted statements.
+        let count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM images WHERE observation_id = ?1",
+                [id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("the image count should be readable");
+        assert_eq!(count, 0);
 
         let entries = std::fs::read_dir(
             destination
