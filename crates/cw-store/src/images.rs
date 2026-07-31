@@ -2,7 +2,7 @@
 
 use crate::{StoreError, timestamp};
 use chrono::Datelike;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// GENERIC_WRITE | DELETE. The DELETE right is what lets a handle rename its own file.
 const RENAMABLE_WRITE_ACCESS: u32 = 0x4000_0000 | 0x0001_0000;
@@ -240,7 +240,8 @@ pub fn delete(
     Ok(())
 }
 
-/// Remove image files no row knows about, and report how many went.
+/// A file is removed only when nothing registered names it and the filesystem does not report it as
+/// one of the registered files under another spelling. Reports how many went.
 ///
 /// This is a startup operation and must not run while anything is saving: a file renamed into place
 /// but not yet registered is indistinguishable from an orphan.
@@ -248,10 +249,6 @@ pub fn sweep_orphan_files(
     conn: &rusqlite::Connection,
     root: &std::path::Path,
 ) -> Result<usize, StoreError> {
-    // Compared case-insensitively because the filesystem this runs on is: the same file answers to
-    // `…/01J….webp` and `…/01j….WEBP`, so a byte comparison would call a registered image an orphan
-    // and delete it. Only ASCII case folding is needed — every character this program puts in one of
-    // these names is a digit, an upper-case Crockford letter, a slash or a dot.
     let registered = registered_paths(conn)?;
     let mut files = Vec::new();
     collect_files(root, &mut files)?;
@@ -263,11 +260,39 @@ fn sweep_collected_files(
     registered: &HashSet<String>,
     files: &[std::path::PathBuf],
 ) -> Result<usize, StoreError> {
+    // Whether two spellings name one file is the filesystem's rule, not this program's. A byte
+    // comparison deletes a registered image on the case-insensitive directory this normally runs
+    // on, and folding case spares a real orphan on a case-sensitive one — `storage.data_dir` can be
+    // either, since NTFS can be made case-sensitive per directory and a share need not be NTFS at
+    // all. Measured 2026-07-30 on a case-insensitive directory, `canonicalize` answers with the
+    // name actually on disk, so two spellings of one file agree; the case-sensitive side is not
+    // measured here, which is why an unanswerable comparison keeps the file rather than removing
+    // it. Leaving a leftover costs disk; removing a registered image costs the picture.
+    let registered_by_folded: HashMap<_, _> = registered
+        .iter()
+        .map(|relative| (relative.to_ascii_lowercase(), relative.as_str()))
+        .collect();
     let mut removed = 0;
 
     for path in files {
         let relative = path_relative_to_root(root, path)?;
-        if !registered.contains(&relative.to_ascii_lowercase()) {
+        let should_remove = if registered.contains(&relative) {
+            false
+        } else if let Some(registered_relative) =
+            registered_by_folded.get(&relative.to_ascii_lowercase())
+        {
+            match (
+                std::fs::canonicalize(path),
+                std::fs::canonicalize(root.join(*registered_relative)),
+            ) {
+                (Ok(enumerated), Ok(registered)) => enumerated != registered,
+                _ => false,
+            }
+        } else {
+            true
+        };
+
+        if should_remove {
             match std::fs::remove_file(path) {
                 Ok(()) => removed += 1,
                 // Two startups can collect the same orphan. The one that loses the removal race
@@ -336,7 +361,7 @@ fn registered_paths(conn: &rusqlite::Connection) -> Result<HashSet<String>, Stor
     let mut paths = HashSet::new();
 
     while let Some(row) = rows.next().map_err(|source| StoreError::Sql { source })? {
-        paths.insert(image_path_from_row(row)?.to_ascii_lowercase());
+        paths.insert(image_path_from_row(row)?);
     }
 
     Ok(paths)
