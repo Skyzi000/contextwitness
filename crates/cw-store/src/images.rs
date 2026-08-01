@@ -332,20 +332,35 @@ pub fn sweep_orphan_files(
                 path: root.to_path_buf(),
                 source,
             };
-            if std::fs::symlink_metadata(root).is_ok() {
-                return Err(unreadable);
-            }
-            let deepest = root
-                .ancestors()
-                .skip(1)
-                .find(|ancestor| std::fs::symlink_metadata(ancestor).is_ok());
-            return match deepest {
-                None => Ok(0),
-                Some(existing) if std::fs::metadata(existing).is_ok_and(|entry| entry.is_dir()) => {
-                    Ok(0)
+            for name in root.ancestors() {
+                match std::fs::symlink_metadata(name) {
+                    // Nothing is here. Keep climbing — the path may simply not be created yet, and
+                    // running out of names means none of it is.
+                    Err(absent) if absent.kind() == std::io::ErrorKind::NotFound => {}
+                    // The name cannot be answered about, which is not the same as nothing being
+                    // there. Measured 2026-08-01: a component the filesystem will not take — one
+                    // holding a `|`, or longer than a component may be — answers `InvalidFilename`
+                    // while the directory above it is perfectly ordinary, and a `storage.data_dir`
+                    // typed with such a character is exactly that. Reporting a clean sweep on a
+                    // doubt would report it on every startup.
+                    Err(_) => return Err(unreadable),
+                    // The deepest entry that does exist. The root itself arriving here is a name
+                    // taken by something `canonicalize` refused. Otherwise what is left of the path
+                    // is waiting to be created, and only a directory can hold it — asked with
+                    // `metadata`, which follows links, because a data directory junctioned onto
+                    // another volume is a directory to everything else here.
+                    Ok(_) => {
+                        return if name != root
+                            && std::fs::metadata(name).is_ok_and(|entry| entry.is_dir())
+                        {
+                            Ok(0)
+                        } else {
+                            Err(unreadable)
+                        };
+                    }
                 }
-                Some(_) => Err(unreadable),
-            };
+            }
+            return Ok(0);
         }
     };
     let registered = registered_paths(conn)?;
@@ -1678,6 +1693,23 @@ mod tests {
         // The root's own entry is absent here exactly as it is in the test above, and the two are
         // told apart by what is standing above it: a link whose target is gone, under which
         // `create_dir_all` answers `AlreadyExists` and no image can ever be written.
+        let result = sweep_orphan_files(&conn, &root);
+
+        assert!(
+            matches!(result, Err(StoreError::ImageIo { .. })),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn a_root_the_filesystem_will_not_answer_about_is_reported() {
+        let (dir, conn, _root) = database();
+        // A `storage.data_dir` typed with a character Windows does not take. Measured 2026-08-01:
+        // both `canonicalize` and `symlink_metadata` answer `InvalidFilename` here, while the
+        // directory holding it is an ordinary one — so nothing about this name has been shown to
+        // be absent, and it needs no special privilege to arrange.
+        let root = dir.path().join("im|ages");
+
         let result = sweep_orphan_files(&conn, &root);
 
         assert!(
