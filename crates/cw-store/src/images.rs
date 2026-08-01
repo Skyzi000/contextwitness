@@ -309,21 +309,36 @@ pub fn sweep_orphan_files(
     let root = match std::fs::canonicalize(root) {
         Ok(resolved) => resolved,
         // Nothing there at all is the ordinary state before the first save and there is nothing to
-        // sweep, but that is a question about the entry and not about what it leads to.
-        // `canonicalize` cannot tell the two apart: measured 2026-08-01, a directory link whose
-        // target is gone answers `NotFound` exactly as an absent name does, while
-        // `symlink_metadata` reports the entry that is plainly there. That entry holds the name as
-        // far as every save is concerned — `create_dir_all` on it answers `AlreadyExists` — so a
-        // sweep calling it the state before the first save would report a clean pass on every
-        // startup while no image could be written at all. This is the rule the registered names
-        // below are already read by, facing the same way.
+        // sweep, but that is a question about the entries on this path and not about what they lead
+        // to, and it has to be put to the whole path rather than to its last component.
+        // `canonicalize` answers `NotFound` for a name that was never there, for a link whose target
+        // is gone, and for a path leading through either of those — measured 2026-08-01, and the
+        // raw code does not separate them either. What decides is the deepest entry that does
+        // exist: none at all, or a directory, and the rest of the path is simply not created yet;
+        // anything else, and no image can ever be written here — `create_dir_all` answers
+        // `AlreadyExists` — so calling it the state before the first save would report a clean
+        // pass on every startup of a store that cannot work at all. The registered names below are
+        // read by a weaker rule on purpose: `canonicalize` answering `NotFound` is taken as absent
+        // there without asking about the entry, because that loop only needs to know which file a
+        // row names, and a name leading nowhere names none. This root has to be walked.
         Err(source) => {
-            return match std::fs::symlink_metadata(root) {
-                Err(absent) if absent.kind() == std::io::ErrorKind::NotFound => Ok(0),
-                _ => Err(StoreError::ImageIo {
-                    path: root.to_path_buf(),
-                    source,
-                }),
+            let unreadable = StoreError::ImageIo {
+                path: root.to_path_buf(),
+                source,
+            };
+            if std::fs::symlink_metadata(root).is_ok() {
+                return Err(unreadable);
+            }
+            let deepest = root
+                .ancestors()
+                .skip(1)
+                .find(|ancestor| std::fs::symlink_metadata(ancestor).is_ok());
+            return match deepest {
+                None => Ok(0),
+                Some(existing) if std::fs::metadata(existing).is_ok_and(|entry| entry.is_dir()) => {
+                    Ok(0)
+                }
+                Some(_) => Err(unreadable),
             };
         }
     };
@@ -1614,6 +1629,42 @@ mod tests {
 
         // `canonicalize` answers `NotFound` here, exactly as it does for a name that was never
         // there — but this name is taken, and every save will fail on it until someone clears it.
+        let result = sweep_orphan_files(&conn, &root);
+
+        assert!(
+            matches!(result, Err(StoreError::ImageIo { .. })),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn a_root_under_a_directory_that_does_not_exist_yet_removes_nothing() {
+        let (dir, conn, _root) = database();
+        let root = dir.path().join("not-yet").join("images");
+
+        // A first run whose whole data directory is still to be created. The deepest entry that
+        // does exist is the temporary directory, and it is a directory, so nothing here is wrong.
+        assert_eq!(
+            sweep_orphan_files(&conn, &root).expect("a sweep before the first save should succeed"),
+            0
+        );
+    }
+
+    #[test]
+    fn a_root_whose_parent_leads_nowhere_is_reported() {
+        let (dir, conn, _root) = database();
+        let parent = dir.path().join("data");
+        let root = parent.join("images");
+
+        // Creating a directory link needs Developer Mode or SeCreateSymbolicLinkPrivilege, so this
+        // case cannot be built everywhere the suite runs.
+        let Ok(()) = std::os::windows::fs::symlink_dir(dir.path().join("nowhere"), &parent) else {
+            return;
+        };
+
+        // The root's own entry is absent here exactly as it is in the test above, and the two are
+        // told apart by what is standing above it: a link whose target is gone, under which
+        // `create_dir_all` answers `AlreadyExists` and no image can ever be written.
         let result = sweep_orphan_files(&conn, &root);
 
         assert!(
