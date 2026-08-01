@@ -183,7 +183,13 @@ pub fn save(
     }
 
     if let Err(source) = transaction.commit() {
-        discard_written_file(&file, &destination)?;
+        // The picture stays. An error here does not prove the row is not there — SQLite does not
+        // promise that every failed commit rolled back — and discarding it would turn that
+        // uncertainty into the one outcome this store refuses: a registered row whose file is gone,
+        // which nothing removes and retention keeps charging against a budget that is already free.
+        // If the transaction did roll back, what is left is an unregistered file, which is what the
+        // startup sweep collects. Every other failure above can discard, because none of them has
+        // reached the commit.
         return Err(StoreError::Sql { source });
     }
     drop(file);
