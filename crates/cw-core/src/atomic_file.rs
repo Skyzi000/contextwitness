@@ -291,6 +291,20 @@ mod tests {
     }
 
     #[test]
+    fn a_directory_cannot_be_opened_for_removal() {
+        let path = unique_temp_path("open-for-removal-directory");
+        std::fs::create_dir(&path).expect("the directory should be creatable");
+
+        // Measured 2026-08-01: `PermissionDenied` (raw 5). The kind is not asserted — what the
+        // caller is promised, and what the image sweep's comment rests on, is only that this
+        // refuses.
+        let result = open_for_removal(&path);
+
+        assert!(result.is_err(), "{result:?}");
+        std::fs::remove_dir(&path).expect("the test directory should be removable");
+    }
+
+    #[test]
     fn a_win32_failure_keeps_the_kind_the_operating_system_gave_it() {
         let access_denied = io_error(windows::core::Error::from_hresult(windows::core::HRESULT(
             0x8007_0005u32 as i32,

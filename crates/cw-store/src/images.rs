@@ -766,6 +766,44 @@ mod tests {
     }
 
     #[test]
+    fn an_image_whose_commit_fails_stays_for_the_sweep() {
+        let (_dir, mut conn, root) = database();
+        let id = ulid::Ulid::new();
+        let taken_at = at(2026, 7, 30);
+        // No observation is inserted, so this image's row breaks the foreign key `db::open` turns
+        // on. Measured 2026-08-01: the check is enforced as the INSERT arrives, unless it is
+        // deferred — and then it is the COMMIT that answers `ConstraintViolation` (787), which is
+        // the one failure the last statement of `save` can be given from here. `save` never reads
+        // or writes this pragma, and SQLite clears it when the transaction ends.
+        conn.execute_batch("PRAGMA defer_foreign_keys = ON")
+            .expect("the pragma should apply");
+
+        let result = save(
+            &mut conn,
+            &root,
+            id,
+            &pixels(93),
+            WIDTH,
+            HEIGHT,
+            75.0,
+            taken_at,
+        );
+
+        assert!(matches!(result, Err(StoreError::Sql { .. })), "{result:?}");
+        // The picture is left where it was published, which is what the startup sweep collects.
+        // Discarding it instead would be the one outcome this store refuses if the row did survive.
+        let published = root.join(format!("2026/07/30/{id}.webp"));
+        assert!(
+            published.is_file(),
+            "the published image should still be there"
+        );
+        let registered: i64 = conn
+            .query_one("SELECT count(*) FROM images", [], |row| row.get(0))
+            .expect("the image count should be readable");
+        assert_eq!(registered, 0);
+    }
+
+    #[test]
     fn a_save_that_cannot_take_the_write_lock_leaves_no_file_behind() {
         let (dir, mut conn, root) = database();
         let id = ulid::Ulid::new();
@@ -1711,6 +1749,51 @@ mod tests {
         let root = dir.path().join("im|ages");
 
         let result = sweep_orphan_files(&conn, &root);
+
+        assert!(
+            matches!(result, Err(StoreError::ImageIo { .. })),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn a_root_that_is_a_directory_no_one_may_open_is_reported() {
+        let (dir, conn, root) = database();
+        std::fs::create_dir(&root).expect("the image root should be creatable");
+        let Ok(user) = std::env::var("USERNAME") else {
+            return;
+        };
+        let path = root.to_string_lossy().to_string();
+        // std has no way to set an ACL and this crate may hold no `unsafe`, so the check is asked
+        // of the tool Windows ships with. Measured 2026-08-01: after this, `canonicalize` answers
+        // `PermissionDenied` while `metadata` still answers that it is a directory — the one state
+        // that separates a root which is there and will not open from a path not created yet.
+        let denied = std::process::Command::new("icacls")
+            .args([
+                path.as_str(),
+                "/deny",
+                &format!("{user}:(RX,RA,RD)"),
+                "/inheritance:r",
+            ])
+            .output();
+        let Ok(output) = denied else {
+            return;
+        };
+        if !output.status.success() || std::fs::canonicalize(&root).is_ok() {
+            return;
+        }
+
+        let result = sweep_orphan_files(&conn, &root);
+
+        // Put it back before asserting: a failing assertion must not leave a directory the
+        // temporary directory cannot remove.
+        let _ = std::process::Command::new("icacls")
+            .args([path.as_str(), "/reset"])
+            .output();
+        let _ = std::process::Command::new("icacls")
+            .args([path.as_str(), "/remove:d", user.as_str()])
+            .output();
+        drop(dir);
 
         assert!(
             matches!(result, Err(StoreError::ImageIo { .. })),
