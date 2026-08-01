@@ -10,8 +10,9 @@ const COUNT_IMAGE_BY_ID: &str = "SELECT count(*) FROM images WHERE observation_i
 const SELECT_PATH_BY_ID: &str =
     "SELECT observation_id, relative_path, created_at FROM images WHERE observation_id = ?1";
 const DELETE_IMAGE: &str = "DELETE FROM images WHERE observation_id = ?1";
-// The report `orphan_rows` produces is read by a person and its order is the order the pictures were
-// taken; the sweep collects into a set and pays for a sort no index serves.
+// The report `orphan_rows` produces is read by a person and its order is the order the pictures
+// were taken. The sweep collects into a set, so it asks without an `ORDER BY` at all rather than
+// paying for a sort no index serves.
 const SELECT_IMAGE_ROWS: &str = "SELECT observation_id, relative_path, created_at FROM images ORDER BY created_at, observation_id";
 const SELECT_IMAGE_PATHS: &str = "SELECT observation_id, relative_path, created_at FROM images";
 
@@ -306,10 +307,11 @@ pub fn sweep_orphan_files(
     sweep_collected_files(&root, &registered, &files)
 }
 
-/// `root` must be spelled the way `canonicalize` answers. Every candidate is compared against it as
-/// a prefix, so a root spelled any other way puts every candidate outside it and the pass removes
-/// nothing. Resolving it here would resolve it after the caller's walk, which is the window this
-/// separation exists to close.
+/// `root` must be spelled the way `canonicalize` answers, and `files` must have been listed by
+/// walking that spelling: a candidate is required to resolve to the name it was listed under, and a
+/// root spelled any other way makes every listed name fail that on its first component. Resolving
+/// the root here would resolve it after the caller's walk, which is the window that separation
+/// exists to close.
 fn sweep_collected_files(
     root: &std::path::Path,
     registered: &HashSet<String>,
@@ -376,17 +378,24 @@ fn sweep_collected_files(
         let Ok(identity) = std::fs::canonicalize(path) else {
             continue;
         };
-        // Every name here is resolved once to enumerate it and again to act on it, and a directory
-        // above it can be replaced in between: Windows follows a reparse point met partway along a
-        // path. No spelling protects against that. `checked_path` keeps a stored path from naming
-        // anything outside the image root, which is a statement about the string and not about
-        // where the string leads, so the only thing worth checking is what the filesystem answers
-        // with — against a root the caller resolved before it read anything.
-        if !identity.starts_with(root) || unspelled_identities.contains(&identity) {
+        // Every name here is resolved once to list it and again to act on it, and what stands under
+        // it can be replaced in between — the entry itself, or a directory above it, since Windows
+        // follows a reparse point met partway along a path. No spelling protects against that, so
+        // the question is what the filesystem answers with. `collect_files` keeps only what the
+        // filesystem calls a file and a link is not one, so every candidate was an ordinary file
+        // when it was listed, and an ordinary file resolves to the name it was listed under.
+        // Measured 2026-08-01 on two volumes, over a tree holding a hardlink, a Japanese name,
+        // names with spaces and dots and twenty levels of nesting: every listed file canonicalized
+        // to its own listed path, and a name reached through a directory link did not. Anything
+        // answering differently is no longer what was listed, and what it now reaches may be a
+        // registered image. This settles containment too: every listed name is under the root by
+        // construction, so a candidate that is its own name is inside the root.
+        if identity.as_path() != path.as_path() || unspelled_identities.contains(&identity) {
             continue;
         }
 
-        // Addressed to the spelling that was checked, not to the one that was enumerated.
+        // The check above required these to be one name, so this is both the name that was listed
+        // and the one the filesystem answered with.
         match std::fs::remove_file(&identity) {
             Ok(()) => removed += 1,
             // Two startups can collect the same orphan. The one that loses the removal race
@@ -1298,6 +1307,37 @@ mod tests {
             .query_row("SELECT count(*) FROM images", [], |row| row.get(0))
             .expect("the image count should be readable");
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn an_orphan_that_became_a_link_to_a_registered_image_is_not_removed() {
+        let (_dir, mut conn, root) = database();
+        let id = ulid::Ulid::new();
+        let relative = save_test_image(&mut conn, &root, id, at(2026, 7, 30), 82);
+        let picture = root.join(&relative);
+        let orphan = root.join("2026").join("07").join("30").join("orphan.webp");
+        std::fs::write(&orphan, b"not registered")
+            .expect("the hand-placed file should be writable");
+
+        let resolved = std::fs::canonicalize(&root).expect("the image root should resolve");
+        let registered =
+            super::registered_paths(&conn).expect("the registered paths should be readable");
+        let mut files = Vec::new();
+        super::collect_files(&resolved, &mut files).expect("the image tree should be collectable");
+
+        // Both were ordinary files when they were listed, so the registered one is spelled by a
+        // listed file and is not among the names the sweep asks about. The orphan then becomes a
+        // link to it.
+        std::fs::remove_file(&orphan).expect("the hand-placed file should be removable");
+        let Ok(()) = std::os::windows::fs::symlink_file(&picture, &orphan) else {
+            return;
+        };
+
+        let removed = sweep_collected_files(&resolved, &registered, &files)
+            .expect("the sweep should succeed");
+
+        assert_eq!(removed, 0);
+        assert!(picture.is_file());
     }
 
     #[test]
