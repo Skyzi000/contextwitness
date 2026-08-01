@@ -562,20 +562,33 @@ fn registered_paths(conn: &rusqlite::Connection) -> Result<HashSet<String>, Stor
 /// image root rather than only what this program wrote there, so its depth is not this program's
 /// to assume. Running out of stack aborts the process, and this runs at startup.
 fn collect_files(
-    directory: &std::path::Path,
+    root: &std::path::Path,
     files: &mut Vec<std::path::PathBuf>,
 ) -> Result<(), StoreError> {
-    let mut worklist: Vec<std::path::PathBuf> = vec![directory.to_path_buf()];
+    let mut worklist: Vec<std::path::PathBuf> = vec![root.to_path_buf()];
     while let Some(directory) = worklist.pop() {
         let entries = match std::fs::read_dir(&directory) {
             Ok(entries) => entries,
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(source) => {
+            // The root is the name the caller configured and the only one it can act on, and a
+            // root that will not be listed means nothing under it was seen at all — answering
+            // `Ok` there is a clean sweep reported on every startup of a store from which nothing
+            // is ever collected. A directory under it is one place among many, and failing the
+            // whole pass on one of them leaves every orphan everywhere else uncollected for as
+            // long as it stays, which is what a candidate that will not open or will not go is
+            // already passed over for. Measured 2026-08-01, the two are separate arrangements and
+            // not one: denying this user the right to list a subdirectory leaves the root
+            // enumerable and still yielding that subdirectory, while denying it on the root
+            // leaves `canonicalize` answering `Ok`, so the walk above never sees either. Nothing
+            // under a directory that was not listed becomes a candidate, so passing over one
+            // removes nothing on a guess.
+            Err(source) if directory == root => {
                 return Err(StoreError::ImageIo {
                     path: directory,
                     source,
                 });
             }
+            Err(_) => continue,
         };
 
         for entry in entries {
@@ -689,6 +702,31 @@ mod tests {
             db::open(&dir.path().join("db.sqlite3")).expect("the fresh database should initialize");
         let root = dir.path().join("images");
         (dir, conn, root)
+    }
+
+    /// Puts back what a `/deny` on `path` took away. A guard and not a call, because a call is
+    /// skipped by exactly the failure the tests that use this exist to detect: a panic anywhere
+    /// below unwinds past every restore written as a statement, and measured 2026-08-01 a directory
+    /// left holding such a deny cannot be removed by anything — not by the temporary directory, not
+    /// by `Remove-Item -Recurse -Force`. Provoked with a `panic!` in place of the sweep: with the
+    /// restore written as a call the entry survived holding `(DENY)(RX)` and the whole temporary
+    /// tree became unremovable; with this it did not. Construct it before applying the deny, so that
+    /// the exit taken when `icacls` cannot even be waited on is covered, and after the temporary
+    /// directory, so that it runs before the directory is taken away.
+    struct RestoreEntry<'a> {
+        path: &'a str,
+        user: &'a str,
+    }
+
+    impl Drop for RestoreEntry<'_> {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("icacls")
+                .args([self.path, "/reset"])
+                .output();
+            let _ = std::process::Command::new("icacls")
+                .args([self.path, "/remove:d", self.user])
+                .output();
+        }
     }
 
     fn at(year: i32, month: u32, day: u32) -> DateTime<Utc> {
@@ -1817,29 +1855,6 @@ mod tests {
             return;
         };
         let path = root.to_string_lossy().to_string();
-        // A guard and not a call, because a call is skipped by exactly the failure this test exists
-        // to detect: a panic anywhere below unwinds past every restore written as a statement, and
-        // measured 2026-08-01 a directory left holding this deny cannot be removed by anything —
-        // not by the temporary directory, not by `Remove-Item -Recurse -Force`. Provoked with a
-        // `panic!` in place of the sweep: with the restore written as a call the entry survived
-        // holding `(DENY)(RX)` and the whole temporary tree became unremovable; with this it did
-        // not. Constructed before the deny is applied, so the exit taken when `icacls` cannot even
-        // be waited on is covered, and declared after the temporary directory so that it runs
-        // before the directory is taken away.
-        struct RestoreEntry<'a> {
-            path: &'a str,
-            user: &'a str,
-        }
-        impl Drop for RestoreEntry<'_> {
-            fn drop(&mut self) {
-                let _ = std::process::Command::new("icacls")
-                    .args([self.path, "/reset"])
-                    .output();
-                let _ = std::process::Command::new("icacls")
-                    .args([self.path, "/remove:d", self.user])
-                    .output();
-            }
-        }
         let _restore = RestoreEntry {
             path: path.as_str(),
             user: user.as_str(),
@@ -1878,6 +1893,89 @@ mod tests {
         assert!(
             matches!(result, Err(StoreError::ImageIo { .. })),
             "{result:?}"
+        );
+    }
+
+    #[test]
+    fn a_root_that_will_not_be_listed_is_reported() {
+        let (_dir, conn, root) = database();
+        std::fs::create_dir(&root).expect("the image root should be creatable");
+        std::fs::write(root.join("ordinary.webp"), b"an orphan")
+            .expect("the file should be writable");
+        let Ok(user) = std::env::var("USERNAME") else {
+            return;
+        };
+        let path = root.to_string_lossy().to_string();
+        let _restore = RestoreEntry {
+            path: path.as_str(),
+            user: user.as_str(),
+        };
+        // Only the right to list the contents is taken. Measured 2026-08-01: `canonicalize` still
+        // answers `Ok`, so the walk that reports an unopenable root never runs, and the enumeration
+        // is the only thing that fails — the one arrangement that puts the question to the walk
+        // over the tree instead.
+        let denied = std::process::Command::new("icacls")
+            .args([path.as_str(), "/deny", &format!("{user}:(RD)")])
+            .output();
+        let Ok(output) = denied else {
+            return;
+        };
+        if !output.status.success()
+            || std::fs::canonicalize(&root).is_err()
+            || std::fs::read_dir(&root).is_ok()
+        {
+            return;
+        }
+
+        let result = sweep_orphan_files(&conn, &root);
+
+        assert!(
+            matches!(result, Err(StoreError::ImageIo { .. })),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn a_directory_that_will_not_be_listed_does_not_stop_the_sweep() {
+        let (_dir, conn, root) = database();
+        let blocked = root.join("blocked");
+        std::fs::create_dir_all(&blocked).expect("the image root should be creatable");
+        let ordinary = root.join("ordinary.webp");
+        std::fs::write(&ordinary, b"an orphan").expect("the file should be writable");
+        std::fs::write(blocked.join("inner.webp"), b"an orphan")
+            .expect("the file should be writable");
+        let Ok(user) = std::env::var("USERNAME") else {
+            return;
+        };
+        let path = blocked.to_string_lossy().to_string();
+        let _restore = RestoreEntry {
+            path: path.as_str(),
+            user: user.as_str(),
+        };
+        // Measured 2026-08-01: with this applied the root still enumerates and still yields
+        // `blocked` as a directory, while listing `blocked` itself answers `PermissionDenied`. One
+        // such place must not decide whether anything else under the root is ever collected.
+        let denied = std::process::Command::new("icacls")
+            .args([path.as_str(), "/deny", &format!("{user}:(RX,RA,RD)")])
+            .output();
+        let Ok(output) = denied else {
+            return;
+        };
+        if !output.status.success() || std::fs::read_dir(&blocked).is_ok() {
+            return;
+        }
+
+        let removed =
+            sweep_orphan_files(&conn, &root).expect("one place that will not open is not the pass");
+
+        assert_eq!(removed, 1);
+        assert!(
+            !ordinary.exists(),
+            "the orphan the sweep could reach should be gone"
+        );
+        assert!(
+            blocked.join("inner.webp").exists(),
+            "nothing under a directory that was not listed is a candidate"
         );
     }
 
