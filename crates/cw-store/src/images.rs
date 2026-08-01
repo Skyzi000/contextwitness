@@ -1765,16 +1765,32 @@ mod tests {
             return;
         };
         let path = root.to_string_lossy().to_string();
-        // Defined before the deny is applied, because the exit taken when `icacls` cannot be waited
-        // on needs it too. Both calls discard their result and neither changes anything on a
-        // directory that was never denied, so this is safe to run whether or not it was.
-        let restore = || {
-            let _ = std::process::Command::new("icacls")
-                .args([path.as_str(), "/reset"])
-                .output();
-            let _ = std::process::Command::new("icacls")
-                .args([path.as_str(), "/remove:d", user.as_str()])
-                .output();
+        // A guard and not a call, because a call is skipped by exactly the failure this test exists
+        // to detect: a panic anywhere below unwinds past every restore written as a statement, and
+        // measured 2026-08-01 a directory left holding this deny cannot be removed by anything —
+        // not by the temporary directory, not by `Remove-Item -Recurse -Force`. Provoked with a
+        // `panic!` in place of the sweep: with the restore written as a call the entry survived
+        // holding `(DENY)(RX)` and the whole temporary tree became unremovable; with this it did
+        // not. Constructed before the deny is applied, so the exit taken when `icacls` cannot even
+        // be waited on is covered, and declared after the temporary directory so that it runs
+        // before the directory is taken away.
+        struct RestoreEntry<'a> {
+            path: &'a str,
+            user: &'a str,
+        }
+        impl Drop for RestoreEntry<'_> {
+            fn drop(&mut self) {
+                let _ = std::process::Command::new("icacls")
+                    .args([self.path, "/reset"])
+                    .output();
+                let _ = std::process::Command::new("icacls")
+                    .args([self.path, "/remove:d", self.user])
+                    .output();
+            }
+        }
+        let _restore = RestoreEntry {
+            path: path.as_str(),
+            user: user.as_str(),
         };
         // std has no way to set an ACL and this crate may hold no `unsafe`, so the check is asked
         // of the tool Windows ships with. Measured 2026-08-01: after this, `canonicalize` answers
@@ -1790,23 +1806,22 @@ mod tests {
             .output();
         // `Err` here does not mean the tool never ran: the standard library spawns the child first
         // and the wait that follows is fallible on its own, so the deny may already be applied.
-        // Measured 2026-08-01, a directory left holding it cannot be removed by anything, so this
-        // exit puts it back rather than deciding which of the two happened.
+        // Nothing here decides which of the two happened, because nothing has to: the guard above
+        // runs on this exit as on every other, and on a directory that was never denied it changes
+        // nothing.
         let Ok(output) = denied else {
-            restore();
             return;
         };
         if !output.status.success() || std::fs::canonicalize(&root).is_ok() {
-            restore();
             return;
         }
 
         let result = sweep_orphan_files(&conn, &root);
 
-        // Nothing is dropped by hand here. The temporary directory has to outlive the connection
-        // that holds `db.sqlite3` open, and leaving the scope — including by unwinding out of the
-        // assertion below — already drops them in that order.
-        restore();
+        // Nothing is dropped or restored by hand here. The temporary directory has to outlive the
+        // connection that holds `db.sqlite3` open and the guard above has to run before either, and
+        // leaving the scope — including by unwinding out of the assertion below — already drops
+        // them in that order.
 
         assert!(
             matches!(result, Err(StoreError::ImageIo { .. })),
