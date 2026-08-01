@@ -148,11 +148,13 @@ pub enum StoreError {
         /// Observation the frame belongs to.
         id: String,
     },
-    /// An operation on a path under the image root failed. Deliberately not a list of which ones:
-    /// this is raised for creating, writing, syncing, renaming, reading, enumerating and removing,
-    /// and for a listed file that turns out not to be under the root at all, and every list of them
-    /// written here so far has been shorter than the set. Which operation it was is what `source`
-    /// carries.
+    /// An operation on a path under the image root failed. Which operation is not recorded
+    /// anywhere on this variant: it is raised for creating, writing, syncing, renaming, reading,
+    /// enumerating and removing, and for a listed file that turns out not to be under the root at
+    /// all, and the two closed lists written here before this were both shorter than that set.
+    /// `source` does not close the gap — it says what went wrong and not what was attempted, so a
+    /// `PermissionDenied` from a removal and one from creating a directory are the same value. A
+    /// caller that has to tell them apart needs a field this variant does not have.
     #[error("an operation on image path {path} failed: {source}")]
     ImageIo {
         /// What this call was about: an image file, or a directory on the way to one. Where a name
