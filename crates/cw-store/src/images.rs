@@ -108,9 +108,10 @@ pub fn save(
     // the commit so the destination remains removable while anything can still fail. A crash
     // before the commit leaves at most an unregistered file, which is what the sweep exists for.
     // `delete` takes the same IMMEDIATE lock, so no two decisions about this observation's row can
-    // be made at once. Its file removal happens after its commit and cannot take this file: it
+    // be made at once. A `delete` whose transaction ran before this one cannot take this file: it
     // removes nothing unless the name was occupied while it still held the lock, and while the name
-    // is occupied this rename cannot have put anything there.
+    // is occupied this rename cannot have put anything there. One that takes the lock after this
+    // commit does remove the file published here, which is what deleting this observation means.
     let transaction = match conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
     {
         Ok(transaction) => transaction,
@@ -152,9 +153,11 @@ pub fn save(
             // the image would point recovery the wrong way. Nothing this program registered can
             // hold the name either — it writes one spelling per id and that spelling is this
             // row's — though a row planted with the same path spelled another way would survive
-            // the index, since SQLite compares TEXT as bytes while Windows resolves names without
-            // regard to case. That is a database disagreeing with itself, and it is the sweep that
-            // reports such a row rather than this branch.
+            // the index, since SQLite compares TEXT as bytes while an ordinary Windows directory
+            // resolves names without regard to case. On a directory marked case-sensitive, which
+            // `storage.data_dir` can be, those are two names and this rename never meets the other
+            // file at all. Either way it is a database disagreeing with itself, and it is the sweep
+            // that reports such a row rather than this branch.
             return Err(StoreError::ImageIo {
                 path: destination,
                 source: std::io::Error::from(std::io::ErrorKind::AlreadyExists),
@@ -204,10 +207,11 @@ pub fn save(
 /// is gone would charge its `byte_size` against a budget that is already free.
 ///
 /// Whether there is a file to remove is decided while the transaction still holds the lock. If the
-/// name is occupied, a `save` for the same observation racing this call finds it held and fails
-/// with [`StoreError::ImageIo`], because the rename refuses to replace. What that guarantees is only
-/// that no save can take the name before the removal is through; one arriving afterwards succeeds
-/// the first time. If the name is empty — a row whose file has already gone — nothing is
+/// name is occupied, a `save` for the same observation whose rename reaches that name before the
+/// removal does finds it held and fails with [`StoreError::ImageIo`], because the rename refuses to
+/// replace. What that guarantees is only that no save can take the name before the removal is
+/// through; one whose rename lands after it finds the name free and succeeds the first time. If the
+/// name is empty — a row whose file has already gone — nothing is
 /// removed at all, so a save that follows this commit keeps the file it renames into that name.
 ///
 /// Leaves the observation row alone: the OCR text and the payload are the point of the record and
@@ -284,8 +288,10 @@ pub fn delete(
     Ok(())
 }
 
-/// A file is removed only when nothing registered names it and the filesystem does not report it as
-/// one of the registered files under another spelling. Reports how many went.
+/// A file is removed only when nothing registered names it, it still resolves to the name it was
+/// listed under, and it is not what one of the registered names reaches. That last question is put
+/// to the registered names no enumerated file spelled and not to every row; the comment inside says
+/// what that leaves out and what asking about all of them would cost. Reports how many went.
 ///
 /// This is a startup operation and must not run while anything is saving: a file renamed into place
 /// but not yet registered is indistinguishable from an orphan.
@@ -299,10 +305,27 @@ pub fn sweep_orphan_files(
     // tree that is enumerated nor the baseline that tree is checked against. Resolving it after the
     // walk instead lets a name that was the image root while the files were listed be a link
     // somewhere else by the time they are compared, and every file under the replacement passes
-    // containment. A root that will not resolve is the ordinary state before the first save: there
-    // is nothing under it to sweep.
-    let Ok(root) = std::fs::canonicalize(root) else {
-        return Ok(0);
+    // containment.
+    let root = match std::fs::canonicalize(root) {
+        Ok(resolved) => resolved,
+        // Nothing there at all is the ordinary state before the first save and there is nothing to
+        // sweep, but that is a question about the entry and not about what it leads to.
+        // `canonicalize` cannot tell the two apart: measured 2026-08-01, a directory link whose
+        // target is gone answers `NotFound` exactly as an absent name does, while
+        // `symlink_metadata` reports the entry that is plainly there. That entry holds the name as
+        // far as every save is concerned — `create_dir_all` on it answers `AlreadyExists` — so a
+        // sweep calling it the state before the first save would report a clean pass on every
+        // startup while no image could be written at all. This is the rule the registered names
+        // below are already read by, facing the same way.
+        Err(source) => {
+            return match std::fs::symlink_metadata(root) {
+                Err(absent) if absent.kind() == std::io::ErrorKind::NotFound => Ok(0),
+                _ => Err(StoreError::ImageIo {
+                    path: root.to_path_buf(),
+                    source,
+                }),
+            };
+        }
     };
     let registered = registered_paths(conn)?;
     let mut files = Vec::new();
@@ -1575,6 +1598,27 @@ mod tests {
         assert_eq!(
             sweep_orphan_files(&conn, &root).expect("a sweep before the first save should succeed"),
             0
+        );
+    }
+
+    #[test]
+    fn a_root_whose_entry_is_there_and_will_not_resolve_is_reported() {
+        let (dir, conn, root) = database();
+        let nowhere = dir.path().join("nowhere");
+
+        // Creating a directory link needs Developer Mode or SeCreateSymbolicLinkPrivilege, so this
+        // case cannot be built everywhere the suite runs.
+        let Ok(()) = std::os::windows::fs::symlink_dir(&nowhere, &root) else {
+            return;
+        };
+
+        // `canonicalize` answers `NotFound` here, exactly as it does for a name that was never
+        // there — but this name is taken, and every save will fail on it until someone clears it.
+        let result = sweep_orphan_files(&conn, &root);
+
+        assert!(
+            matches!(result, Err(StoreError::ImageIo { .. })),
+            "{result:?}"
         );
     }
 
