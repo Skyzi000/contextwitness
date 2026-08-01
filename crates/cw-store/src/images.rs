@@ -362,7 +362,20 @@ pub fn sweep_orphan_files(
                     }
                 }
             }
-            return Ok(0);
+            // Nothing on the whole path is there, its anchor included. For a relative root that is
+            // the ordinary state before the first save: what holds it is the directory the process
+            // is in, and that is never one of these names — measured 2026-08-01, the last name
+            // `ancestors()` yields for a relative path is the empty one, which answers `NotFound`
+            // itself. For an absolute root it means the drive or the share the path is anchored to
+            // is not there, and `create_dir_all` creates a tail but never an anchor, so no image can
+            // ever be written here. Measured 2026-08-01 with an unmapped drive letter: every name on
+            // the path, `Z:\` included, answers `NotFound`, so the anchor's own absence is the only
+            // thing that separates this from a directory waiting to be created.
+            return if root.is_absolute() {
+                Err(unreadable)
+            } else {
+                Ok(0)
+            };
         }
     };
     let registered = registered_paths(conn)?;
@@ -1748,6 +1761,45 @@ mod tests {
         // directory holding it is an ordinary one — so nothing about this name has been shown to
         // be absent, and it needs no special privilege to arrange.
         let root = dir.path().join("im|ages");
+
+        let result = sweep_orphan_files(&conn, &root);
+
+        assert!(
+            matches!(result, Err(StoreError::ImageIo { .. })),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn a_relative_root_that_is_not_there_yet_removes_nothing() {
+        let (_dir, conn, _root) = database();
+        // `resolve_data_dir` hands back what was configured, so a relative `storage.data_dir` is
+        // something a user can write. Every name on such a path can be absent while the directory
+        // holding it — the one the process is in — is perfectly ordinary and is never among them,
+        // so running out of names says nothing here. This is the other side of the check that
+        // reports an absolute root whose drive is not there.
+        let root = std::path::PathBuf::from("cw-store-root-that-was-never-created");
+        assert!(!root.exists(), "the test would say nothing if this existed");
+
+        assert_eq!(
+            sweep_orphan_files(&conn, &root).expect("a relative root is simply not created yet"),
+            0
+        );
+    }
+
+    #[test]
+    fn a_root_anchored_to_a_drive_that_is_not_there_is_reported() {
+        let (_dir, conn, _root) = database();
+        // Any letter with no volume behind it. Measured 2026-08-01: every name on such a path
+        // answers `NotFound`, the anchor included, so this is the arrangement in which running out
+        // of names is the only signal there is.
+        let Some(letter) = ('D'..='Z').find(|letter| {
+            std::fs::symlink_metadata(format!("{letter}:\\"))
+                .is_err_and(|absent| absent.kind() == std::io::ErrorKind::NotFound)
+        }) else {
+            return;
+        };
+        let root = std::path::PathBuf::from(format!("{letter}:\\ContextWitness\\images"));
 
         let result = sweep_orphan_files(&conn, &root);
 
