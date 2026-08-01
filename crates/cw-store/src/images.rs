@@ -289,12 +289,27 @@ pub fn sweep_orphan_files(
     conn: &rusqlite::Connection,
     root: &std::path::Path,
 ) -> Result<usize, StoreError> {
+    // Resolved once, before anything is read, and every later step works from this spelling rather
+    // than from the name that was passed in — the walk descends from it and each candidate is
+    // compared against it, so giving the root's own name to a link afterwards moves neither the
+    // tree that is enumerated nor the baseline that tree is checked against. Resolving it after the
+    // walk instead lets a name that was the image root while the files were listed be a link
+    // somewhere else by the time they are compared, and every file under the replacement passes
+    // containment. A root that will not resolve is the ordinary state before the first save: there
+    // is nothing under it to sweep.
+    let Ok(root) = std::fs::canonicalize(root) else {
+        return Ok(0);
+    };
     let registered = registered_paths(conn)?;
     let mut files = Vec::new();
-    collect_files(root, &mut files)?;
-    sweep_collected_files(root, &registered, &files)
+    collect_files(&root, &mut files)?;
+    sweep_collected_files(&root, &registered, &files)
 }
 
+/// `root` must be spelled the way `canonicalize` answers. Every candidate is compared against it as
+/// a prefix, so a root spelled any other way puts every candidate outside it and the pass removes
+/// nothing. Resolving it here would resolve it after the caller's walk, which is the window this
+/// separation exists to close.
 fn sweep_collected_files(
     root: &std::path::Path,
     registered: &HashSet<String>,
@@ -330,16 +345,6 @@ fn sweep_collected_files(
         return Ok(0);
     }
 
-    // Every name here is resolved once to enumerate it and again to act on it, and a directory
-    // above it can be replaced in between: Windows follows a reparse point met partway along a
-    // path. No spelling protects against that. `checked_path` keeps a stored path from naming
-    // anything outside the image root, which is a statement about the string and not about where
-    // the string leads, so the only thing worth checking is what the filesystem answers with. A
-    // root that will not resolve leaves nothing that can be shown to be inside it.
-    let Ok(canonical_root) = std::fs::canonicalize(root) else {
-        return Ok(0);
-    };
-
     let spelled: HashSet<&str> = enumerated
         .iter()
         .map(|(_, relative)| relative.as_str())
@@ -371,7 +376,13 @@ fn sweep_collected_files(
         let Ok(identity) = std::fs::canonicalize(path) else {
             continue;
         };
-        if !identity.starts_with(&canonical_root) || unspelled_identities.contains(&identity) {
+        // Every name here is resolved once to enumerate it and again to act on it, and a directory
+        // above it can be replaced in between: Windows follows a reparse point met partway along a
+        // path. No spelling protects against that. `checked_path` keeps a stored path from naming
+        // anything outside the image root, which is a statement about the string and not about
+        // where the string leads, so the only thing worth checking is what the filesystem answers
+        // with — against a root the caller resolved before it read anything.
+        if !identity.starts_with(root) || unspelled_identities.contains(&identity) {
             continue;
         }
 
@@ -1426,14 +1437,61 @@ mod tests {
             return;
         };
 
+        // The root itself is an ordinary directory, so resolving it after the link exists answers
+        // the same as resolving it before.
+        let resolved = std::fs::canonicalize(&root).expect("the image root should resolve");
+
         // The name as it was enumerated, before the directory above it became a link. Nothing here
         // needs a race: the link can be in place before the sweep starts.
-        let enumerated = vec![redirected.join("orphan.webp")];
-        let removed = super::sweep_collected_files(&root, &HashSet::new(), &enumerated)
+        let enumerated = vec![resolved.join("2026").join("orphan.webp")];
+        let removed = super::sweep_collected_files(&resolved, &HashSet::new(), &enumerated)
             .expect("the sweep should succeed without removing anything");
 
         assert_eq!(removed, 0);
         assert!(victim.is_file());
+    }
+
+    #[test]
+    fn a_root_replaced_after_the_walk_does_not_redirect_the_sweep() {
+        let (dir, _conn, root) = database();
+        std::fs::create_dir_all(&root).expect("the image root should be creatable");
+        // What the caller resolves before it reads anything.
+        let resolved = std::fs::canonicalize(&root).expect("the image root should resolve");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).expect("the outside directory should be creatable");
+        let victim = outside.join("orphan.webp");
+        std::fs::write(&victim, b"a file this program has no business touching")
+            .expect("the outside file should be writable");
+        std::fs::rename(&root, dir.path().join("moved"))
+            .expect("the image root should be movable aside");
+
+        // Creating a directory link needs Developer Mode or SeCreateSymbolicLinkPrivilege, so this
+        // case cannot be built everywhere the suite runs.
+        let Ok(()) = std::os::windows::fs::symlink_dir(&outside, &root) else {
+            return;
+        };
+
+        // The whole root now leads elsewhere. A sweep that resolved it here rather than before its
+        // walk would take the replacement for its own baseline and find this file inside it.
+        let enumerated = vec![resolved.join("orphan.webp")];
+        let removed = super::sweep_collected_files(&resolved, &HashSet::new(), &enumerated)
+            .expect("the sweep should succeed without removing anything");
+
+        assert_eq!(removed, 0);
+        assert!(victim.is_file());
+    }
+
+    #[test]
+    fn a_sweep_of_a_root_that_is_not_there_yet_removes_nothing() {
+        let (_dir, conn, root) = database();
+
+        // Every startup before the first save finds no image root at all, and that is not a failure
+        // to report — it is a directory with nothing in it to sweep.
+        assert!(!root.exists());
+        assert_eq!(
+            sweep_orphan_files(&conn, &root).expect("a sweep before the first save should succeed"),
+            0
+        );
     }
 
     #[test]
@@ -1455,19 +1513,20 @@ mod tests {
 
         std::fs::write(&unregistered, b"not registered")
             .expect("the hand-placed file should be writable again");
+        let resolved = std::fs::canonicalize(&root).expect("the image root should resolve");
         let registered =
             super::registered_paths(&conn).expect("the registered paths should be readable");
         let mut files = Vec::new();
-        super::collect_files(&root, &mut files)
+        super::collect_files(&resolved, &mut files)
             .expect("the image tree should be collectable for both startups");
 
         assert_eq!(
-            sweep_collected_files(&root, &registered, &files)
+            sweep_collected_files(&resolved, &registered, &files)
                 .expect("the first startup sweep should succeed"),
             1
         );
         assert_eq!(
-            sweep_collected_files(&root, &registered, &files)
+            sweep_collected_files(&resolved, &registered, &files)
                 .expect("the second startup sweep should succeed"),
             0
         );

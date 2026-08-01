@@ -76,13 +76,14 @@ pub struct Config {
 #[serde(deny_unknown_fields)]
 #[serde(default)]
 pub struct CaptureConfig {
-    /// Seconds between capture attempts.
+    /// Seconds between capture attempts. At least 1.
     pub interval_secs: u64,
-    /// Per-pixel luma delta from 0 through 255.
+    /// Per-pixel luma delta, 0 through 254. A pixel counts as changed when it moves by strictly
+    /// more than this, so 255 would mean nothing ever changed and [`Config::validate`] refuses it.
     pub change_pixel_threshold: u8,
     /// Capture once more than this many logical pixels changed since the stored frame.
     pub change_area_logical_pixels: u32,
-    /// WebP encoding quality.
+    /// WebP encoding quality, 0 through 100.
     pub webp_quality: u8,
 }
 
@@ -171,7 +172,7 @@ impl Default for HindsightConfig {
 #[serde(deny_unknown_fields)]
 #[serde(default)]
 pub struct EpisodeConfig {
-    /// Duration of an episode window in minutes.
+    /// Duration of an episode window in minutes. At least 1.
     pub window_minutes: u32,
 }
 
