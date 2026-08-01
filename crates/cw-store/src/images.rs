@@ -362,16 +362,24 @@ pub fn sweep_orphan_files(
                     }
                 }
             }
-            // Nothing on the whole path is there, its anchor included. For a relative root that is
-            // the ordinary state before the first save: what holds it is the directory the process
-            // is in, and that is never one of these names — measured 2026-08-01, the last name
-            // `ancestors()` yields for a relative path is the empty one, which answers `NotFound`
-            // itself. For an absolute root it means the drive or the share the path is anchored to
-            // is not there, and `create_dir_all` creates a tail but never an anchor, so no image can
-            // ever be written here. Measured 2026-08-01 with an unmapped drive letter: every name on
-            // the path, `Z:\` included, answers `NotFound`, so the anchor's own absence is the only
-            // thing that separates this from a directory waiting to be created.
-            return if root.is_absolute() {
+            // Nothing on the whole path is there. What that means depends on whether the path
+            // names its own anchor. A root that names a drive or a share carries that anchor as
+            // one of these names, so running out of them says the anchor is absent too, and
+            // `create_dir_all` makes a tail but never an anchor — no image can ever be written
+            // there, and calling it the state before the first save would report a clean pass on
+            // every startup. A root that names none is held by the directory the process is in,
+            // which is never among these names — measured 2026-08-01, the last name `ancestors()`
+            // yields for such a path is the empty one, which answers `NotFound` itself — and that
+            // is the ordinary state before the first save. Whether the path is absolute is the
+            // wrong question to put here: measured 2026-08-01, `X:images` is anchored to drive X
+            // exactly as `X:\images` is and neither can be created, yet `is_absolute()` and
+            // `has_root()` are both false for the first while its leading component is a `Prefix`
+            // just the same. On a drive that is there this line is never reached, because `X:`
+            // answers `Ok` and is the deepest entry that exists.
+            return if matches!(
+                root.components().next(),
+                Some(std::path::Component::Prefix(_))
+            ) {
                 Err(unreadable)
             } else {
                 Ok(0)
@@ -1837,14 +1845,22 @@ mod tests {
         }) else {
             return;
         };
-        let root = std::path::PathBuf::from(format!("{letter}:\\ContextWitness\\images"));
+        // Both spellings that name that drive. `X:images` is relative to whatever the current
+        // directory on drive X is, so it is anchored to a volume exactly as `X:\images` is and
+        // neither of them can be created; measured 2026-08-01, Rust calls only the second one
+        // absolute, which is why the answer here is decided by the leading component instead.
+        for root in [
+            std::path::PathBuf::from(format!("{letter}:\\ContextWitness\\images")),
+            std::path::PathBuf::from(format!("{letter}:ContextWitness\\images")),
+        ] {
+            let result = sweep_orphan_files(&conn, &root);
 
-        let result = sweep_orphan_files(&conn, &root);
-
-        assert!(
-            matches!(result, Err(StoreError::ImageIo { .. })),
-            "{result:?}"
-        );
+            assert!(
+                matches!(result, Err(StoreError::ImageIo { .. })),
+                "{}: {result:?}",
+                root.display()
+            );
+        }
     }
 
     #[test]
