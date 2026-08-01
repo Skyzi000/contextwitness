@@ -6,8 +6,12 @@
 /// and can occasionally answer `ERROR_ACCESS_DENIED`; `storage.data_dir` may be a share and
 /// `%APPDATA%` may be redirected to one.
 const RENAMABLE_WRITE_ACCESS: u32 = 0x8000_0000 | 0x4000_0000 | 0x0001_0000;
-/// FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE. Everything is given away: holding a file
-/// open here is never a reason another process cannot use it.
+/// FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE — every shareable right given away, which
+/// is as much as a handle can offer and still not the same as not being open. Sharing is checked in
+/// both directions: measured 2026-08-01, a newcomer whose own share mode leaves out a right this
+/// handle holds is refused with a sharing violation (raw 32), so anything that opens files
+/// exclusively is locked out for as long as this is held. What is unaffected is reading the file
+/// with the sharing the standard library asks for, and renaming or removing it by name.
 const FULL_SHARE_MODE: u32 = 0x0000_0001 | 0x0000_0002 | 0x0000_0004;
 
 /// How many names are tried before giving up. Each attempt costs one failed `open`. Sixty-four
@@ -139,9 +143,10 @@ const REMOVABLE_ACCESS: u32 = 0x0001_0000;
 ///
 /// A name can be given to another file, and a directory above it can be replaced by a link, between
 /// deciding to remove something and removing it, so the caller holds the file it decided about.
-/// Measured 2026-08-01: this opens an ordinary file with DELETE alone, leaves it open to anyone
-/// else, and answers `PermissionDenied` for a directory — which is a guarantee to the caller that a
-/// directory can never be removed this way.
+/// Measured 2026-08-01: this opens an ordinary file with DELETE alone and answers `PermissionDenied`
+/// for a directory — which is a guarantee to the caller that a directory can never be removed this
+/// way. The file stays readable, renamable and removable by name while the handle is held; what
+/// holding it does cost anyone else is on `FULL_SHARE_MODE`.
 pub fn open_for_removal(path: &std::path::Path) -> std::io::Result<std::fs::File> {
     use std::os::windows::fs::OpenOptionsExt;
 
@@ -288,6 +293,24 @@ mod tests {
             b"someone else's"
         );
         std::fs::remove_file(&path).expect("the test file should be removable");
+    }
+
+    #[test]
+    fn a_file_held_for_removal_can_still_be_read_renamed_and_removed() {
+        let path = unique_temp_path("open-for-removal-shares");
+        std::fs::write(&path, b"an orphan").expect("the file should be writable");
+
+        let file = open_for_removal(&path).expect("an existing file should be openable to remove");
+
+        // These three are what the sweep needs from this handle and they are all it leaves alone:
+        // measured 2026-08-01, a newcomer whose share mode leaves out a right this handle holds is
+        // refused outright, so anything opening files exclusively is locked out meanwhile.
+        std::fs::File::open(&path).expect("a reader sharing what the library shares should get in");
+        let moved = unique_temp_path("open-for-removal-shares-moved");
+        std::fs::rename(&path, &moved).expect("the name should still be renamable");
+        std::fs::remove_file(&moved).expect("the file should still be removable by name");
+
+        drop(file);
     }
 
     #[test]

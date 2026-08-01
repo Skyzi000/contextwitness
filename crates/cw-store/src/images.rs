@@ -1777,22 +1777,29 @@ mod tests {
             ])
             .output();
         let Ok(output) = denied else {
+            // The tool never ran, so there is nothing to put back.
             return;
         };
+        // Every exit from here on has to put the entry back first, including the one taken when the
+        // arrangement did not come out as expected: what icacls applied before answering is not
+        // known, and measured 2026-08-01 a directory left holding that deny cannot be removed at
+        // all, so the temporary directory's own cleanup cannot clear it either.
+        let restore = || {
+            let _ = std::process::Command::new("icacls")
+                .args([path.as_str(), "/reset"])
+                .output();
+            let _ = std::process::Command::new("icacls")
+                .args([path.as_str(), "/remove:d", user.as_str()])
+                .output();
+        };
         if !output.status.success() || std::fs::canonicalize(&root).is_ok() {
+            restore();
             return;
         }
 
         let result = sweep_orphan_files(&conn, &root);
 
-        // Put it back before asserting: a failing assertion must not leave a directory the
-        // temporary directory cannot remove.
-        let _ = std::process::Command::new("icacls")
-            .args([path.as_str(), "/reset"])
-            .output();
-        let _ = std::process::Command::new("icacls")
-            .args([path.as_str(), "/remove:d", user.as_str()])
-            .output();
+        restore();
         drop(dir);
 
         assert!(
