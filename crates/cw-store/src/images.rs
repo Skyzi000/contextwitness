@@ -422,6 +422,16 @@ fn sweep_collected_files(
         if registered.contains(relative) {
             continue;
         }
+        // Opened before anything is decided, so that what goes at the end is the file this
+        // iteration examined. `remove_file` would resolve the name a third time — after the walk
+        // that listed it and after the `canonicalize` below — and a directory replaced above it in
+        // between sends the removal wherever the replacement leads. A candidate that cannot be
+        // opened is kept, for the same reason as one that cannot be resolved: two startups can
+        // reach the same orphan, and the one that arrives second has nothing left to do. Measured
+        // 2026-08-01, a directory cannot be opened this way at all, so no pass can remove one.
+        let Ok(file) = cw_core::atomic_file::open_for_removal(path) else {
+            continue;
+        };
         let Ok(identity) = std::fs::canonicalize(path) else {
             continue;
         };
@@ -441,13 +451,10 @@ fn sweep_collected_files(
             continue;
         }
 
-        // The check above required these to be one name, so this is both the name that was listed
-        // and the one the filesystem answered with.
-        match std::fs::remove_file(&identity) {
+        // Addressed to the handle opened above, so no name is resolved between the last check and
+        // the removal. `identity` is only what a failure is reported against.
+        match cw_core::atomic_file::delete_by_handle(&file) {
             Ok(()) => removed += 1,
-            // Two startups can collect the same orphan. The one that loses the removal race
-            // has nothing left to do, rather than a reason to abort.
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
             Err(source) => {
                 return Err(StoreError::ImageIo {
                     path: identity,
@@ -1737,6 +1744,45 @@ mod tests {
             )
             .expect("the image count should be readable");
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn a_registered_name_that_is_a_link_to_its_image_is_not_reported() {
+        let (dir, mut conn, root) = database();
+        let id = ulid::Ulid::new();
+        let relative = save_test_image(&mut conn, &root, id, at(2026, 7, 30), 91);
+        let registered = root.join(&relative);
+        let moved = dir.path().join("moved.webp");
+        std::fs::rename(&registered, &moved).expect("the image should be movable aside");
+
+        // Creating a symlink needs Developer Mode or SeCreateSymbolicLinkPrivilege, so this case
+        // cannot be built everywhere the suite runs.
+        let Ok(()) = std::os::windows::fs::symlink_file(&moved, &registered) else {
+            return;
+        };
+
+        // The row still reaches its picture, which is all a registered name has to do.
+        assert!(
+            orphan_rows(&conn, &root)
+                .expect("the report should succeed")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_registered_name_held_by_a_directory_is_reported() {
+        let (_dir, mut conn, root) = database();
+        let id = ulid::Ulid::new();
+        let relative = save_test_image(&mut conn, &root, id, at(2026, 7, 30), 92);
+        let registered = root.join(&relative);
+        std::fs::remove_file(&registered).expect("the image should be removable");
+        std::fs::create_dir(&registered).expect("a directory should take the freed name");
+
+        // Something is there under that name and it is not this row's picture.
+        assert_eq!(
+            orphan_rows(&conn, &root).expect("the report should succeed"),
+            vec![relative]
+        );
     }
 
     #[test]

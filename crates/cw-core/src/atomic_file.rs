@@ -6,8 +6,9 @@
 /// and can occasionally answer `ERROR_ACCESS_DENIED`; `storage.data_dir` may be a share and
 /// `%APPDATA%` may be redirected to one.
 const RENAMABLE_WRITE_ACCESS: u32 = 0x8000_0000 | 0x4000_0000 | 0x0001_0000;
-/// FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE.
-const TEMPORARY_SHARE_MODE: u32 = 0x0000_0001 | 0x0000_0002 | 0x0000_0004;
+/// FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE. Everything is given away: holding a file
+/// open here is never a reason another process cannot use it.
+const FULL_SHARE_MODE: u32 = 0x0000_0001 | 0x0000_0002 | 0x0000_0004;
 
 /// How many names are tried before giving up. Each attempt costs one failed `open`. Sixty-four
 /// leftovers from earlier runs — the process id in the name repeats — would exhaust it with nothing
@@ -38,7 +39,7 @@ pub fn create_temporary_beside(
             .write(true)
             .create_new(true)
             .access_mode(RENAMABLE_WRITE_ACCESS)
-            .share_mode(TEMPORARY_SHARE_MODE)
+            .share_mode(FULL_SHARE_MODE)
             .open(&temporary)
         {
             Ok(file) => return Ok((temporary, file)),
@@ -130,6 +131,26 @@ pub fn rename_without_replacing(
     }
 }
 
+/// DELETE. Enough to remove the file through the handle and nothing else; the file is not read and
+/// not written.
+const REMOVABLE_ACCESS: u32 = 0x0001_0000;
+
+/// Open an existing file so that it can be removed through the handle rather than through its name.
+///
+/// A name can be given to another file, and a directory above it can be replaced by a link, between
+/// deciding to remove something and removing it, so the caller holds the file it decided about.
+/// Measured 2026-08-01: this opens an ordinary file with DELETE alone, leaves it open to anyone
+/// else, and answers `PermissionDenied` for a directory — which is a guarantee to the caller that a
+/// directory can never be removed this way.
+pub fn open_for_removal(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    std::fs::OpenOptions::new()
+        .access_mode(REMOVABLE_ACCESS)
+        .share_mode(FULL_SHARE_MODE)
+        .open(path)
+}
+
 /// Remove the file this handle refers to, whatever name it answers to by now.
 ///
 /// A name can be given to another file between deciding to remove one and removing it, and every
@@ -193,7 +214,7 @@ mod tests {
             .create(true)
             .truncate(true)
             .access_mode(RENAMABLE_WRITE_ACCESS)
-            .share_mode(TEMPORARY_SHARE_MODE)
+            .share_mode(FULL_SHARE_MODE)
             .open(&temporary)
             .expect("the temporary config should be openable");
         std::io::Write::write_all(&mut file, DEFAULT_CONFIG_TOML.as_bytes())
@@ -244,6 +265,29 @@ mod tests {
             b"someone else's"
         );
         std::fs::remove_file(&destination).expect("the test file should be removable");
+    }
+
+    #[test]
+    fn a_file_opened_for_removal_goes_and_the_name_stays() {
+        let path = unique_temp_path("open-for-removal");
+        std::fs::write(&path, b"an orphan").expect("the file should be writable");
+
+        let file = open_for_removal(&path).expect("an existing file should be openable to remove");
+
+        // Another party moves it aside and puts a different file at its name.
+        let moved = unique_temp_path("open-for-removal-moved");
+        std::fs::rename(&path, &moved).expect("the file should be movable");
+        std::fs::write(&path, b"someone else's").expect("the freed name should be writable");
+
+        delete_by_handle(&file).expect("the file this handle holds should be removable");
+        drop(file);
+
+        assert!(!moved.exists(), "the file that was opened should be gone");
+        assert_eq!(
+            std::fs::read(&path).expect("the file at the name should still be there"),
+            b"someone else's"
+        );
+        std::fs::remove_file(&path).expect("the test file should be removable");
     }
 
     #[test]
