@@ -148,12 +148,16 @@ pub enum StoreError {
         /// Observation the frame belongs to.
         id: String,
     },
-    /// Reading, writing or enumerating something under the image root failed.
-    #[error("image path {path} could not be read, written or enumerated: {source}")]
+    /// An operation on a path under the image root failed. Deliberately not a list of which ones:
+    /// this is raised for creating, writing, syncing, renaming, reading, enumerating and removing,
+    /// and for a listed file that turns out not to be under the root at all, and every list of them
+    /// written here so far has been shorter than the set. Which operation it was is what `source`
+    /// carries.
+    #[error("an operation on image path {path} failed: {source}")]
     ImageIo {
-        /// What this call was about: an image file, or a directory it was creating, reading or
-        /// enumerating. Where a name was reserved rather than chosen — the temporary a publish
-        /// writes into — this is the destination, which is the only name the caller can act on.
+        /// What this call was about: an image file, or a directory on the way to one. Where a name
+        /// was reserved rather than chosen — the temporary a publish writes into — this is the
+        /// destination, which is the only name the caller can act on.
         path: PathBuf,
         /// Underlying filesystem error.
         source: std::io::Error,
