@@ -305,13 +305,15 @@ pub fn sweep_orphan_files(
     conn: &rusqlite::Connection,
     root: &std::path::Path,
 ) -> Result<usize, StoreError> {
-    // Resolved once, before anything is read, and every later step works from this spelling rather
-    // than from the name that was passed in — the walk descends from it and each candidate is
-    // compared against it, so giving the root's own name to a link afterwards moves neither the
-    // tree that is enumerated nor the baseline that tree is checked against. Resolving it after the
-    // walk instead lets a name that was the image root while the files were listed be a link
-    // somewhere else by the time they are compared, and every file under the replacement passes
-    // containment.
+    // Resolved once, before anything is read, so that the baseline every candidate is compared
+    // against is the one taken here rather than one taken after the walk. What this does not do is
+    // pin the tree that gets enumerated: what is held is a path and not a handle, so `collect_files`
+    // resolves this spelling again and a link put at the root's name in between is followed. What
+    // keeps that from costing anything is the per-candidate check further down — a file listed
+    // under the replacement does not resolve to the name it was listed under, so it is kept. That
+    // check is load-bearing here and not merely a second opinion. Resolving the root after the walk
+    // would move the baseline itself, and then every file under the replacement would compare as
+    // though it belonged here.
     let root = match std::fs::canonicalize(root) {
         Ok(resolved) => resolved,
         // Nothing there at all is the ordinary state before the first save and there is nothing to
@@ -467,15 +469,14 @@ fn sweep_collected_files(
         }
 
         // Addressed to the handle opened above, so no name is resolved between the last check and
-        // the removal. `identity` is only what a failure is reported against.
-        match cw_core::atomic_file::delete_by_handle(&file) {
-            Ok(()) => removed += 1,
-            Err(source) => {
-                return Err(StoreError::ImageIo {
-                    path: identity,
-                    source,
-                });
-            }
+        // the removal. A candidate that will not go is kept and the pass carries on, for the same
+        // reason as one that cannot be opened or resolved: a single file must not decide whether
+        // every other orphan is collected, and a file that fails the same way on every startup
+        // would mean none of them ever are. Measured 2026-08-01, that is reachable with no race and
+        // no privilege — a read-only file opens for removal and then answers `PermissionDenied` to
+        // the disposition call. It is not counted, because the count is of files that went.
+        if cw_core::atomic_file::delete_by_handle(&file).is_ok() {
+            removed += 1;
         }
     }
 
@@ -1811,6 +1812,35 @@ mod tests {
             matches!(result, Err(StoreError::ImageIo { .. })),
             "{result:?}"
         );
+    }
+
+    #[test]
+    fn an_orphan_that_will_not_go_does_not_stop_the_others() {
+        let (_dir, conn, root) = database();
+        std::fs::create_dir_all(&root).expect("the image root should be creatable");
+        let stubborn = root.join("stubborn.webp");
+        let ordinary = root.join("ordinary.webp");
+        std::fs::write(&stubborn, b"an orphan").expect("the file should be writable");
+        std::fs::write(&ordinary, b"an orphan").expect("the file should be writable");
+        // Measured 2026-08-01: this file opens for removal and then refuses the disposition call
+        // with `PermissionDenied`, which is the reachable form of a candidate that will not go.
+        let mut attributes = std::fs::metadata(&stubborn)
+            .expect("the file should be there")
+            .permissions();
+        attributes.set_readonly(true);
+        std::fs::set_permissions(&stubborn, attributes).expect("the attribute should be settable");
+
+        // The attribute is left set on purpose and nothing here puts it back: measured 2026-08-01,
+        // `std::fs::remove_file` clears it and succeeds, so the temporary directory can still take
+        // the file away — which is the same difference this test is about.
+        let removed = sweep_orphan_files(&conn, &root);
+
+        assert_eq!(
+            removed.expect("one file that will not go must not fail the pass"),
+            1
+        );
+        assert!(stubborn.exists(), "the one that will not go should be kept");
+        assert!(!ordinary.exists(), "the other one should have gone");
     }
 
     #[test]
