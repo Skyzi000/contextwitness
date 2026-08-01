@@ -1764,6 +1764,17 @@ mod tests {
             return;
         };
         let path = root.to_string_lossy().to_string();
+        // Defined before the deny is applied, because the exit taken when `icacls` cannot be waited
+        // on needs it too. Both calls discard their result and neither changes anything on a
+        // directory that was never denied, so this is safe to run whether or not it was.
+        let restore = || {
+            let _ = std::process::Command::new("icacls")
+                .args([path.as_str(), "/reset"])
+                .output();
+            let _ = std::process::Command::new("icacls")
+                .args([path.as_str(), "/remove:d", user.as_str()])
+                .output();
+        };
         // std has no way to set an ACL and this crate may hold no `unsafe`, so the check is asked
         // of the tool Windows ships with. Measured 2026-08-01: after this, `canonicalize` answers
         // `PermissionDenied` while `metadata` still answers that it is a directory — the one state
@@ -1776,21 +1787,13 @@ mod tests {
                 "/inheritance:r",
             ])
             .output();
+        // `Err` here does not mean the tool never ran: the standard library spawns the child first
+        // and the wait that follows is fallible on its own, so the deny may already be applied.
+        // Measured 2026-08-01, a directory left holding it cannot be removed by anything, so this
+        // exit puts it back rather than deciding which of the two happened.
         let Ok(output) = denied else {
-            // The tool never ran, so there is nothing to put back.
+            restore();
             return;
-        };
-        // Every exit from here on has to put the entry back first, including the one taken when the
-        // arrangement did not come out as expected: what icacls applied before answering is not
-        // known, and measured 2026-08-01 a directory left holding that deny cannot be removed at
-        // all, so the temporary directory's own cleanup cannot clear it either.
-        let restore = || {
-            let _ = std::process::Command::new("icacls")
-                .args([path.as_str(), "/reset"])
-                .output();
-            let _ = std::process::Command::new("icacls")
-                .args([path.as_str(), "/remove:d", user.as_str()])
-                .output();
         };
         if !output.status.success() || std::fs::canonicalize(&root).is_ok() {
             restore();
