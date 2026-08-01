@@ -1758,7 +1758,7 @@ mod tests {
 
     #[test]
     fn a_root_that_is_a_directory_no_one_may_open_is_reported() {
-        let (dir, conn, root) = database();
+        let (_dir, conn, root) = database();
         std::fs::create_dir(&root).expect("the image root should be creatable");
         let Ok(user) = std::env::var("USERNAME") else {
             return;
@@ -1799,8 +1799,10 @@ mod tests {
 
         let result = sweep_orphan_files(&conn, &root);
 
+        // Nothing is dropped by hand here. The temporary directory has to outlive the connection
+        // that holds `db.sqlite3` open, and leaving the scope — including by unwinding out of the
+        // assertion below — already drops them in that order.
         restore();
-        drop(dir);
 
         assert!(
             matches!(result, Err(StoreError::ImageIo { .. })),
