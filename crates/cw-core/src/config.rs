@@ -191,7 +191,7 @@ pub struct ActivityWatchConfig {
     pub enabled: bool,
 }
 
-/// Errors produced while loading or resolving configuration.
+/// Errors produced while reading, writing or resolving configuration.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     /// Reading an existing configuration file failed.
@@ -599,15 +599,24 @@ mod tests {
     #[test]
     fn validate_accepts_the_smallest_and_largest_values_each_bound_allows() {
         // Each refusal above says only that one value is out; it cannot tell the intended bound
-        // from one narrowed by a step, and a user is entitled to every value asserted here.
+        // from one narrowed by a step, and a user is entitled to every value asserted here. The
+        // top of the pixel threshold has its own test above and is not repeated.
         let mut config = Config::default();
         config.capture.interval_secs = 1;
+        config.capture.change_pixel_threshold = 0;
+        config.capture.webp_quality = 0;
         config.episode.window_minutes = 1;
+        config.hindsight.bank_id = "x".to_owned();
+
+        config
+            .validate()
+            .expect("the smallest value every bound allows should be accepted");
+
         config.capture.webp_quality = 100;
 
         config
             .validate()
-            .expect("the tightest capture interval, window and highest quality should be accepted");
+            .expect("the highest encoding quality should be accepted");
     }
 
     #[test]

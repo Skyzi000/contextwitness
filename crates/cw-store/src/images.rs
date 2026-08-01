@@ -147,11 +147,14 @@ pub fn save(
         Ok(true) => {}
         Ok(false) => {
             discard_written_file(&file, &destination)?;
-            // Not `ImageAlreadyRegistered`: the insert above has already succeeded, so this
-            // observation has no row. Whatever holds the name is unregistered — the file a
-            // crash between this rename and the commit leaves behind, or something this
-            // program did not write — and saying the database already knows about it would
-            // point recovery the wrong way.
+            // Not `ImageAlreadyRegistered`: the insert above has already succeeded, so once this
+            // rolls back the observation has no row, and saying the database already knows about
+            // the image would point recovery the wrong way. Nothing this program registered can
+            // hold the name either — it writes one spelling per id and that spelling is this
+            // row's — though a row planted with the same path spelled another way would survive
+            // the index, since SQLite compares TEXT as bytes while Windows resolves names without
+            // regard to case. That is a database disagreeing with itself, and it is the sweep that
+            // reports such a row rather than this branch.
             return Err(StoreError::ImageIo {
                 path: destination,
                 source: std::io::Error::from(std::io::ErrorKind::AlreadyExists),

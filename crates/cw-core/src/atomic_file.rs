@@ -94,8 +94,12 @@ pub fn rename_without_replacing(
     // Creating the destination first and filling it afterwards is no better — the name exists
     // before the content does, so a concurrent `setup` is told the config is ready, writes the
     // user's settings into the empty shell, and has them replaced a moment later. Renaming by
-    // handle with ReplaceIfExists = FALSE is the only operation that makes the name appear
-    // already holding the full template, and it works on exFAT as well as NTFS (both measured).
+    // handle with ReplaceIfExists = FALSE makes the name appear already holding the full template,
+    // and it works on exFAT as well as NTFS (both measured). It is not the only call that would
+    // refuse a taken destination — measured 2026-08-01, `MoveFileExW` with no flags answers
+    // `ERROR_ALREADY_EXISTS` and leaves both files as they were. What the handle adds is that it
+    // moves the file this call opened, rather than whatever its source name has come to mean by
+    // now.
     let destination = std::path::absolute(destination)?;
     let destination: Vec<u16> = destination.as_os_str().encode_wide().collect();
     let name_bytes = destination.len() * std::mem::size_of::<u16>();
