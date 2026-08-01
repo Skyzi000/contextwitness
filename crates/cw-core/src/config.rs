@@ -1,4 +1,4 @@
-use crate::atomic_file::{create_temporary_beside, rename_without_replacing};
+use crate::atomic_file::{create_temporary_beside, delete_by_handle, rename_without_replacing};
 use serde::{Deserialize, Serialize};
 
 /// Commented TOML listing every setting at its built-in default. Written on first run so the
@@ -311,7 +311,7 @@ impl Config {
             })?;
         }
 
-        let (temporary, mut file) =
+        let (_temporary, mut file) =
             create_temporary_beside(path).map_err(|source| ConfigError::Write {
                 path: path.to_path_buf(),
                 source,
@@ -320,10 +320,9 @@ impl Config {
             .and_then(|()| file.sync_all());
         if let Err(source) = write_result {
             // Left behind, this looks like a stale config to anyone reading the directory, and it
-            // accumulates on every failed first run. The handle holds the DELETE right, so
-            // unlinking while it is open leaves no moment in which another opener can keep the
-            // name.
-            let _ = std::fs::remove_file(&temporary);
+            // accumulates on every failed first run. Addressed to the handle, so what is discarded
+            // is the file this call wrote and not whatever the name has come to mean.
+            let _ = delete_by_handle(&file);
             drop(file);
             return Err(ConfigError::Write {
                 path: path.to_path_buf(),
@@ -334,12 +333,12 @@ impl Config {
         match rename_without_replacing(&file, path) {
             Ok(true) => Ok(true),
             Ok(false) => {
-                let _ = std::fs::remove_file(&temporary);
+                let _ = delete_by_handle(&file);
                 drop(file);
                 Ok(false)
             }
             Err(error) => {
-                let _ = std::fs::remove_file(&temporary);
+                let _ = delete_by_handle(&file);
                 drop(file);
                 Err(ConfigError::Write {
                     path: path.to_path_buf(),

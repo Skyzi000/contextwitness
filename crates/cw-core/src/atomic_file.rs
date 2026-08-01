@@ -126,6 +126,35 @@ pub fn rename_without_replacing(
     }
 }
 
+/// Remove the file this handle refers to, whatever name it answers to by now.
+///
+/// A name can be given to another file between deciding to remove one and removing it, and every
+/// caller here is holding the file it means. Measured 2026-08-01: with the published file moved
+/// aside and a different file put at its name, this removes the one that was written and leaves the
+/// other, while `remove_file` on the name does the opposite. The entry disappears when the last
+/// handle closes rather than at once, so a caller that needs the name free again must drop the file
+/// first — every caller here is on its way out.
+pub fn delete_by_handle(file: &std::fs::File) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::{
+        Foundation::HANDLE,
+        Storage::FileSystem::{
+            FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle,
+        },
+    };
+
+    let info = FILE_DISPOSITION_INFO { DeleteFile: true };
+    let result = unsafe {
+        SetFileInformationByHandle(
+            HANDLE(file.as_raw_handle()),
+            FileDispositionInfo,
+            std::ptr::addr_of!(info).cast(),
+            std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+        )
+    };
+    result.map_err(io_error)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,6 +214,32 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&temp_dir).expect("the rename test directory should be removable");
+    }
+
+    #[test]
+    fn deleting_through_the_handle_takes_the_file_and_not_the_name() {
+        let destination = unique_temp_path("delete-by-handle");
+        let (_temporary, file) =
+            create_temporary_beside(&destination).expect("the temporary should be reservable");
+        assert!(
+            rename_without_replacing(&file, &destination).expect("the publish should succeed"),
+            "the destination should have been free"
+        );
+
+        // Another party moves the published file aside and puts a different one at its name.
+        let moved = unique_temp_path("delete-by-handle-moved");
+        std::fs::rename(&destination, &moved).expect("the published file should be movable");
+        std::fs::write(&destination, b"someone else's").expect("the freed name should be writable");
+
+        delete_by_handle(&file).expect("the file this handle holds should be removable");
+        drop(file);
+
+        assert!(!moved.exists(), "the file this handle wrote should be gone");
+        assert_eq!(
+            std::fs::read(&destination).expect("the file at the name should still be there"),
+            b"someone else's"
+        );
+        std::fs::remove_file(&destination).expect("the test file should be removable");
     }
 
     #[test]

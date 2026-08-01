@@ -86,7 +86,7 @@ pub fn save(
         source,
     })?;
 
-    let (temporary, mut file) = cw_core::atomic_file::create_temporary_beside(&destination)
+    let (_temporary, mut file) = cw_core::atomic_file::create_temporary_beside(&destination)
         .map_err(|source| StoreError::ImageIo {
             path: destination.clone(),
             source,
@@ -94,12 +94,12 @@ pub fn save(
     let write_result =
         std::io::Write::write_all(&mut file, &encoded).and_then(|()| file.sync_all());
     if let Err(source) = write_result {
-        // The handle holds the DELETE right, so unlinking while it is open leaves no moment in
-        // which another opener can keep the name.
-        remove_image_file(&temporary)?;
+        // Addressed to the handle and not to a name: nothing else in this function needs to know
+        // what the temporary was called.
+        discard_written_file(&file, &destination)?;
         drop(file);
         return Err(StoreError::ImageIo {
-            path: temporary,
+            path: destination,
             source,
         });
     }
@@ -115,7 +115,7 @@ pub fn save(
     {
         Ok(transaction) => transaction,
         Err(source) => {
-            remove_image_file(&temporary)?;
+            discard_written_file(&file, &destination)?;
             return Err(StoreError::Sql { source });
         }
     };
@@ -136,7 +136,7 @@ pub fn save(
                 .get::<_, i64>(0)),
             Ok(1..)
         );
-        remove_image_file(&temporary)?;
+        discard_written_file(&file, &destination)?;
         if already_registered {
             return Err(StoreError::ImageAlreadyRegistered { id: id_text });
         }
@@ -146,7 +146,7 @@ pub fn save(
     match cw_core::atomic_file::rename_without_replacing(&file, &destination) {
         Ok(true) => {}
         Ok(false) => {
-            remove_image_file(&temporary)?;
+            discard_written_file(&file, &destination)?;
             // Not `ImageAlreadyRegistered`: the insert above has already succeeded, so this
             // observation has no row. Whatever holds the name is unregistered — the file a
             // crash between this rename and the commit leaves behind, or something this
@@ -158,7 +158,7 @@ pub fn save(
             });
         }
         Err(source) => {
-            remove_image_file(&temporary)?;
+            discard_written_file(&file, &destination)?;
             return Err(StoreError::ImageIo {
                 path: destination,
                 source,
@@ -169,7 +169,7 @@ pub fn save(
     // The rename is a metadata change on this handle, and Windows buffers those; closing the
     // handle does not push them.
     if let Err(source) = file.sync_all() {
-        remove_image_file(&destination)?;
+        discard_written_file(&file, &destination)?;
         return Err(StoreError::ImageIo {
             path: destination,
             source,
@@ -177,7 +177,7 @@ pub fn save(
     }
 
     if let Err(source) = transaction.commit() {
-        remove_image_file(&destination)?;
+        discard_written_file(&file, &destination)?;
         return Err(StoreError::Sql { source });
     }
     drop(file);
@@ -446,9 +446,14 @@ pub fn orphan_rows(
     Ok(orphaned)
 }
 
-fn remove_image_file(path: &std::path::Path) -> Result<(), StoreError> {
-    std::fs::remove_file(path).map_err(|source| StoreError::ImageIo {
-        path: path.to_path_buf(),
+/// Discard the file `save` wrote, whichever name it answers to now. `destination` is only what the
+/// failure is reported against; nothing is looked up by it.
+fn discard_written_file(
+    file: &std::fs::File,
+    destination: &std::path::Path,
+) -> Result<(), StoreError> {
+    cw_core::atomic_file::delete_by_handle(file).map_err(|source| StoreError::ImageIo {
+        path: destination.to_path_buf(),
         source,
     })
 }
@@ -689,6 +694,42 @@ mod tests {
             created_at,
             timestamp::to_sql(taken_at).expect("the test timestamp should be spellable")
         );
+    }
+
+    #[test]
+    fn a_save_that_cannot_take_the_write_lock_leaves_no_file_behind() {
+        let (dir, mut conn, root) = database();
+        let id = ulid::Ulid::new();
+        insert_observation(&conn, id, at(2026, 7, 30));
+
+        // Another connection holds the write lock this save needs, and this one is told not to wait
+        // for it, so the transaction cannot begin at all — after the temporary has been reserved
+        // and written.
+        let mut blocker =
+            db::open(&dir.path().join("db.sqlite3")).expect("a second connection should open");
+        let held = blocker
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .expect("the second connection should take the write lock");
+        conn.busy_timeout(std::time::Duration::ZERO)
+            .expect("the busy timeout should be settable");
+
+        let result = save(
+            &mut conn,
+            &root,
+            id,
+            &pixels(7),
+            WIDTH,
+            HEIGHT,
+            75.0,
+            at(2026, 7, 30),
+        );
+
+        assert!(matches!(result, Err(StoreError::Sql { .. })), "{result:?}");
+        drop(held);
+        let mut left_behind = Vec::new();
+        super::collect_files(&root, &mut left_behind)
+            .expect("the image tree should be collectable");
+        assert!(left_behind.is_empty(), "{left_behind:?}");
     }
 
     #[test]
