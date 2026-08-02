@@ -311,14 +311,14 @@ pub fn sweep_orphan_files(
         // to, and it has to be put to the whole path rather than to its last component.
         // `canonicalize` answers `NotFound` for a name that was never there, for a link whose target
         // is gone, and for a path leading through either of those, and the raw code does not
-        // separate them either. What decides is the deepest entry that does
-        // exist: none at all, or a directory, and the rest of the path is simply not created yet;
-        // anything else, and no image can ever be written here — `create_dir_all` answers
-        // `AlreadyExists` — so calling it the state before the first save would report a clean
-        // pass on every startup of a store that cannot work at all. The registered names below are
-        // read by a weaker rule on purpose: `canonicalize` answering `NotFound` is taken as absent
-        // there without asking about the entry, because that loop only needs to know which file a
-        // row names, and a name leading nowhere names none. This root has to be walked.
+        // separate them either. What decides is the deepest entry that does exist: none at all, or a
+        // directory, and the rest of the path is simply not created yet; anything else, and no image
+        // can ever be written here — `create_dir_all` answers `AlreadyExists` — so calling it the
+        // state before the first save would report a clean pass on every startup of a store that
+        // cannot work at all. The registered names below are read by a weaker rule on purpose:
+        // `canonicalize` answering `NotFound` is taken as absent there without asking about the
+        // entry, because that loop only needs to know which file a row names, and a name leading
+        // nowhere names none. This root has to be walked.
         Err(source) => {
             let unreadable = StoreError::ImageIo {
                 path: root.to_path_buf(),
@@ -399,14 +399,14 @@ fn sweep_collected_files(
     // the rows whose file, if it is there at all, is under some other name. On the ordinary
     // directory nothing reaches this point, because every enumerated file is registered under the
     // name it was enumerated with. `canonicalize` answers with the name actually on disk, so two
-    // spellings of one file agree. A candidate whose identity cannot be
-    // established is kept: leaving a leftover costs disk, and removing a registered image costs the
-    // picture. Asking only about the names no enumerated file spelled is a cost decision and it
-    // leaves something out — a registered name that was an ordinary file when it was enumerated and
-    // has become a link by the time this runs is not asked about, so the file it now reaches can be
-    // taken as an orphan. Asking about every registered name instead is a filesystem round trip per
-    // row, which at a hundred thousand images is tens of seconds of startup, paid whenever anything
-    // unregistered is under the root at all.
+    // spellings of one file agree. A candidate whose identity cannot be established is kept: leaving
+    // a leftover costs disk, and removing a registered image costs the picture. Asking only about
+    // the names no enumerated file spelled is a cost decision and it leaves something out — a
+    // registered name that was an ordinary file when it was enumerated and has become a link by the
+    // time this runs is not asked about, so the file it now reaches can be taken as an orphan.
+    // Asking about every registered name instead is a filesystem round trip per row, which at a
+    // hundred thousand images is tens of seconds of startup, paid whenever anything unregistered is
+    // under the root at all.
     let mut enumerated = Vec::with_capacity(files.len());
     for path in files {
         let relative = path_relative_to_root(root, path)?;
@@ -468,10 +468,10 @@ fn sweep_collected_files(
         // when it was listed, and an ordinary file resolves to the name it was listed under.
         // Every listed file canonicalizes to its own listed path — a hardlink, a non-ASCII name,
         // names with spaces and dots and deep nesting all do — while a name reached through a
-        // directory link does not. Anything
-        // answering differently is no longer what was listed, and what it now reaches may be a
-        // registered image. This settles containment too: every listed name is under the root by
-        // construction, so a candidate that is its own name is inside the root.
+        // directory link does not. Anything answering differently is no longer what was listed, and
+        // what it now reaches may be a registered image. This settles containment too: every listed
+        // name is under the root by construction, so a candidate that is its own name is inside the
+        // root.
         if identity.as_path() != path.as_path() || unspelled_identities.contains(&identity) {
             continue;
         }
