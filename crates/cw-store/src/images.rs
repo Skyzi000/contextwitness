@@ -125,13 +125,12 @@ pub fn save(
         INSERT_IMAGE,
         rusqlite::params![id_text, relative, byte_size, created_at],
     ) {
-        // Measured 2026-07-31: an identical retry violates both indexes and SQLite reports the path
-        // index, `SQLITE_CONSTRAINT_UNIQUE` — and so does another observation's row already holding
-        // this path, which is a database that disagrees with itself rather than a retry. The code
-        // alone cannot separate them, so the row is asked for instead; a constraint violation aborts
-        // the statement and leaves the transaction usable. A count that cannot be taken leaves the
-        // original error to speak for itself, because nothing has established that anything is
-        // registered.
+        // Two different states raise the same `SQLITE_CONSTRAINT_UNIQUE` on the path index: an
+        // identical retry, and another observation's row already holding this path, which is a
+        // database that disagrees with itself. The error alone does not separate them, so the row
+        // is asked for instead — a constraint violation aborts the statement and leaves the
+        // transaction usable. A count that cannot be taken leaves the original error to speak for
+        // itself, because nothing has established that anything is registered.
         let already_registered = matches!(
             transaction.query_one(COUNT_IMAGE_BY_ID, [id_text.as_str()], |row| row
                 .get::<_, i64>(0)),
@@ -152,12 +151,8 @@ pub fn save(
             // rolls back the observation has no row, and saying the database already knows about
             // the image would point recovery the wrong way. Nothing this program registered can
             // hold the name either — it writes one spelling per id and that spelling is this
-            // row's — though a row planted with the same path spelled another way would survive
-            // the index, since SQLite compares TEXT as bytes while an ordinary Windows directory
-            // resolves names without regard to case. On a directory marked case-sensitive, which
-            // `storage.data_dir` can be, those are two names and this rename never meets the other
-            // file at all. Either way it is a database disagreeing with itself, and it is the sweep
-            // that reports such a row rather than this branch.
+            // row's. A row naming this file by some other spelling would survive the index and is
+            // a database disagreeing with itself, which the sweep reports rather than this branch.
             return Err(StoreError::ImageIo {
                 path: destination,
                 source: std::io::Error::from(std::io::ErrorKind::AlreadyExists),
@@ -202,15 +197,12 @@ pub fn save(
 /// This is an explicit request for one image, so it removes the row even when the file has already
 /// gone: the rule that a row without its file is reported and kept binds [`orphan_rows`] and
 /// [`sweep_orphan_files`], which run on their own and must never decide a picture is expendable.
-/// The observation, its OCR text and its payload are untouched. Nothing records that the image
-/// existed once this row is gone, and that is the point: retention removes an image to reclaim
-/// space, and a row kept for a file that is gone would keep charging its `byte_size` against a
-/// budget that is already free.
+/// Nothing records that the image existed once this row is gone, and that is deliberate.
 ///
 /// The row is committed before the file is removed, so a failure in between leaves an unregistered
 /// file for the next sweep rather than a row whose file is gone. That is the residue worth having:
 /// the failure this has to survive is a full disk during retention, and a row kept for a file that
-/// is gone would charge its `byte_size` against a budget that is already free.
+/// is gone would go on charging its `byte_size` against a budget that is already free.
 ///
 /// Whether there is a file to remove is decided while the transaction still holds the lock. If the
 /// name is occupied, a `save` for the same observation whose rename reaches that name before the
@@ -220,10 +212,10 @@ pub fn save(
 /// name is empty — a row whose file has already gone — nothing is
 /// removed at all, so a save that follows this commit keeps the file it renames into that name.
 ///
-/// Leaves the observation row alone: the OCR text and the payload are the point of the record and
-/// outlive the picture. Empty day directories are left behind on purpose: pruning one could race
-/// with [`save`] between creating that directory and opening its temporary file, while a few
-/// hundred empty entries a year cost nothing and only the startup sweep walks them.
+/// The observation, its OCR text and its payload are untouched: they are the point of the record
+/// and outlive the picture. Empty day directories are left behind on purpose, because pruning one
+/// could race with [`save`] between creating that directory and opening its temporary file, while
+/// a few hundred empty entries a year cost nothing and only the startup sweep walks them.
 pub fn delete(
     conn: &mut rusqlite::Connection,
     root: &std::path::Path,
@@ -253,19 +245,17 @@ pub fn delete(
     let path = root.join(relative);
     // Decided while the transaction still holds the lock, because after the commit this name stops
     // being this call's business. A row whose file is already gone is a state this store tolerates,
-    // and there the whole of the work left is nothing: a `save` for this observation that follows
-    // the commit renames its new file into this very name, and a removal running afterwards would
-    // take it away while its fresh row said it was there. When the name is occupied, no save can
-    // reach it first — the rename refuses to replace, so it fails until this removal is through.
-    // A name that cannot even be asked about counts as occupied, so the removal below reports the
-    // real error rather than this line inventing one.
-    // The question is whether a directory entry exists under this name, which is the question
-    // `rename_without_replacing` answers, and not whether anything can be read through it.
-    // Measured 2026-07-31: for a symlink whose target is gone, `try_exists` reports the name as
-    // empty while `create_new` on it still fails with `AlreadyExists` and `remove_file` still has
-    // an entry to remove — so following the link would leave that entry standing in the way of
-    // every later save for this observation — and not until the next startup either, because the
-    // sweep collects only entries the filesystem calls files and a link is not one.
+    // and there the work left is nothing: a `save` for this observation that follows the commit
+    // renames its new file into this very name, and a removal running afterwards would take it
+    // away while its fresh row said it was there. When the name is occupied, no save can reach it
+    // first — the rename refuses to replace, so it fails until this removal is through. A name that
+    // cannot even be asked about counts as occupied, so the removal below reports the real error
+    // rather than this line inventing one.
+    // Asked without following links, because the question is whether a directory entry exists under
+    // this name — the question `rename_without_replacing` answers — and not whether anything can be
+    // read through it. A link whose target is gone still has an entry, and leaving it would stand in
+    // the way of every later save for this observation, and not until the next startup either,
+    // because the sweep collects only entries the filesystem calls files and a link is not one.
     let occupied = match path.symlink_metadata() {
         Ok(_) => true,
         Err(source) => source.kind() != std::io::ErrorKind::NotFound,
@@ -320,8 +310,8 @@ pub fn sweep_orphan_files(
         // sweep, but that is a question about the entries on this path and not about what they lead
         // to, and it has to be put to the whole path rather than to its last component.
         // `canonicalize` answers `NotFound` for a name that was never there, for a link whose target
-        // is gone, and for a path leading through either of those — measured 2026-08-01, and the
-        // raw code does not separate them either. What decides is the deepest entry that does
+        // is gone, and for a path leading through either of those, and the raw code does not
+        // separate them either. What decides is the deepest entry that does
         // exist: none at all, or a directory, and the rest of the path is simply not created yet;
         // anything else, and no image can ever be written here — `create_dir_all` answers
         // `AlreadyExists` — so calling it the state before the first save would report a clean
@@ -340,11 +330,11 @@ pub fn sweep_orphan_files(
                     // running out of names means none of it is.
                     Err(absent) if absent.kind() == std::io::ErrorKind::NotFound => {}
                     // The name cannot be answered about, which is not the same as nothing being
-                    // there. Measured 2026-08-01: a component the filesystem will not take — one
-                    // holding a `|`, or longer than a component may be — answers `InvalidFilename`
-                    // while the directory above it is perfectly ordinary, and a `storage.data_dir`
-                    // typed with such a character is exactly that. Reporting a clean sweep on a
-                    // doubt would report it on every startup.
+                    // there. A component Windows will not take — one holding a `|`, or longer than
+                    // a component may be — answers `InvalidFilename` while the directory above it
+                    // is perfectly ordinary, and a `storage.data_dir` typed with such a character
+                    // is exactly that. Reporting a clean sweep on a doubt would report it on every
+                    // startup.
                     Err(_) => return Err(unreadable),
                     // The deepest entry that does exist. The root itself arriving here is a name
                     // taken by something `canonicalize` refused. Otherwise what is left of the path
@@ -368,14 +358,12 @@ pub fn sweep_orphan_files(
             // `create_dir_all` makes a tail but never an anchor — no image can ever be written
             // there, and calling it the state before the first save would report a clean pass on
             // every startup. A root that names none is held by the directory the process is in,
-            // which is never among these names — measured 2026-08-01, the last name `ancestors()`
-            // yields for such a path is the empty one, which answers `NotFound` itself — and that
+            // which is never among these names, so running out of them settles nothing and this
             // is the ordinary state before the first save. Whether the path is absolute is the
-            // wrong question to put here: measured 2026-08-01, `X:images` is anchored to drive X
-            // exactly as `X:\images` is and neither can be created, yet `is_absolute()` and
-            // `has_root()` are both false for the first while its leading component is a `Prefix`
-            // just the same. On a drive that is there this line is never reached, because `X:`
-            // answers `Ok` and is the deepest entry that exists.
+            // wrong question to put here: `X:images` is anchored to drive X exactly as `X:\images`
+            // is and neither can be created, yet only the second is absolute to Rust while both
+            // lead with a `Prefix` component. On a drive that is there this line is never reached,
+            // because `X:` answers `Ok` and is the deepest entry that exists.
             return if matches!(
                 root.components().next(),
                 Some(std::path::Component::Prefix(_))
@@ -410,16 +398,15 @@ fn sweep_collected_files(
     // it reaches, and it is asked against every registered name that no enumerated file spelled —
     // the rows whose file, if it is there at all, is under some other name. On the ordinary
     // directory nothing reaches this point, because every enumerated file is registered under the
-    // name it was enumerated with. Measured 2026-07-30, `canonicalize` answers with the name
-    // actually on disk, so two spellings of one file agree. A candidate whose identity cannot be
+    // name it was enumerated with. `canonicalize` answers with the name actually on disk, so two
+    // spellings of one file agree. A candidate whose identity cannot be
     // established is kept: leaving a leftover costs disk, and removing a registered image costs the
     // picture. Asking only about the names no enumerated file spelled is a cost decision and it
     // leaves something out — a registered name that was an ordinary file when it was enumerated and
     // has become a link by the time this runs is not asked about, so the file it now reaches can be
-    // taken as an orphan. Asking about every registered name instead is what that would cost:
-    // measured 2026-08-01 on this machine, `canonicalize` takes 169 µs and `symlink_metadata`
-    // 107 µs, which is seventeen seconds of startup at a hundred thousand images, paid whenever
-    // anything unregistered is under the root at all.
+    // taken as an orphan. Asking about every registered name instead is a filesystem round trip per
+    // row, which at a hundred thousand images is tens of seconds of startup, paid whenever anything
+    // unregistered is under the root at all.
     let mut enumerated = Vec::with_capacity(files.len());
     for path in files {
         let relative = path_relative_to_root(root, path)?;
@@ -449,8 +436,8 @@ fn sweep_collected_files(
             // ordinary state of a row whose file is gone, which the sweep must not let stop it.
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
             // The name is there and will not say which file it reaches. Any candidate might be
-            // that file, so this pass has nothing it can safely remove. Measured 2026-08-01: a
-            // symlink pointing at itself answers `FilesystemLoop` here while its entry exists.
+            // that file, so this pass has nothing it can safely remove — a symlink pointing at
+            // itself answers `FilesystemLoop` here while its entry exists.
             Err(_) => return Ok(0),
         }
     }
@@ -465,8 +452,8 @@ fn sweep_collected_files(
         // that listed it and after the `canonicalize` below — and a directory replaced above it in
         // between sends the removal wherever the replacement leads. A candidate that cannot be
         // opened is kept, for the same reason as one that cannot be resolved: two startups can
-        // reach the same orphan, and the one that arrives second has nothing left to do. Measured
-        // 2026-08-01, a directory cannot be opened this way at all, so no pass can remove one.
+        // reach the same orphan, and the one that arrives second has nothing left to do. A
+        // directory cannot be opened this way at all, so no pass can remove one.
         let Ok(file) = cw_core::atomic_file::open_for_removal(path) else {
             continue;
         };
@@ -479,9 +466,9 @@ fn sweep_collected_files(
         // the question is what the filesystem answers with. `collect_files` keeps only what the
         // filesystem calls a file and a link is not one, so every candidate was an ordinary file
         // when it was listed, and an ordinary file resolves to the name it was listed under.
-        // Measured 2026-08-01 on two volumes, over a tree holding a hardlink, a Japanese name,
-        // names with spaces and dots and twenty levels of nesting: every listed file canonicalized
-        // to its own listed path, and a name reached through a directory link did not. Anything
+        // Every listed file canonicalizes to its own listed path — a hardlink, a non-ASCII name,
+        // names with spaces and dots and deep nesting all do — while a name reached through a
+        // directory link does not. Anything
         // answering differently is no longer what was listed, and what it now reaches may be a
         // registered image. This settles containment too: every listed name is under the root by
         // construction, so a candidate that is its own name is inside the root.
@@ -493,9 +480,9 @@ fn sweep_collected_files(
         // the removal. A candidate that will not go is kept and the pass carries on, for the same
         // reason as one that cannot be opened or resolved: a single file must not decide whether
         // every other orphan is collected, and a file that fails the same way on every startup
-        // would mean none of them ever are. Measured 2026-08-01, that is reachable with no race and
-        // no privilege — a read-only file opens for removal and then answers `PermissionDenied` to
-        // the disposition call. It is not counted, because the count is of files that went.
+        // would mean none of them ever are. That is reachable with no race and no privilege: a
+        // read-only file opens for removal and then answers `PermissionDenied` to the disposition
+        // call. It is not counted, because the count is of files that went.
         if cw_core::atomic_file::delete_by_handle(&file).is_ok() {
             removed += 1;
         }
@@ -655,8 +642,7 @@ fn path_relative_to_root(
 ///
 /// `relative_path` is TEXT and the schema constrains nothing, so a row edited by hand or damaged
 /// can name anything at all — including a path that climbs out of the image root, which `delete`
-/// would then remove. The write side has had one spelling since this file was written; this is the
-/// read side finally agreeing with it.
+/// would then remove.
 fn checked_path(
     id: ulid::Ulid,
     created_at: chrono::DateTime<chrono::Utc>,
@@ -694,9 +680,8 @@ fn decode_image_path(
 > {
     let stored_id: String = row.get(0)?;
     let id = ulid::Ulid::from_string(&stored_id)?;
-    // The observation and control stores have had this check since they were written, but this one
-    // did not: a lower-cased id was accepted everywhere except by `delete`, which looked it up in
-    // canonical spelling and silently matched nothing.
+    // `Ulid::from_string` accepts spellings this program never writes, and a row holding one then
+    // matches nothing in `delete`, which looks a row up in the canonical spelling.
     if id.to_string() != stored_id {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
