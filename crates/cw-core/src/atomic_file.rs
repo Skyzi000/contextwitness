@@ -8,10 +8,10 @@
 const RENAMABLE_WRITE_ACCESS: u32 = 0x8000_0000 | 0x4000_0000 | 0x0001_0000;
 /// FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE — every shareable right given away, which
 /// is as much as a handle can offer and still not the same as not being open. Sharing is checked in
-/// both directions: measured 2026-08-01, a newcomer whose own share mode leaves out a right this
-/// handle holds is refused with a sharing violation (raw 32), so anything that opens files
-/// exclusively is locked out for as long as this is held. What is unaffected is reading the file
-/// with the sharing the standard library asks for, and renaming or removing it by name.
+/// both directions: a newcomer whose own share mode leaves out a right this handle holds is refused
+/// with a sharing violation, so anything that opens files exclusively is locked out for as long as
+/// this is held. Unaffected are opening the file for reading or for writing with the sharing the
+/// standard library asks for, and renaming or removing it by name.
 const FULL_SHARE_MODE: u32 = 0x0000_0001 | 0x0000_0002 | 0x0000_0004;
 
 /// How many names are tried before giving up. Each attempt costs one failed `open`. Sixty-four
@@ -47,7 +47,7 @@ pub fn create_temporary_beside(
             .open(&temporary)
         {
             Ok(file) => return Ok((temporary, file)),
-            // Not only `AlreadyExists`: measured 2026-08-01, a name held by a directory answers
+            // Not only `AlreadyExists`: on Windows a name held by a directory answers
             // `PermissionDenied`, and so does a deleted name on a filesystem that keeps it until
             // its last handle closes. Either way this call did not get the name, which is the only
             // thing it needs to know before trying the next one.
@@ -95,14 +95,14 @@ pub fn rename_without_replacing(
     };
 
     // `fs::rename` cannot be used to publish a config: on Windows it is MoveFileExW with
-    // MOVEFILE_REPLACE_EXISTING and silently replaces the destination (measured 2026-07-27).
+    // MOVEFILE_REPLACE_EXISTING and silently replaces the destination.
     // Creating the destination first and filling it afterwards is no better — the name exists
     // before the content does, so a concurrent `setup` is told the config is ready, writes the
     // user's settings into the empty shell, and has them replaced a moment later. Renaming by
     // handle with ReplaceIfExists = FALSE makes the name appear already holding the full template,
-    // and it works on exFAT as well as NTFS (both measured). It is not the only call that would
-    // refuse a taken destination — measured 2026-08-01, `MoveFileExW` with no flags answers
-    // `ERROR_ALREADY_EXISTS` and leaves both files as they were. What the handle adds is that it
+    // and it works on exFAT as well as NTFS. It is not the only call that would refuse a taken
+    // destination: `MoveFileExW` with no flags answers `ERROR_ALREADY_EXISTS` and leaves both files
+    // as they were. What the handle adds is that it
     // moves the file this call opened, rather than whatever its source name has come to mean by
     // now.
     let destination = std::path::absolute(destination)?;
@@ -143,10 +143,10 @@ const REMOVABLE_ACCESS: u32 = 0x0001_0000;
 ///
 /// A name can be given to another file, and a directory above it can be replaced by a link, between
 /// deciding to remove something and removing it, so the caller holds the file it decided about.
-/// Measured 2026-08-01: this opens an ordinary file with DELETE alone and answers `PermissionDenied`
-/// for a directory — which is a guarantee to the caller that a directory can never be removed this
-/// way. The file stays readable, renamable and removable by name while the handle is held; what
-/// holding it does cost anyone else is on `FULL_SHARE_MODE`.
+/// This opens an ordinary file with DELETE alone and answers `PermissionDenied` for a directory,
+/// which is a guarantee to the caller that a directory can never be removed this way. The file
+/// stays readable, writable, renamable and removable by name while the handle is held; what holding
+/// it does cost anyone else is on `FULL_SHARE_MODE`.
 pub fn open_for_removal(path: &std::path::Path) -> std::io::Result<std::fs::File> {
     use std::os::windows::fs::OpenOptionsExt;
 
@@ -159,8 +159,8 @@ pub fn open_for_removal(path: &std::path::Path) -> std::io::Result<std::fs::File
 /// Remove the file this handle refers to, whatever name it answers to by now.
 ///
 /// A name can be given to another file between deciding to remove one and removing it, and every
-/// caller here is holding the file it means. Measured 2026-08-01: with the published file moved
-/// aside and a different file put at its name, this removes the one that was written and leaves the
+/// caller here is holding the file it means. With the published file moved aside and a different
+/// file put at its name, this removes the one that was written and leaves the
 /// other, while `remove_file` on the name does the opposite. The entry disappears when the last
 /// handle closes rather than at once, so a caller that needs the name free again must drop the file
 /// first — every caller here is on its way out.
@@ -296,16 +296,21 @@ mod tests {
     }
 
     #[test]
-    fn a_file_held_for_removal_can_still_be_read_renamed_and_removed() {
+    fn a_file_held_for_removal_shares_read_write_rename_and_removal() {
         let path = unique_temp_path("open-for-removal-shares");
         std::fs::write(&path, b"an orphan").expect("the file should be writable");
 
         let file = open_for_removal(&path).expect("an existing file should be openable to remove");
 
-        // These three are what the sweep needs from this handle and they are all it leaves alone:
-        // measured 2026-08-01, a newcomer whose share mode leaves out a right this handle holds is
-        // refused outright, so anything opening files exclusively is locked out meanwhile.
+        // What this handle gives away. Asserted here because `FULL_SHARE_MODE` is one constant and
+        // a bit missing from it shows up nowhere else: sharing is checked in both directions, so a
+        // newcomer whose own share mode leaves out a right this handle holds is refused, and
+        // anything that opens files exclusively is locked out while this is held.
         std::fs::File::open(&path).expect("a reader sharing what the library shares should get in");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("a writer sharing what the library shares should get in");
         let moved = unique_temp_path("open-for-removal-shares-moved");
         std::fs::rename(&path, &moved).expect("the name should still be renamable");
         std::fs::remove_file(&moved).expect("the file should still be removable by name");
@@ -318,7 +323,7 @@ mod tests {
         let path = unique_temp_path("open-for-removal-directory");
         std::fs::create_dir(&path).expect("the directory should be creatable");
 
-        // Measured 2026-08-01: `PermissionDenied` (raw 5). The kind is not asserted — what the
+        // A directory answers `PermissionDenied`. The kind is not asserted — what the
         // caller is promised, and what the image sweep's comment rests on, is only that this
         // refuses.
         let result = open_for_removal(&path);
@@ -386,7 +391,7 @@ mod tests {
         std::fs::create_dir(&temp_dir).expect("the unique test directory should be creatable");
         let destination = temp_dir.join("config.toml");
 
-        // Measured 2026-08-01: a reserving open on a name a directory holds answers
+        // A reserving open on a name a directory holds answers
         // `PermissionDenied`, not `AlreadyExists`, so a loop that steps past only the latter gives
         // up here while every later name is free.
         let mut planted = destination.as_os_str().to_os_string();
