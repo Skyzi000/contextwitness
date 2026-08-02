@@ -148,7 +148,7 @@ fn enable_wal(conn: &rusqlite::Connection, path: &std::path::Path) -> Result<(),
 /// Open the database at `path`, apply the connection contract and bring the schema up to
 /// [`SCHEMA_VERSION`].
 ///
-/// Every subsystem opens its own connection (design section 7), so every open migrates; there is
+/// Every subsystem opens its own connection, so every open migrates; there is
 /// no separate step a caller could forget to call.
 pub fn open(path: &std::path::Path) -> Result<rusqlite::Connection, StoreError> {
     if let Some(directory) = path
@@ -321,8 +321,7 @@ mod tests {
         let path = dir.path().join("db.sqlite3");
         let conn = open(&path).expect("the database should open with the SQLite contract");
 
-        // These three values are design section 7's contract between subsystems that each hold
-        // their own connection.
+        // The contract between subsystems that each hold their own connection.
         let journal_mode: String = conn
             .pragma_query_value(None, "journal_mode", |row| row.get(0))
             .expect("the journal mode should be readable");
@@ -340,8 +339,8 @@ mod tests {
 
     #[test]
     fn a_first_start_where_every_subsystem_opens_at_once_succeeds() {
-        // Design section 7 gives every subsystem its own connection, so a first start is several
-        // opens at the same moment against a database still in rollback-journal mode. They all meet
+        // Every subsystem holds its own connection, so a first start is several opens at the same
+        // moment against a database still in rollback-journal mode. They all meet
         // on the WAL conversion, which needs an exclusive lock and does not go through the busy
         // timeout: measured 2026-07-29, six connections opening together failed 83% of the time
         // before enable_wal waited on its own behalf.

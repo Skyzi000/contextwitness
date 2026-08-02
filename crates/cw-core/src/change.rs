@@ -152,7 +152,7 @@ pub fn max_logical_pixels(width: u32, height: u32, dpi_scale: f32) -> f64 {
 /// `frame_changed` compares with `>`, so a threshold at or above the monitor's logical area is
 /// never satisfied and that monitor is never captured again after its first frame — silently, with
 /// no error anywhere. `Config::validate` cannot check this because no monitor is known when the
-/// config is read, so the daemon calls this once per monitor at enumeration. Kept here so the
+/// config is read, so it has to be asked once per monitor, as they are enumerated. Kept here so
 /// bound and the comparison that makes it a bound stay in the same file.
 pub fn change_threshold_is_reachable(
     width: u32,

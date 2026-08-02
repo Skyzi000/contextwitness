@@ -64,9 +64,9 @@ pub fn window_start(
 /// episode. Returns `None` when nothing falls in the window — an empty window must not become an
 /// empty document.
 ///
-/// `render_offset` is the UTC offset used for the human-readable times in the body; the daemon
-/// passes the machine's local offset, so a memory reads back in the time the user experienced.
-/// Ids and metadata stay UTC regardless. A window that straddles a DST transition renders every
+/// `render_offset` is the UTC offset used for the human-readable times in the body. Supplying the
+/// machine's local offset is what makes a memory read back in the time the user experienced; ids
+/// and metadata stay UTC regardless. A window that straddles a DST transition renders every
 /// line at the single supplied offset; the header prints the offset, so the result stays readable.
 ///
 /// The fold relation is field-wise equality and therefore an equivalence relation, so comparing
@@ -107,12 +107,8 @@ pub fn build_episode(
     entries.dedup_by(|current, previous| {
         // Fold only when this entry would render exactly the line the last kept one already put in
         // the document; then it adds nothing but a timestamp, which is the premise of folding.
-        //
-        // Comparing the fields the renderer reads is the whole rule. An earlier version also
-        // consulted a perceptual fingerprint of the frame and that was wrong in both directions:
-        // a 9x8 hash does not move when text is typed, so equal hashes deleted entries that were
-        // not duplicates, and it moves on nearly every frame of a video, so requiring a match kept
-        // a hundred and fifty identical text-free lines. The fingerprint has since been removed.
+        // Comparing the fields the renderer reads is the whole rule: anything the document does not
+        // show cannot make two lines different, and anything it does show must keep them apart.
         let current = current.1;
         let previous = previous.1;
 
@@ -457,9 +453,8 @@ Monitor DISPLAY2 (1920x1080):
 
     #[test]
     fn consecutive_entries_with_different_text_are_never_collapsed() {
-        // A 9x8 fingerprint does not move when ten characters are typed: zero differing bits were
-        // measured on every supported configuration, and still zero for up to 400 characters at
-        // 3840x2160. Folding on it would drop the OCR text this product exists to deliver.
+        // Text is what this product exists to deliver, so two entries whose text differs must
+        // survive as two lines however small the difference is.
         let observations = vec![
             observation(
                 1,
@@ -494,8 +489,8 @@ Monitor DISPLAY2 (1920x1080):
 
     #[test]
     fn text_free_entries_from_the_same_application_fold() {
-        // This is a video playing: the fingerprint moves on every frame while the document line
-        // stays identical, and the old rule kept every one of them.
+        // A video playing: every frame renders the same line, and one line is what the reader
+        // needs from it.
         let observations = vec![
             observation(
                 1,
@@ -529,8 +524,8 @@ Monitor DISPLAY2 (1920x1080):
 
     #[test]
     fn a_different_application_keeps_the_entry() {
-        // The fingerprint says nothing here: the switch between two text-free applications is the
-        // only thing the entry records, and the old rule deleted it.
+        // The switch between two text-free applications is the only thing these entries record, so
+        // folding them would leave the document with nothing to show for it.
         let observations = vec![
             observation(
                 1,

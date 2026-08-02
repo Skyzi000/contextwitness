@@ -137,7 +137,7 @@ pub fn find_in_window(
 }
 
 /// The payload column's text: the payload's own JSON, with no discriminator inside it. The `source`
-/// column is the single place the kind is written (design section 4.1).
+/// column is the single place the kind is written.
 fn payload_json(
     observation: &Observation,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
@@ -342,14 +342,8 @@ mod tests {
         let start = at("2026-07-25T12:00:00Z");
         let end = at("2026-07-25T12:05:00Z");
         let before = screen_observation_at(start - TimeDelta::nanoseconds(1));
-        // A ULID is a millisecond timestamp and eighty random bits, so two ids generated in one
-        // test almost always share a millisecond, and their order is then a coin flip: measured
-        // 2026-07-30 over 200,000 back-to-back pairs, 199,995 shared one and the second sorted
-        // first in 50.1% of those. The five that crossed a millisecond are the only pairs whose ids
-        // follow the clock, and they are far too rare to account for anything here. Generated ids
-        // therefore make this a flaky detector of `ORDER BY id, observed_at` rather than a blind one — six
-        // tests are sensitive to that swap, and the suite caught it in 29 runs out of 30. Fixed ids
-        // running against the timestamps make it certain.
+        // Fixed ids running against the timestamps, so a swap to `ORDER BY id, observed_at` fails every
+        // run: ids generated in one test almost always share a millisecond and then sort at random.
         let mut at_start = screen_observation_at(start);
         at_start.id = ulid::Ulid::from(9u128);
         let mut before_end = screen_observation_at(end - TimeDelta::nanoseconds(1));
@@ -371,14 +365,8 @@ mod tests {
         let path = dir.path().join("db.sqlite3");
         let conn = db::open(&path).expect("the fresh database should initialize");
         let start = at("2026-07-25T12:00:00Z");
-        // A ULID is a millisecond timestamp and eighty random bits, so two ids generated in one
-        // test almost always share a millisecond, and their order is then a coin flip: measured
-        // 2026-07-30 over 200,000 back-to-back pairs, 199,995 shared one and the second sorted
-        // first in 50.1% of those. The five that crossed a millisecond are the only pairs whose ids
-        // follow the clock, and they are far too rare to account for anything here. Generated ids
-        // therefore make this a flaky detector of `ORDER BY id, observed_at` rather than a blind one — six
-        // tests are sensitive to that swap, and the suite caught it in 29 runs out of 30. Fixed ids
-        // running against the timestamps make it certain.
+        // Fixed ids running against the timestamps, so a swap to `ORDER BY id, observed_at` fails every
+        // run: ids generated in one test almost always share a millisecond and then sort at random.
         let mut oldest = screen_observation_at(start);
         oldest.id = ulid::Ulid::from(9u128);
         let mut middle = screen_observation_at(start + TimeDelta::seconds(1));
@@ -425,14 +413,8 @@ mod tests {
         let path = dir.path().join("db.sqlite3");
         let conn = db::open(&path).expect("the fresh database should initialize");
         let start = at("2026-07-25T12:00:00Z");
-        // A ULID is a millisecond timestamp and eighty random bits, so two ids generated in one
-        // test almost always share a millisecond, and their order is then a coin flip: measured
-        // 2026-07-30 over 200,000 back-to-back pairs, 199,995 shared one and the second sorted
-        // first in 50.1% of those. The five that crossed a millisecond are the only pairs whose ids
-        // follow the clock, and they are far too rare to account for anything here. Generated ids
-        // therefore make this a flaky detector of `ORDER BY id, observed_at` rather than a blind one — six
-        // tests are sensitive to that swap, and the suite caught it in 29 runs out of 30. Fixed ids
-        // running against the timestamps make it certain.
+        // Fixed ids running against the timestamps, so a swap to `ORDER BY id, observed_at` fails every
+        // run: ids generated in one test almost always share a millisecond and then sort at random.
         let mut whole_second = screen_observation_at(start);
         whole_second.id = ulid::Ulid::from(9u128);
         let mut last_fraction = screen_observation_at(at("2026-07-25T12:00:00.999999999Z"));
@@ -673,8 +655,8 @@ mod tests {
             other => panic!("expected Encoding, got {other:?}"),
         }
 
-        // This is the contradiction being closed: the row was reachable by the window query and
-        // invisible to this lookup under the one id that the window query reported.
+        // A row must not be reachable by the window query and invisible to this lookup under the
+        // very id that query reports.
         let found = find_by_id(&conn, id).expect("the canonical observation id lookup should work");
         assert_eq!(found, None);
     }

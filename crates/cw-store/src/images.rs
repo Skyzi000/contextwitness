@@ -1622,8 +1622,8 @@ mod tests {
             return;
         };
 
-        // Before this change the moved file was the only thing the sweep could see and it deleted
-        // it, leaving the row pointing at a link to nothing.
+        // A file a registered row reaches only through a link must survive: deleting it would
+        // leave the row pointing at a link to nothing.
         let removed = sweep_orphan_files(&conn, &root).expect("the orphan sweep should succeed");
 
         assert_eq!(removed, 0);
