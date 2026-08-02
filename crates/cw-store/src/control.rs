@@ -938,10 +938,10 @@ mod tests {
             at: at(2026, 7, 30, 12, 2, 0),
             detail: Some("middle.exe".to_owned()),
         };
-        // The boundary row is what makes this test tell `<= end - 1 ns` apart from
-        // `< end - 1 ns`. It is no longer the only test that does: measured 2026-07-30, that change
-        // fails this one and `every_event_the_schema_can_store_is_inside_a_window_it_can_search`,
-        // which puts an event on the same edge from the other side.
+        // The boundary row is what makes this test tell `<= end - 1 ns` apart from `< end - 1 ns`.
+        // It is not the only test that does:
+        // `every_event_the_schema_can_store_is_inside_a_window_it_can_search` puts an event on the
+        // same edge from the other side.
         let boundary = ControlEvent {
             id: ulid::Ulid::from(3u128),
             kind: EventKind::BlacklistSkip,

@@ -3,9 +3,9 @@
 use chrono::{DateTime, SecondsFormat, Timelike, Utc};
 
 /// The spelled length of every timestamp this schema stores. Years 0000 through 9999 produce it.
-/// Measured 2026-07-28, a year above gains a sign and a digit — 10000 spells `+10000-…` at 32
-/// characters — and a year below gains only a sign, so -1 spells `-0001-…` at 31. Both are refused;
-/// only the first is refused for the reason the length suggests.
+/// A year above gains a sign and a digit — 10000 spells `+10000-…` at 32 characters — and a year
+/// below gains only a sign, so -1 spells `-0001-…` at 31. Both are refused; only the first is
+/// refused for the reason the length suggests.
 const SPELLED_LENGTH: usize = 30;
 
 /// One more than the largest value a real nanosecond field can hold. chrono spends everything at or
@@ -137,8 +137,8 @@ mod tests {
             // This ordinary instant would not sort against the `Z` spellings.
             "2026-07-30T12:00:00.000000000+09:00",
             // Exactly thirty characters, and nine hours from where its text sorts: a length check
-            // cannot tell this from the spelling this schema writes. Measured 2026-07-30, it parses to
-            // 03:00:00 UTC and its text sorts after 11:59:59.999999999Z.
+            // cannot tell this from the spelling this schema writes. It parses to 03:00:00 UTC
+            // while its text sorts after 11:59:59.999999999Z.
             "2026-07-30T12:00:00.0000+09:00",
             // chrono would drop this tenth digit, but SQLite would keep comparing it.
             "2026-07-30T12:00:00.0000000001Z",

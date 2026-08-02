@@ -526,8 +526,8 @@ mod tests {
             .expect("year 10000 should be valid");
 
         insert(&conn, &observation).expect("the last spellable observation should be stored");
-        // The exclusive end is year 10000, which has no spelling of its own. This row was
-        // previously stranded by a reader that refused to look for it.
+        // The exclusive end is year 10000, which has no spelling of its own. A reader that cannot
+        // spell the end of a window must still find the rows inside it.
         let found = find_in_window(&conn, start, end)
             .expect("the last spellable observation should be searchable");
         assert_eq!(found, vec![observation]);

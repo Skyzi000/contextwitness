@@ -230,9 +230,9 @@ fn migrate(conn: &mut rusqlite::Connection, path: &std::path::Path) -> Result<()
     let current = read_user_version(&transaction, path)?;
 
     // The lower bound is not decoration: `current as usize` on a negative number is an index far
-    // past the end of MIGRATIONS, and the slice below panics on it. Measured 2026-07-30, -1 becomes
-    // 18446744073709551615 against a list of length 1. A guard that only excluded values above
-    // SCHEMA_VERSION would leave the daemon a value that crashes it.
+    // past the end of MIGRATIONS — -1 becomes `usize::MAX` — and the slice below panics on it. A
+    // guard that only excluded values above SCHEMA_VERSION would leave the daemon a value that
+    // crashes it.
     if !(0..=SCHEMA_VERSION).contains(&current) {
         return Err(StoreError::UnsupportedSchema {
             path: path.to_path_buf(),
@@ -565,9 +565,9 @@ mod tests {
                     observations
                 ),
                 ("delete", 0, found, 0),
-                "SCHEMA_VERSION is the case that used to be accepted and handed back with no \
-                 tables in it, and a marker that is not zero is one somebody wrote, so the file \
-                 is not ours to take"
+                "a marker that is not zero is one somebody wrote, so the file is not ours to \
+                 take and refusing it must leave it exactly as found — SCHEMA_VERSION included, \
+                 which is the value that looks most like ours"
             );
         }
     }
