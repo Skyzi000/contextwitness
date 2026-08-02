@@ -569,6 +569,10 @@ fn registered_paths(conn: &rusqlite::Connection) -> Result<HashSet<String>, Stor
 /// on Windows each holds a `WIN32_FIND_DATAW` by value — and this walk reads whatever is under the
 /// image root rather than only what this program wrote there, so its depth is not this program's
 /// to assume. Running out of stack aborts the process, and this runs at startup.
+///
+/// `root` must be the spelling `canonicalize` answered, and is the only name whose enumeration
+/// failing is reported. Anything below it, and any single entry that cannot be answered about, is
+/// passed over: what was not collected never becomes a candidate, so nothing is removed on a guess.
 fn collect_files(
     root: &std::path::Path,
     files: &mut Vec<std::path::PathBuf>,
@@ -577,19 +581,18 @@ fn collect_files(
     while let Some(directory) = worklist.pop() {
         let entries = match std::fs::read_dir(&directory) {
             Ok(entries) => entries,
+            // Nothing at this name. Below the root that is a directory that went away while the
+            // walk was running, with nothing left under it to collect. At the root it is the root
+            // itself going away after `sweep_orphan_files` resolved it, and no orphan exists under
+            // a root that is not there. A root whose name is taken by something that cannot hold
+            // images never arrives here: that caller climbs the ancestors and reports it first.
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => continue,
-            // The root is the name the caller configured and the only one it can act on, and a
-            // root that will not be listed means nothing under it was seen at all — answering
+            // A root that will not be listed means nothing under it was seen at all, so answering
             // `Ok` there is a clean sweep reported on every startup of a store from which nothing
             // is ever collected. A directory under it is one place among many, and failing the
             // whole pass on one of them leaves every orphan everywhere else uncollected for as
             // long as it stays, which is what a candidate that will not open or will not go is
-            // already passed over for. Measured 2026-08-01, the two are separate arrangements and
-            // not one: denying this user the right to list a subdirectory leaves the root
-            // enumerable and still yielding that subdirectory, while denying it on the root
-            // leaves `canonicalize` answering `Ok`, so the walk above never sees either. Nothing
-            // under a directory that was not listed becomes a candidate, so passing over one
-            // removes nothing on a guess.
+            // already passed over for.
             Err(source) if directory == root => {
                 return Err(StoreError::ImageIo {
                     path: directory,
@@ -600,15 +603,30 @@ fn collect_files(
         };
 
         for entry in entries {
-            let entry = entry.map_err(|source| StoreError::ImageIo {
-                path: directory.clone(),
-                source,
-            })?;
+            let entry = match entry {
+                Ok(entry) => entry,
+                // The listing stopped partway, which is the arm above arriving one step later: the
+                // root's listing is the whole candidate list, so a clean sweep reported from one
+                // that stopped is a clean sweep reported over what was never seen, while a
+                // directory under it is one place among many. Broken out of rather than skipped,
+                // because the rest of this directory is not coming either way — in the rustc 1.97.1
+                // source `ReadDir::next` drops its handle before handing this back and answers
+                // `None` from then on.
+                Err(source) if directory == root => {
+                    return Err(StoreError::ImageIo {
+                        path: directory.clone(),
+                        source,
+                    });
+                }
+                Err(_) => break,
+            };
             let path = entry.path();
-            let file_type = entry.file_type().map_err(|source| StoreError::ImageIo {
-                path: path.clone(),
-                source,
-            })?;
+            // One name that cannot be answered about, in a listing that is otherwise still
+            // arriving. It costs this pass that one name and not the root's whole listing, so the
+            // rule above does not reach here even at the root.
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
             if file_type.is_dir() {
                 worklist.push(path);
             } else if file_type.is_file() {
@@ -712,15 +730,12 @@ mod tests {
         (dir, conn, root)
     }
 
-    /// Puts back what a `/deny` on `path` took away. A guard and not a call, because a call is
-    /// skipped by exactly the failure the tests that use this exist to detect: a panic anywhere
-    /// below unwinds past every restore written as a statement, and measured 2026-08-01 a directory
-    /// left holding such a deny cannot be removed by anything — not by the temporary directory, not
-    /// by `Remove-Item -Recurse -Force`. Provoked with a `panic!` in place of the sweep: with the
-    /// restore written as a call the entry survived holding `(DENY)(RX)` and the whole temporary
-    /// tree became unremovable; with this it did not. Construct it before applying the deny, so that
-    /// the exit taken when `icacls` cannot even be waited on is covered, and after the temporary
-    /// directory, so that it runs before the directory is taken away.
+    /// Puts back what a `/deny` on `path` took away. A guard and not a call, because a panic — the
+    /// failure the tests that use this exist to detect — unwinds past a restore written as a
+    /// statement, and a directory left holding such a deny cannot afterwards be removed by
+    /// anything, so the whole temporary tree stays on disk. Construct it before applying the deny,
+    /// so that the exit taken when `icacls` cannot even be waited on is covered, and after the
+    /// temporary directory, so that it runs before that directory is taken away.
     struct RestoreEntry<'a> {
         path: &'a str,
         user: &'a str,
