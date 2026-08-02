@@ -831,10 +831,10 @@ mod tests {
         let id = ulid::Ulid::new();
         let taken_at = at(2026, 7, 30);
         // No observation is inserted, so this image's row breaks the foreign key `db::open` turns
-        // on. Measured 2026-08-01: the check is enforced as the INSERT arrives, unless it is
-        // deferred — and then it is the COMMIT that answers `ConstraintViolation` (787), which is
-        // the one failure the last statement of `save` can be given from here. `save` never reads
-        // or writes this pragma, and SQLite clears it when the transaction ends.
+        // on. SQLite enforces that check as the INSERT arrives unless it is deferred, and then it
+        // is the COMMIT that answers `ConstraintViolation` (787) — the one failure the last
+        // statement of `save` can be given from here. `save` never reads or writes this pragma, and
+        // SQLite clears it when the transaction ends.
         conn.execute_batch("PRAGMA defer_foreign_keys = ON")
             .expect("the pragma should apply");
 
@@ -1288,9 +1288,9 @@ mod tests {
             .expect("the saved file should be removable before replacement with a symlink");
 
         // Creating a symlink needs Developer Mode or SeCreateSymbolicLinkPrivilege, so this case
-        // cannot be built everywhere the suite runs. It was measured on the development machine,
-        // and the predicate it pins is justified there independently: `create_new` on such a name
-        // fails with `AlreadyExists`, which is exactly what the publishing rename would meet.
+        // cannot be built everywhere the suite runs, and the test returns without asserting where
+        // it cannot. The predicate it pins holds without it: `create_new` on such a name fails with
+        // `AlreadyExists`, which is exactly what the publishing rename would meet.
         let Ok(()) = std::os::windows::fs::symlink_file(&missing_target, &path) else {
             return;
         };
@@ -1315,11 +1315,11 @@ mod tests {
         let relative = save_test_image(&mut conn, &root, id, at(2026, 7, 30), 52);
         let path = root.join(relative);
 
-        // Measured 2026-07-31 on this machine: `remove_file` against a directory fails with
-        // `PermissionDenied` (raw OS error 5) and leaves it in place, while a missing file and a
-        // missing parent directory both come back as `NotFound`. That is the deterministic
-        // non-`NotFound` failure this needs, and the absent row is what tells this order apart from
-        // removing the file first — that one returns before the row is ever touched.
+        // On Windows `remove_file` against a directory fails with `PermissionDenied` and leaves it
+        // in place, while a missing file and a missing parent directory both come back as
+        // `NotFound`. That is the deterministic non-`NotFound` failure this needs, and the absent
+        // row is what tells this order apart from removing the file first — that one returns before
+        // the row is ever touched.
         std::fs::remove_file(&path).expect("the saved file should be removable before replacement");
         std::fs::create_dir(&path).expect("a directory should be creatable at the image path");
 
@@ -1802,10 +1802,10 @@ mod tests {
     #[test]
     fn a_root_the_filesystem_will_not_answer_about_is_reported() {
         let (dir, conn, _root) = database();
-        // A `storage.data_dir` typed with a character Windows does not take. Measured 2026-08-01:
-        // both `canonicalize` and `symlink_metadata` answer `InvalidFilename` here, while the
-        // directory holding it is an ordinary one — so nothing about this name has been shown to
-        // be absent, and it needs no special privilege to arrange.
+        // A `storage.data_dir` typed with a character Windows does not take. Both `canonicalize`
+        // and `symlink_metadata` answer `InvalidFilename` here while the directory holding it is an
+        // ordinary one, so nothing about this name has been shown to be absent — and it needs no
+        // special privilege to arrange.
         let root = dir.path().join("im|ages");
 
         let result = sweep_orphan_files(&conn, &root);
@@ -1836,9 +1836,9 @@ mod tests {
     #[test]
     fn a_root_anchored_to_a_drive_that_is_not_there_is_reported() {
         let (_dir, conn, _root) = database();
-        // Any letter with no volume behind it. Measured 2026-08-01: every name on such a path
-        // answers `NotFound`, the anchor included, so this is the arrangement in which running out
-        // of names is the only signal there is.
+        // Any letter with no volume behind it. Every name on such a path answers `NotFound`, the
+        // anchor included, so this is the arrangement in which running out of names is the only
+        // signal there is.
         let Some(letter) = ('D'..='Z').find(|letter| {
             std::fs::symlink_metadata(format!("{letter}:\\"))
                 .is_err_and(|absent| absent.kind() == std::io::ErrorKind::NotFound)
@@ -1847,8 +1847,8 @@ mod tests {
         };
         // Both spellings that name that drive. `X:images` is relative to whatever the current
         // directory on drive X is, so it is anchored to a volume exactly as `X:\images` is and
-        // neither of them can be created; measured 2026-08-01, Rust calls only the second one
-        // absolute, which is why the answer here is decided by the leading component instead.
+        // neither of them can be created; Rust calls only the second one absolute, which is why
+        // the answer here is decided by the leading component instead.
         for root in [
             std::path::PathBuf::from(format!("{letter}:\\ContextWitness\\images")),
             std::path::PathBuf::from(format!("{letter}:ContextWitness\\images")),
@@ -1876,9 +1876,9 @@ mod tests {
             user: user.as_str(),
         };
         // std has no way to set an ACL and this crate may hold no `unsafe`, so the check is asked
-        // of the tool Windows ships with. Measured 2026-08-01: after this, `canonicalize` answers
-        // `PermissionDenied` while `metadata` still answers that it is a directory — the one state
-        // that separates a root which is there and will not open from a path not created yet.
+        // of the tool Windows ships with. After this, `canonicalize` answers `PermissionDenied`
+        // while `metadata` still answers that it is a directory — the one state that separates a
+        // root which is there and will not open from a path not created yet.
         let denied = std::process::Command::new("icacls")
             .args([
                 path.as_str(),
@@ -1926,10 +1926,10 @@ mod tests {
             path: path.as_str(),
             user: user.as_str(),
         };
-        // Only the right to list the contents is taken. Measured 2026-08-01: `canonicalize` still
-        // answers `Ok`, so the walk that reports an unopenable root never runs, and the enumeration
-        // is the only thing that fails — the one arrangement that puts the question to the walk
-        // over the tree instead.
+        // Only the right to list the contents is taken. `canonicalize` still answers `Ok`, so the
+        // walk that reports an unopenable root never runs and the enumeration is the only thing
+        // that fails — the one arrangement that puts the question to the walk over the tree
+        // instead.
         let denied = std::process::Command::new("icacls")
             .args([path.as_str(), "/deny", &format!("{user}:(RD)")])
             .output();
@@ -1968,9 +1968,9 @@ mod tests {
             path: path.as_str(),
             user: user.as_str(),
         };
-        // Measured 2026-08-01: with this applied the root still enumerates and still yields
-        // `blocked` as a directory, while listing `blocked` itself answers `PermissionDenied`. One
-        // such place must not decide whether anything else under the root is ever collected.
+        // With this applied the root still enumerates and still yields `blocked` as a directory,
+        // while listing `blocked` itself answers `PermissionDenied`. One such place must not decide
+        // whether anything else under the root is ever collected.
         let denied = std::process::Command::new("icacls")
             .args([path.as_str(), "/deny", &format!("{user}:(RX,RA,RD)")])
             .output();
@@ -2003,15 +2003,15 @@ mod tests {
         let ordinary = root.join("ordinary.webp");
         std::fs::write(&stubborn, b"an orphan").expect("the file should be writable");
         std::fs::write(&ordinary, b"an orphan").expect("the file should be writable");
-        // Measured 2026-08-01: this file opens for removal and then refuses the disposition call
-        // with `PermissionDenied`, which is the reachable form of a candidate that will not go.
+        // A read-only file opens for removal and then refuses the disposition call with
+        // `PermissionDenied`, which is the reachable form of a candidate that will not go.
         let mut attributes = std::fs::metadata(&stubborn)
             .expect("the file should be there")
             .permissions();
         attributes.set_readonly(true);
         std::fs::set_permissions(&stubborn, attributes).expect("the attribute should be settable");
 
-        // The attribute is left set on purpose and nothing here puts it back: measured 2026-08-01,
+        // The attribute is left set on purpose and nothing here puts it back:
         // `std::fs::remove_file` clears it and succeeds, so the temporary directory can still take
         // the file away — which is the same difference this test is about.
         let removed = sweep_orphan_files(&conn, &root);
