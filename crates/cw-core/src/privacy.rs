@@ -1,8 +1,13 @@
 /// True when `foreground_process` (a full path or a bare file name) matches any blacklist entry.
-/// The file-name component is compared with Windows' default file-name comparison: ordinal and
-/// case-insensitive, as whole-string equality with no globs and no substring matching.
-/// Treating a name Windows considers different as a match would suppress a program the user never
-/// named. See [`file_names_equal`] for what this does and does not guarantee.
+///
+/// The file-name component is compared the way Windows compares file names: ordinal and
+/// case-insensitive, whole-string, with no globs and no substring matching. Treating a name Windows
+/// considers different as a match would suppress a program the user never named.
+///
+/// This is a comparison of names and not of files. A directory with per-directory case sensitivity
+/// can hold `Foo.exe` and `foo.exe` as two different files, and one blacklist entry matches both. A
+/// comparison that cannot be carried out counts as a match, so failing to compare never ends with
+/// recording a screen the user excluded.
 pub fn is_blacklisted(foreground_process: &str, blacklist: &[String]) -> bool {
     let Some(foreground_file_name) = file_name_component(foreground_process) else {
         return false;
