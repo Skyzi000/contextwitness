@@ -70,8 +70,7 @@ pub fn window_start(
 /// line at the single supplied offset; the header prints the offset, so the result stays readable.
 ///
 /// The fold relation is field-wise equality and therefore an equivalence relation, so comparing
-/// against the last kept entry and the immediately preceding one agree. Keep `Vec::dedup_by`'s
-/// last-kept behavior regardless: a future rule that is not an equivalence relation would need it.
+/// against the last kept entry and comparing against the immediately preceding one agree here.
 pub fn build_episode(
     window_start: chrono::DateTime<chrono::Utc>,
     window_minutes: u32,

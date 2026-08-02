@@ -25,11 +25,10 @@ pub fn is_blacklisted(foreground_process: &str, blacklist: &[String]) -> bool {
 /// call. No Unicode rule reproduces it: Windows folds ASCII, Cyrillic and accented letters, but
 /// keeps Greek final sigma, sharp s and ligatures distinct.
 ///
-/// This is a NAME comparison, not a file-identity check. A directory with per-directory case
-/// sensitivity enabled can hold `Foo.exe` and `foo.exe` as two distinct files, and this function
-/// still reports them equal. That is accepted deliberately: a blacklist entry is a bare executable
-/// name the user typed rather than a path, so there is no directory to consult, and case-sensitive
-/// directories exist for WSL interop rather than for installed Windows applications.
+/// Reporting two distinct files equal, which a case-sensitive directory can produce, is accepted:
+/// a blacklist entry is a bare executable name rather than a path, so there is no directory to
+/// consult, and case-sensitive directories exist for WSL interop rather than for installed Windows
+/// applications.
 fn file_names_equal(left: &str, right: &str) -> bool {
     let left: Vec<u16> = left.encode_utf16().collect();
     let right: Vec<u16> = right.encode_utf16().collect();
