@@ -195,9 +195,10 @@ pub fn save(
 /// Remove an image and the record that it existed.
 ///
 /// This is an explicit request for one image, so it removes the row even when the file has already
-/// gone: the rule that a row without its file is reported and kept binds [`orphan_rows`] and
-/// [`sweep_orphan_files`], which run on their own and must never decide a picture is expendable.
-/// Nothing records that the image existed once this row is gone, and that is deliberate.
+/// gone. Nothing that runs unasked may do that: [`orphan_rows`] reports a row whose file is gone
+/// and deletes nothing, and [`sweep_orphan_files`] removes only a file that nothing registered
+/// names. Neither is allowed to decide a picture is expendable. Nothing records that the image
+/// existed once this row is gone, and that is deliberate.
 ///
 /// The row is committed before the file is removed, so a failure in between leaves an unregistered
 /// file for the next sweep rather than a row whose file is gone. That is the residue worth having:
@@ -404,9 +405,8 @@ fn sweep_collected_files(
     // the names no enumerated file spelled is a cost decision and it leaves something out — a
     // registered name that was an ordinary file when it was enumerated and has become a link by the
     // time this runs is not asked about, so the file it now reaches can be taken as an orphan.
-    // Asking about every registered name instead is a filesystem round trip per row, which at a
-    // hundred thousand images is tens of seconds of startup, paid whenever anything unregistered is
-    // under the root at all.
+    // Asking about every registered name instead is a filesystem round trip per registered row,
+    // paid on every startup where anything unregistered is under the root at all.
     let mut enumerated = Vec::with_capacity(files.len());
     for path in files {
         let relative = path_relative_to_root(root, path)?;
@@ -571,8 +571,9 @@ fn collect_files(
             // Nothing at this name. Below the root that is a directory that went away while the
             // walk was running, with nothing left under it to collect. At the root it is the root
             // itself going away after `sweep_orphan_files` resolved it, and no orphan exists under
-            // a root that is not there. A root whose name is taken by something that cannot hold
-            // images never arrives here: that caller climbs the ancestors and reports it first.
+            // a root that is not there. A root standing on something that cannot hold images takes
+            // the arm below instead: an ordinary file resolves, and listing it fails as
+            // `NotADirectory` rather than as an absence.
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => continue,
             // A root that will not be listed means nothing under it was seen at all, so answering
             // `Ok` there is a clean sweep reported on every startup of a store from which nothing
@@ -596,9 +597,9 @@ fn collect_files(
                 // root's listing is the whole candidate list, so a clean sweep reported from one
                 // that stopped is a clean sweep reported over what was never seen, while a
                 // directory under it is one place among many. Broken out of rather than skipped,
-                // because the rest of this directory is not coming either way — in the rustc 1.97.1
-                // source `ReadDir::next` drops its handle before handing this back and answers
-                // `None` from then on.
+                // because `ReadDir` promises nothing about what follows an error: an iterator that
+                // keeps answering with one would never let this loop end, while ending the listing
+                // early costs at most a leftover left uncollected until some later startup.
                 Err(source) if directory == root => {
                     return Err(StoreError::ImageIo {
                         path: directory.clone(),
@@ -1808,6 +1809,23 @@ mod tests {
         // special privilege to arrange.
         let root = dir.path().join("im|ages");
 
+        let result = sweep_orphan_files(&conn, &root);
+
+        assert!(
+            matches!(result, Err(StoreError::ImageIo { .. })),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn a_root_that_is_an_ordinary_file_is_reported() {
+        let (_dir, conn, root) = database();
+        std::fs::write(&root, b"not a directory")
+            .expect("the file standing in for the image root should be writable");
+
+        // The name resolves, so nothing above it is ever asked about and the walk is what fails.
+        // Answering `Ok` would report a clean sweep on every startup of a store that can never hold
+        // an image.
         let result = sweep_orphan_files(&conn, &root);
 
         assert!(

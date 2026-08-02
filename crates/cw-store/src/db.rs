@@ -107,9 +107,9 @@ fn read_user_version(
 /// Converting a rollback-journal database to WAL needs an exclusive lock, and this is the one
 /// statement `PRAGMA busy_timeout` does not reach — it comes back `SQLITE_BUSY` at once instead of
 /// waiting. Every subsystem opens its own connection, so a first start is several of them meeting
-/// on this one conversion, and most such starts failed before this function waited on its own
-/// behalf. Reasserting WAL on a database that already has it needs no exclusive lock and succeeds
-/// even while another connection is writing, so no open waits here once the file is in WAL.
+/// on this one conversion, and without the wait below most such starts fail. Reasserting WAL on a
+/// database that already has it needs no exclusive lock and succeeds even while another connection
+/// is writing, so no open waits here once the file is in WAL.
 fn enable_wal(conn: &rusqlite::Connection, path: &std::path::Path) -> Result<(), StoreError> {
     let deadline = std::time::Instant::now() + WAL_SWITCH_DEADLINE;
     loop {
@@ -332,8 +332,8 @@ mod tests {
     fn a_first_start_where_every_subsystem_opens_at_once_succeeds() {
         // Every subsystem holds its own connection, so a first start is several opens at the same
         // moment against a database still in rollback-journal mode. They all meet on the WAL
-        // conversion, which needs an exclusive lock and does not go through the busy timeout, and
-        // most such starts failed before `enable_wal` waited on its own behalf.
+        // conversion, which needs an exclusive lock and does not go through the busy timeout, so
+        // without the wait `enable_wal` does on its own behalf most such starts fail.
         const CONNECTIONS: usize = 8;
         // Two races live here and they need different spacings to show up. Starting together, the
         // connections collide on the WAL conversion. Starting about a millisecond apart, a later

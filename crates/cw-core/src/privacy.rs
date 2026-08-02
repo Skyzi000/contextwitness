@@ -1,8 +1,8 @@
 /// True when `foreground_process` (a full path or a bare file name) matches any blacklist entry.
 ///
-/// The file-name component is compared the way Windows compares file names: ordinal and
-/// case-insensitive, whole-string, with no globs and no substring matching. Treating a name Windows
-/// considers different as a match would suppress a program the user never named.
+/// Only the file-name component is compared: whole, case-insensitively, with no globs and no
+/// substring matching. Matching a name the user did not write would suppress a program they never
+/// named.
 ///
 /// This is a comparison of names and not of files. A directory with per-directory case sensitivity
 /// can hold `Foo.exe` and `foo.exe` as two different files, and one blacklist entry matches both. A
@@ -26,9 +26,9 @@ pub fn is_blacklisted(foreground_process: &str, blacklist: &[String]) -> bool {
 /// keeps Greek final sigma, sharp s and ligatures distinct.
 ///
 /// Reporting two distinct files equal, which a case-sensitive directory can produce, is accepted:
-/// a blacklist entry is a bare executable name rather than a path, so there is no directory to
-/// consult, and case-sensitive directories exist for WSL interop rather than for installed Windows
-/// applications.
+/// what reaches here is a file-name component — the caller reduces a full path to its last one — so
+/// there is no directory left to ask, and case-sensitive directories exist for WSL interop rather
+/// than for installed Windows applications.
 fn file_names_equal(left: &str, right: &str) -> bool {
     let left: Vec<u16> = left.encode_utf16().collect();
     let right: Vec<u16> = right.encode_utf16().collect();

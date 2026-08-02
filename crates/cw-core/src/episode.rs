@@ -104,10 +104,13 @@ pub fn build_episode(
         },
     );
     entries.dedup_by(|current, previous| {
-        // Fold only when this entry would render exactly the line the last kept one already put in
-        // the document; then it adds nothing but a timestamp, which is the premise of folding.
-        // Comparing the fields the renderer reads is the whole rule: anything the document does not
-        // show cannot make two lines different, and anything it does show must keep them apart.
+        // Fold only when this entry renders what the last kept one already put in the document.
+        // The timestamp is left out on purpose: it is the one rendered field a folded entry
+        // differs in, and collapsing repeated timestamps is the point. Everything else is compared
+        // whether the status renders it or not — `ocr_text` under one that shows no text, say — so
+        // this can keep two entries that would read alike, but it never folds two that would not.
+        // A folded entry takes its image path with it: the episode lists one picture per line it
+        // keeps.
         let current = current.1;
         let previous = previous.1;
 

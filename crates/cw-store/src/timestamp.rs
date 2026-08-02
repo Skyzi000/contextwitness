@@ -3,9 +3,9 @@
 use chrono::{DateTime, SecondsFormat, Timelike, Utc};
 
 /// The spelled length of every timestamp this schema stores. Years 0000 through 9999 produce it.
-/// A year above gains a sign and a digit — 10000 spells `+10000-…` at 32 characters — and a year
-/// below gains only a sign, so -1 spells `-0001-…` at 31. Both are refused; only the first is
-/// refused for the reason the length suggests.
+/// A year outside them changes the width either way — 10000 gains a sign and a digit and spells
+/// `+10000-…` at 32, while -1 gains only a sign and spells `-0001-…` at 31 — so one width check
+/// refuses both.
 const SPELLED_LENGTH: usize = 30;
 
 /// One more than the largest value a real nanosecond field can hold. chrono spends everything at or
@@ -28,8 +28,10 @@ const NANOSECONDS_PER_SECOND: u32 = 1_000_000_000;
 /// rejects that spelling as well, which would leave a row this program wrote and can never read.
 /// And a nanosecond field at or above one second, which chrono carries up to 1_999_999_999: it is
 /// spelled into the following second, so it either takes text an ordinary instant already owns or,
-/// at second 59, becomes a `:60` that no stored instant owns and no range query finds. A width
-/// check cannot see either, because the wrong spelling is exactly as wide as the right one.
+/// at second 59, becomes a `:60`. That one sorts after every instant of the minute it belongs to
+/// and before the minute that follows, so a window ending inside that minute passes over it while
+/// a window reaching past it selects text nothing can decode. A width check cannot see either,
+/// because the wrong spelling is exactly as wide as the right one.
 ///
 /// Requiring a real nanosecond field is what keeps stored instants on a grid, and that is what lets
 /// a half-open `[start, end)` be asked as `[start, end - 1ns]`. `Utc::now()` cannot produce a
@@ -37,11 +39,9 @@ const NANOSECONDS_PER_SECOND: u32 = 1_000_000_000;
 pub(crate) fn to_sql(at: DateTime<Utc>) -> Result<String, crate::StoreError> {
     let spelled = at.to_rfc3339_opts(SecondsFormat::Nanos, true);
     if at.nanosecond() >= NANOSECONDS_PER_SECOND {
-        // The spelling cannot stand for the value here, and it fails two different ways. Mid-minute
-        // it is text an ordinary stored instant already owns, so reporting it alone names the wrong
-        // value; at second 59 it is a `:60` no storable instant owns, which the half-open contract
-        // still places inside a window while the query misses it at both ends. Naming the field it
-        // came from is the only form that fits both.
+        // The spelling cannot stand for the value here: mid-minute it is text an ordinary stored
+        // instant already owns, so reporting it alone would name a different value than the one
+        // refused. Naming the field it came from is what separates them.
         return Err(crate::StoreError::TimestampOutOfRange {
             at: format!(
                 "{spelled} spelled from a nanosecond field of {}",

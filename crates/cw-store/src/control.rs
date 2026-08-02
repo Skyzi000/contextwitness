@@ -939,9 +939,6 @@ mod tests {
             detail: Some("middle.exe".to_owned()),
         };
         // The boundary row is what makes this test tell `<= end - 1 ns` apart from `< end - 1 ns`.
-        // It is not the only test that does:
-        // `every_event_the_schema_can_store_is_inside_a_window_it_can_search` puts an event on the
-        // same edge from the other side.
         let boundary = ControlEvent {
             id: ulid::Ulid::from(3u128),
             kind: EventKind::BlacklistSkip,

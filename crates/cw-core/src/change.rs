@@ -397,8 +397,9 @@ mod tests {
         // large panel, and which configuration is tightest does not follow from the pixel count
         // alone.
         // Bounds are the measured range over a full thumbnail-sample-period offset sweep, rounded
-        // outward, so a value on a measured edge is inside. Changing the resize filter, the glyph
-        // fixture or the pixel threshold moves them and must fail here.
+        // outward, so a value on a measured edge is inside. The loop below places its glyph at one
+        // offset, so a change to the resize filter, the glyph fixture or the pixel threshold needs
+        // that sweep run again and not only this test rerun.
         for (width, height, scale, logical_min, logical_max) in [
             (1024, 768, 1.0, 853.0, 1302.0),
             (1366, 768, 1.0, 1138.0, 1480.0),
@@ -439,8 +440,9 @@ mod tests {
         // one where a caret can measure exactly 0, because at that sample granularity one character
         // can split across four samples with none of them crossing the per-pixel threshold.
         // Bounds are the measured range over a full thumbnail-sample-period offset sweep, rounded
-        // outward, so a value on a measured edge is inside. Changing the resize filter, the glyph
-        // fixture or the pixel threshold moves them and must fail here.
+        // outward, so a value on a measured edge is inside. The loop below places its glyph at one
+        // offset, so a change to the resize filter, the glyph fixture or the pixel threshold needs
+        // that sweep run again and not only this test rerun.
         for (width, height, scale, logical_min, logical_max) in [
             (1024, 768, 1.0, 85.0, 150.0),
             (1366, 768, 1.0, 85.0, 171.0),
