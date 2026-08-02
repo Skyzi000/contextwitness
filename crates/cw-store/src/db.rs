@@ -98,23 +98,18 @@ fn read_user_version(
 /// Put the database into WAL mode, failing when it does not take.
 ///
 /// `PRAGMA journal_mode = WAL` reports a refusal by returning the mode the database is actually in
-/// rather than by failing, so the returned row is the only evidence that the statement did what it
-/// says.
-/// `query_one` rather than `query_row`, because that evidence arrives before the statement is
-/// finished. The mode change is written in a transaction that commits when the statement halts,
-/// which is the step after the row: `query_row` never takes that step and rusqlite discards the
-/// reset it does instead, so an `SQLITE_IOERR` or `SQLITE_FULL` from that commit would be dropped
-/// and this function would report success. `query_one` steps again and returns it.
+/// rather than by failing, so the returned row is the only evidence the statement did what it says.
+/// `query_one` rather than `query_row`, because the mode change commits when the statement halts,
+/// which is the step after that row: `query_row` never takes it and rusqlite discards the reset it
+/// does instead, so an `SQLITE_IOERR` or `SQLITE_FULL` from that commit would be dropped and this
+/// function would report success.
 ///
 /// Converting a rollback-journal database to WAL needs an exclusive lock, and this is the one
-/// statement `PRAGMA busy_timeout` does not reach: measured 2026-07-29 with a 5000 ms timeout in
-/// place, it came back `SQLITE_BUSY` after 612 us rather than waiting. Every subsystem opens its own
-/// connection, so on first start several of them meet on this one conversion — six opening together
-/// failed 83% of the time without a retry here, and none with it. Reasserting WAL on a database that
-/// already has it needs no exclusive lock and succeeds even while another connection is writing, so
-/// no open waits here once the file is in WAL. During the first start itself more than one open can
-/// wait: whichever reaches the conversion first has to clear both the other connections' migration
-/// transactions and their own attempts at the same conversion.
+/// statement `PRAGMA busy_timeout` does not reach — it comes back `SQLITE_BUSY` at once instead of
+/// waiting. Every subsystem opens its own connection, so a first start is several of them meeting
+/// on this one conversion, and most such starts failed before this function waited on its own
+/// behalf. Reasserting WAL on a database that already has it needs no exclusive lock and succeeds
+/// even while another connection is writing, so no open waits here once the file is in WAL.
 fn enable_wal(conn: &rusqlite::Connection, path: &std::path::Path) -> Result<(), StoreError> {
     let deadline = std::time::Instant::now() + WAL_SWITCH_DEADLINE;
     loop {
@@ -174,23 +169,19 @@ pub fn open(path: &std::path::Path) -> Result<rusqlite::Connection, StoreError> 
         })?;
 
     // One snapshot, not three reads. `ownership` asks three separate questions, and a statement
-    // outside a transaction is its own implicit transaction, so a first start in which another
-    // connection commits its migration between two of them combines an `application_id` of 0 read
-    // before the commit with a `sqlite_master` read after it — and calls a database this program
-    // has just created somebody else's. Measured 2026-07-30, eight connections opening 0.9 ms apart
-    // failed 52% of their opens that way; inside one read transaction it is 0% at every spacing
-    // tried. What makes it safe is not that a late connection waits — it may find the migration
-    // already committed and take its own write lock without waiting at all — but that the two
-    // answers it reads are answers about the same moment, so neither can be a refusal assembled
-    // out of one reading from before another connection's commit and one from after.
+    // outside a transaction is its own implicit transaction, so another connection committing its
+    // migration between two of them combines an `application_id` of 0 read before that commit with
+    // a `sqlite_master` read after it — and calls a database this program has just created somebody
+    // else's. Without the transaction that happened on more than half of concurrent first starts.
+    // What makes it safe is not that a late connection waits, since it may find the migration
+    // committed and take its own lock without waiting at all, but that its two answers are answers
+    // about the same moment.
     //
-    // Ownership before the version gate, because "whose file is this" has to be settled before
-    // "which schema is it at". Both are early refusals, and they earn their place by keeping this
-    // program from asking for a write lock on a stranger's database: a foreign file its real owner
-    // is writing to would otherwise make `migrate` wait out the busy timeout and report
-    // SQLITE_BUSY, which says much less than naming the owner. Neither is the decision anything
-    // rests on — `migrate` takes both again inside its write transaction, on the view its own
-    // writes land on.
+    // Ownership before the version gate, because whose file this is has to be settled before which
+    // schema it is at. Settling it first keeps this program from asking for a write lock on a
+    // stranger's database, where `migrate` would wait out the busy timeout and report SQLITE_BUSY
+    // rather than name the owner. Neither is authoritative: `migrate` takes both again inside its
+    // write transaction, on the view its own writes land on.
     {
         let snapshot = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
@@ -340,17 +331,15 @@ mod tests {
     #[test]
     fn a_first_start_where_every_subsystem_opens_at_once_succeeds() {
         // Every subsystem holds its own connection, so a first start is several opens at the same
-        // moment against a database still in rollback-journal mode. They all meet
-        // on the WAL conversion, which needs an exclusive lock and does not go through the busy
-        // timeout: measured 2026-07-29, six connections opening together failed 83% of the time
-        // before enable_wal waited on its own behalf.
+        // moment against a database still in rollback-journal mode. They all meet on the WAL
+        // conversion, which needs an exclusive lock and does not go through the busy timeout, and
+        // most such starts failed before `enable_wal` waited on its own behalf.
         const CONNECTIONS: usize = 8;
         // Two races live here and they need different spacings to show up. Starting together, the
-        // connections collide on the WAL conversion. Starting about a millisecond apart, a later one
-        // runs its ownership reads while an earlier one is committing the migration. Measured
-        // 2026-07-30 against the code before these fixes, no spacing sees both: together caught the
-        // first in 25 runs out of 30 and never the second, 900 us lost 52% of its opens to the
-        // second and never met the first.
+        // connections collide on the WAL conversion. Starting about a millisecond apart, a later
+        // one runs its ownership reads while an earlier one is committing the migration. No single
+        // spacing sees both, which is why this test uses more than one; and neither is certain in
+        // one run, so a green pass is evidence and not proof.
         const SPACINGS: [std::time::Duration; 4] = [
             std::time::Duration::ZERO,
             std::time::Duration::from_micros(500),

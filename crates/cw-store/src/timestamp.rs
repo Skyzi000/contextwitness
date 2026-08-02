@@ -14,42 +14,26 @@ const SPELLED_LENGTH: usize = 30;
 /// this schema can store owns at all.
 const NANOSECONDS_PER_SECOND: u32 = 1_000_000_000;
 
-/// Spell `at` for a TEXT column.
+/// Spell `at` for a TEXT column: fixed width, nanosecond precision, `Z`.
 ///
-/// Fixed width, nanosecond precision, `Z`. The columns a range query compares —
-/// `observations.observed_at` and `control_events.at` — are compared with `>=` and `<=` on the
-/// stored text, so string order has to be time order, and that is a property of the spelling, not
-/// of RFC 3339. The pause deadline and the health marks are fetched by key and decoded in Rust
-/// instead, and use this same spelling anyway: the decision is taken once, and a column that
-/// becomes range-compared later is already right rather than needing to be found first.
-/// With the fraction dropped when it is zero,
-/// `2026-07-25T12:34:56Z` sorts AFTER `2026-07-25T12:34:56.999999999Z`, because `Z` is 0x5A and `.`
-/// is 0x2E (measured 2026-07-28), so a row half a second into a window falls outside its own lower
-/// bound. Nanoseconds are not decoration either: the clock this program reads carries 100 ns
-/// granularity, so a coarser column would hand back a different instant than it was given.
+/// The columns a range query compares are compared as text, so string order has to be time order,
+/// and that is a property of this spelling rather than of RFC 3339. Dropping a zero fraction would
+/// break it: `Z` is 0x5A and `.` is 0x2E, so `12:34:56Z` would sort after `12:34:56.999999999Z` and
+/// a row half a second into a window would fall outside its own lower bound. Nanoseconds are not
+/// decoration either — the clock this program reads carries 100 ns granularity, so a coarser column
+/// would hand back a different instant than it was given.
 ///
-/// A value outside years 0000 through 9999 both stops sorting and stops parsing. `+` is 0x2B, below
-/// every digit, so year 10000 sorts before year 9999, and the parser rejects the spelling, which
-/// would leave a row this program wrote and can never read.
+/// Two values are refused rather than spelled. A year outside 0000 through 9999, because `+` is
+/// 0x2B and sorts below every digit, so year 10000 would sort before year 9999 — and the parser
+/// rejects that spelling as well, which would leave a row this program wrote and can never read.
+/// And a nanosecond field at or above one second, which chrono carries up to 1_999_999_999: it is
+/// spelled into the following second, so it either takes text an ordinary instant already owns or,
+/// at second 59, becomes a `:60` that no stored instant owns and no range query finds. A width
+/// check cannot see either, because the wrong spelling is exactly as wide as the right one.
 ///
-/// The nanosecond condition is not about the year: chrono's nanosecond field reaches
-/// 1_999_999_999, and anything at or above a billion is spelled as part of the following second, so
-/// `12:34:58` carrying 1.333 seconds is written as `12:34:59.333333333Z` — the same text an
-/// ordinary, different instant already owns. The width check cannot see that, because the wrong
-/// spelling is exactly as wide as the right one. At second 59 the same overflow spells as `:60`,
-/// which no storable instant owns — and which the half-open contract still places inside a window
-/// (measured 2026-07-30, `start <= leap` and `leap < end` are both true) while the closed-form
-/// query misses it at both ends, its text sorting after `23:59:59.999999999Z` and before
-/// `2017-01-01T00:00:00.000000000Z`. That is the shape of the danger throughout: not a value
-/// outside the range, but one the contract promises to return that the query cannot find.
-/// Requiring a real nanosecond field makes the spelling name exactly one instant
-/// and keeps the stored instants on the grid, which is what lets `find_in_window` state
-/// `[start, end)` as `[start, end - 1ns]` at all, in `observations::find_in_window` and
-/// `control::events_in_window` alike.
-/// Nothing real is lost: `Utc::now()` builds from a `Duration` since the epoch, whose subsecond part
-/// is below one second by construction.
-///
-/// Every task that stores a timestamp uses this, so the decision is taken once.
+/// Requiring a real nanosecond field is what keeps stored instants on a grid, and that is what lets
+/// a half-open `[start, end)` be asked as `[start, end - 1ns]`. `Utc::now()` cannot produce a
+/// refused value: it builds from a `Duration` since the epoch.
 pub(crate) fn to_sql(at: DateTime<Utc>) -> Result<String, crate::StoreError> {
     let spelled = at.to_rfc3339_opts(SecondsFormat::Nanos, true);
     if at.nanosecond() >= NANOSECONDS_PER_SECOND {
@@ -73,27 +57,20 @@ pub(crate) fn to_sql(at: DateTime<Utc>) -> Result<String, crate::StoreError> {
 
 /// Read a timestamp back, accepting only the spelling [`to_sql`] writes.
 ///
-/// Parsing is not enough. RFC 3339 lets the same instant be written many ways, and these columns
-/// are compared as TEXT, so a row spelled any other way is decodable and in the wrong place in
-/// every range query at once: `…+09:00` does not sort against the `Z` forms, a tenth fractional
-/// digit sorts before the `Z` that should follow the ninth, and an offset can carry a year outside
-/// the range across the boundary into one `to_sql` refuses to write. Re-spelling what was parsed
-/// and demanding the original back is the whole check, and it cannot fall out of step with
-/// [`to_sql`] because it is [`to_sql`]. What that is worth depends on who asks, because a range
-/// query compares the stored TEXT before anything is decoded. Measured 2026-07-30, all three of
-/// `…T12:00:00Z`, `…T12:00:00.0000+09:00` and `…T12:00:00.0000000001Z` sort inside a window
-/// covering that whole day, so such a query reaches this function and fails loudly; a five-minute
-/// window around noon selects only the first and drops the other two before the decoder is reached,
-/// losing them in silence. One row, two behaviours, decided by the bounds. Nothing but [`to_sql`]
-/// may write one of these columns: this function catches a bad row when a query happens to reach
-/// it, it does not prevent one.
-/// The reason `to_sql` gives for refusing the re-spelling is deliberately dropped: it describes the
-/// value that came back from parsing, and what has to be repaired is the text in the column. An
-/// error naming `-0001-12-31T23:59:00.000000000Z` for a row that reads
-/// `0000-01-01T00:00:00.000000000+00:01` points at nothing anyone can find.
-/// A parse failure is reported the same way and for the same reason: chrono's message describes the
-/// text it was handed, which the caller already has to be told about, and the one thing worth
-/// carrying up is which value in which row has to be repaired.
+/// Parsing is not enough. RFC 3339 lets one instant be written many ways and these columns are
+/// compared as text, so a row spelled otherwise decodes correctly and sits in the wrong place in
+/// every range query at once. Re-spelling what was parsed and demanding the original back is the
+/// whole check, and it cannot fall out of step with [`to_sql`] because it is [`to_sql`].
+///
+/// It catches such a row only when a query reaches it. A range query compares the stored text
+/// before anything is decoded, so a wide window reaches this function and fails loudly while a
+/// narrow one drops the row before the decoder and loses it in silence. Nothing but [`to_sql`] may
+/// write these columns: this reports a bad row, it does not prevent one.
+///
+/// Both failures report the text in the column rather than what parsing made of it. An error
+/// naming `-0001-12-31T23:59:00.000000000Z` for a row that reads
+/// `0000-01-01T00:00:00.000000000+00:01` points at nothing anyone can find, and what has to be
+/// repaired is the text.
 pub(crate) fn from_sql(
     text: &str,
 ) -> Result<DateTime<Utc>, Box<dyn std::error::Error + Send + Sync>> {
