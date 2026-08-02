@@ -1,8 +1,9 @@
 /// True when `foreground_process` (a full path or a bare file name) matches any blacklist entry.
 ///
-/// Only the file-name component is compared: whole, case-insensitively, with no globs and no
-/// substring matching. Matching a name the user did not write would suppress a program they never
-/// named.
+/// Only the file-name component is compared, whole and case-insensitively: an entry written as a
+/// full path matches that file name in any directory, and nothing matches by prefix, suffix or
+/// glob. Matching by fragment would suppress every program whose name merely contains the one
+/// written.
 ///
 /// This is a comparison of names and not of files. A directory with per-directory case sensitivity
 /// can hold `Foo.exe` and `foo.exe` as two different files, and one blacklist entry matches both. A

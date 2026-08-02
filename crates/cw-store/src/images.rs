@@ -196,9 +196,10 @@ pub fn save(
 ///
 /// This is an explicit request for one image, so it removes the row even when the file has already
 /// gone. Nothing that runs unasked may do that: [`orphan_rows`] reports a row whose file is gone
-/// and deletes nothing, and [`sweep_orphan_files`] removes only a file that nothing registered
-/// names. Neither is allowed to decide a picture is expendable. Nothing records that the image
-/// existed once this row is gone, and that is deliberate.
+/// and deletes nothing, and [`sweep_orphan_files`] removes a file only under the rule its own
+/// documentation gives, which states what that rule leaves out. Neither is allowed to decide a
+/// picture is expendable. Nothing records that the image existed once this row is gone, and that is
+/// deliberate.
 ///
 /// The row is committed before the file is removed, so a failure in between leaves an unregistered
 /// file for the next sweep rather than a row whose file is gone. That is the residue worth having:
@@ -610,8 +611,9 @@ fn collect_files(
             };
             let path = entry.path();
             // One name that cannot be answered about, in a listing that is otherwise still
-            // arriving. It costs this pass that one name and not the root's whole listing, so the
-            // rule above does not reach here even at the root.
+            // arriving. It costs this pass that name, and everything under it when the name was a
+            // directory, because the worklist never learns of it. What it does not cost is the
+            // root's whole listing, so the rule above does not reach here even at the root.
             let Ok(file_type) = entry.file_type() else {
                 continue;
             };
@@ -1290,8 +1292,7 @@ mod tests {
 
         // Creating a symlink needs Developer Mode or SeCreateSymbolicLinkPrivilege, so this case
         // cannot be built everywhere the suite runs, and the test returns without asserting where
-        // it cannot. The predicate it pins holds without it: `create_new` on such a name fails with
-        // `AlreadyExists`, which is exactly what the publishing rename would meet.
+        // it cannot.
         let Ok(()) = std::os::windows::fs::symlink_file(&missing_target, &path) else {
             return;
         };
@@ -1895,8 +1896,9 @@ mod tests {
         };
         // std has no way to set an ACL and this crate may hold no `unsafe`, so the check is asked
         // of the tool Windows ships with. After this, `canonicalize` answers `PermissionDenied`
-        // while `metadata` still answers that it is a directory — the one state that separates a
-        // root which is there and will not open from a path not created yet.
+        // while `symlink_metadata` — which is what the ancestor walk puts to the root — still
+        // answers that something is there, and that is what separates a root which will not open
+        // from a path not created yet.
         let denied = std::process::Command::new("icacls")
             .args([
                 path.as_str(),

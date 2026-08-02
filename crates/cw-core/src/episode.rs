@@ -105,12 +105,12 @@ pub fn build_episode(
     );
     entries.dedup_by(|current, previous| {
         // Fold only when this entry renders what the last kept one already put in the document.
-        // The timestamp is left out on purpose: it is the one rendered field a folded entry
-        // differs in, and collapsing repeated timestamps is the point. Everything else is compared
-        // whether the status renders it or not — `ocr_text` under one that shows no text, say — so
-        // this can keep two entries that would read alike, but it never folds two that would not.
-        // A folded entry takes its image path with it: the episode lists one picture per line it
-        // keeps.
+        // The timestamp is excluded: it is what a folded entry usually differs in, and collapsing
+        // repeated timestamps is the point — two observations at one instant fold as readily.
+        // Everything else is compared whether the status renders it or not — `ocr_text` under one
+        // that shows no text, say — so this can keep two entries that would read alike, but it
+        // never folds two that would not. A folded entry takes its image path with it, so the
+        // episode carries no picture from a line it dropped.
         let current = current.1;
         let previous = previous.1;
 
@@ -455,8 +455,8 @@ Monitor DISPLAY2 (1920x1080):
 
     #[test]
     fn consecutive_entries_with_different_text_are_never_collapsed() {
-        // Text is what this product exists to deliver, so two entries whose text differs must
-        // survive as two lines however small the difference is.
+        // Text is what this product exists to deliver, so the difference here being one character
+        // is not a reason to lose one of them.
         let observations = vec![
             observation(
                 1,

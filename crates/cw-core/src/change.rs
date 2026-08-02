@@ -150,10 +150,12 @@ pub fn max_logical_pixels(width: u32, height: u32, dpi_scale: f32) -> f64 {
 /// Whether `config.change_area_logical_pixels` can ever be exceeded on a monitor of this size.
 ///
 /// `frame_changed` compares with `>`, so a threshold at or above the monitor's logical area is
-/// never satisfied and that monitor is never captured again after its first frame — silently, with
-/// no error anywhere. `Config::validate` cannot check this because no monitor is known when the
-/// config is read, so it has to be asked once per monitor, as they are enumerated. Kept here so
-/// bound and the comparison that makes it a bound stay in the same file.
+/// never satisfied and no pixel difference on that monitor is ever captured again after its first
+/// frame — silently, with no error anywhere. What still gets through is a change of dimensions or
+/// DPI scale, which `frame_changed` answers before it compares any pixels. `Config::validate`
+/// cannot check this because no monitor is known when the config is read, so it has to be asked
+/// once per monitor, as they are enumerated. Kept here so bound and the comparison that makes it a
+/// bound stay in the same file.
 pub fn change_threshold_is_reachable(
     width: u32,
     height: u32,
@@ -396,10 +398,11 @@ mod tests {
         // 3840x2160 appears at both 100% and 150% on purpose: unscaled 4K is an ordinary setup on a
         // large panel, and which configuration is tightest does not follow from the pixel count
         // alone.
-        // Bounds are the measured range over a full thumbnail-sample-period offset sweep, rounded
-        // outward, so a value on a measured edge is inside. The loop below places its glyph at one
-        // offset, so a change to the resize filter, the glyph fixture or the pixel threshold needs
-        // that sweep run again and not only this test rerun.
+        // Bounds are the measured range over every glyph offset within one thumbnail sample period
+        // — `width / THUMBNAIL_WIDTH` by `height / THUMBNAIL_HEIGHT` — rounded outward, so a value
+        // on a measured edge is inside. Nothing in the tree reruns that sweep and the loop below
+        // places its glyph at one offset, so a change to the resize filter, the glyph fixture or
+        // the pixel threshold means deriving these again by hand.
         for (width, height, scale, logical_min, logical_max) in [
             (1024, 768, 1.0, 853.0, 1302.0),
             (1366, 768, 1.0, 1138.0, 1480.0),
@@ -439,10 +442,11 @@ mod tests {
         // configuration in the supported range — 450 against a 600 default — and the only realistic
         // one where a caret can measure exactly 0, because at that sample granularity one character
         // can split across four samples with none of them crossing the per-pixel threshold.
-        // Bounds are the measured range over a full thumbnail-sample-period offset sweep, rounded
-        // outward, so a value on a measured edge is inside. The loop below places its glyph at one
-        // offset, so a change to the resize filter, the glyph fixture or the pixel threshold needs
-        // that sweep run again and not only this test rerun.
+        // Bounds are the measured range over every glyph offset within one thumbnail sample period
+        // — `width / THUMBNAIL_WIDTH` by `height / THUMBNAIL_HEIGHT` — rounded outward, so a value
+        // on a measured edge is inside. Nothing in the tree reruns that sweep and the loop below
+        // places its glyph at one offset, so a change to the resize filter, the glyph fixture or
+        // the pixel threshold means deriving these again by hand.
         for (width, height, scale, logical_min, logical_max) in [
             (1024, 768, 1.0, 85.0, 150.0),
             (1366, 768, 1.0, 85.0, 171.0),

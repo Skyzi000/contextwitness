@@ -143,10 +143,11 @@ const REMOVABLE_ACCESS: u32 = 0x0001_0000;
 ///
 /// A name can be given to another file, and a directory above it can be replaced by a link, between
 /// deciding to remove something and removing it, so the caller holds the file it decided about.
-/// This opens an ordinary file with DELETE alone and answers `PermissionDenied` for a directory,
-/// which is a guarantee to the caller that a directory can never be removed this way. The file
-/// stays readable, writable, renamable and removable by name while the handle is held; what holding
-/// it does cost anyone else is on `FULL_SHARE_MODE`.
+/// This opens an ordinary file with DELETE alone and refuses a directory, which is the guarantee
+/// the caller gets: a directory can never be removed this way. Which error a directory produces is
+/// not part of it, because the spelling changes the answer. The file stays readable, writable,
+/// renamable and removable by name while the handle is held; what holding it does cost anyone else
+/// is on `FULL_SHARE_MODE`.
 pub fn open_for_removal(path: &std::path::Path) -> std::io::Result<std::fs::File> {
     use std::os::windows::fs::OpenOptionsExt;
 
@@ -323,12 +324,16 @@ mod tests {
         let path = unique_temp_path("open-for-removal-directory");
         std::fs::create_dir(&path).expect("the directory should be creatable");
 
-        // A directory answers `PermissionDenied`. The kind is not asserted — what the
-        // caller is promised, and what the image sweep's comment rests on, is only that this
-        // refuses.
-        let result = open_for_removal(&path);
+        // The kind is pinned for this spelling and is not what the caller is promised: the same
+        // directory named with a trailing separator answers `NotFound`, so only the refusal itself
+        // holds however the name is written.
+        let error = open_for_removal(&path).expect_err("a directory must not open for removal");
 
-        assert!(result.is_err(), "{result:?}");
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "{error:?}"
+        );
         std::fs::remove_dir(&path).expect("the test directory should be removable");
     }
 

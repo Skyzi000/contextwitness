@@ -174,8 +174,8 @@ pub fn open(path: &std::path::Path) -> Result<rusqlite::Connection, StoreError> 
     // a `sqlite_master` read after it — and calls a database this program has just created somebody
     // else's. Without the transaction that happened on more than half of concurrent first starts.
     // What makes it safe is not that a late connection waits, since it may find the migration
-    // committed and take its own lock without waiting at all, but that its two answers are answers
-    // about the same moment.
+    // committed and take its own lock without waiting at all, but that all three of its answers
+    // are answers about the same moment.
     //
     // Ownership before the version gate, because whose file this is has to be settled before which
     // schema it is at. Settling it first keeps this program from asking for a write lock on a
@@ -335,11 +335,11 @@ mod tests {
         // conversion, which needs an exclusive lock and does not go through the busy timeout, so
         // without the wait `enable_wal` does on its own behalf most such starts fail.
         const CONNECTIONS: usize = 8;
-        // Two races live here and they need different spacings to show up. Starting together, the
+        // Two races live here and each spacing favours one of them. Starting together, the
         // connections collide on the WAL conversion. Starting about a millisecond apart, a later
-        // one runs its ownership reads while an earlier one is committing the migration. No single
-        // spacing sees both, which is why this test uses more than one; and neither is certain in
-        // one run, so a green pass is evidence and not proof.
+        // one runs its ownership reads while an earlier one is committing the migration. Which one
+        // a given run hits is not something this test can tell, which is why it uses more than one
+        // spacing; and neither is certain in one run, so a green pass is evidence and not proof.
         const SPACINGS: [std::time::Duration; 4] = [
             std::time::Duration::ZERO,
             std::time::Duration::from_micros(500),

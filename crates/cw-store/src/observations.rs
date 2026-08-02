@@ -136,8 +136,9 @@ pub fn find_in_window(
     Ok(observations)
 }
 
-/// The payload column's text: the payload's own JSON, with no discriminator inside it. The `source`
-/// column is the single place the kind is written.
+/// The payload column's text: the payload's own JSON. This adds no discriminator to it — an
+/// `Unknown` payload is stored as it arrived and may carry whatever keys it came with — and the
+/// `source` column is the one this program reads the kind from.
 fn payload_json(
     observation: &Observation,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
@@ -526,8 +527,8 @@ mod tests {
             .expect("year 10000 should be valid");
 
         insert(&conn, &observation).expect("the last spellable observation should be stored");
-        // The exclusive end is year 10000, which has no spelling of its own. A reader that cannot
-        // spell the end of a window must still find the rows inside it.
+        // The exclusive end is year 10000, which has no spelling of its own, so this is what tells
+        // asking `<= end - 1ns` apart from asking against `end` itself.
         let found = find_in_window(&conn, start, end)
             .expect("the last spellable observation should be searchable");
         assert_eq!(found, vec![observation]);
