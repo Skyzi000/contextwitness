@@ -157,9 +157,9 @@ pub fn open_for_removal(path: &std::path::Path) -> std::io::Result<std::fs::File
         .open(path)
 }
 
-/// How many times the name is asked for before giving up. The file can be renamed while this call
-/// holds it, so an answer that outgrew the buffer measured for it is an outcome and not a fault;
-/// what must not happen is asking forever.
+/// How many rounds of asking for the room and then for the name before giving up. The file can be
+/// renamed while a handle to it is held, so an answer that outgrew the buffer measured for it is an
+/// outcome and not a fault; what must not happen is asking forever.
 const FINAL_PATH_ATTEMPTS: u32 = 4;
 
 /// The name this handle refers to, as the filesystem spells it now.
@@ -168,30 +168,47 @@ const FINAL_PATH_ATTEMPTS: u32 = 4;
 /// nothing about a handle opened before it. This asks the handle. The answer comes back in the
 /// `\\?\` form `canonicalize` also produces, so the two compare without normalising either.
 pub fn final_path_by_handle(file: &std::fs::File) -> std::io::Result<std::path::PathBuf> {
-    use std::os::windows::{ffi::OsStringExt, io::AsRawHandle};
+    use std::os::windows::io::AsRawHandle;
     use windows::Win32::{
         Foundation::HANDLE,
         Storage::FileSystem::{FILE_NAME_NORMALIZED, GetFinalPathNameByHandleW},
     };
 
     let handle = HANDLE(file.as_raw_handle());
+    path_from_sized_query(|buffer| unsafe {
+        GetFinalPathNameByHandleW(handle, buffer, FILE_NAME_NORMALIZED)
+    })
+}
+
+/// The name a size-then-fill query settles on, from a `query` that follows the Win32 convention:
+/// zero is a failure, a buffer that holds the name is filled and answered with the length without
+/// its terminator, and a buffer that does not is answered with the length that would, terminator
+/// included.
+///
+/// Separate from the call that supplies those answers because the arithmetic is what has to be
+/// right — the same number means the name or means the room it needs, and reading it the wrong way
+/// either abandons a file that was identified or hands back a truncated name as an identity. A
+/// Win32 call cannot be made to answer to order, and this can.
+fn path_from_sized_query(
+    mut query: impl FnMut(&mut [u16]) -> u32,
+) -> std::io::Result<std::path::PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+
     for _ in 0..FINAL_PATH_ATTEMPTS {
-        // Zero is the only failure this call reports. A buffer too small for the answer is reported
-        // by answering with the length that would hold it, so the second call below is asked again
-        // rather than mistaken for an error and given whatever `GetLastError` was left holding.
-        let required = unsafe { GetFinalPathNameByHandleW(handle, &mut [], FILE_NAME_NORMALIZED) };
+        // Asked for the room first, and then for the name. Running out of room in between is not a
+        // failure and is not reported as one, so it is asked again rather than given whatever
+        // `GetLastError` was left holding.
+        let required = query(&mut []);
         if required == 0 {
             return Err(std::io::Error::last_os_error());
         }
 
         let mut buffer = vec![0; required as usize];
-        let written =
-            unsafe { GetFinalPathNameByHandleW(handle, &mut buffer, FILE_NAME_NORMALIZED) };
+        let written = query(&mut buffer);
         if written == 0 {
             return Err(std::io::Error::last_os_error());
         }
-        // The length that came back excludes the terminator on success and includes it when the
-        // buffer was too small, so fitting strictly inside is what separates the two.
+        // Fitting strictly inside is what separates a name from the room a name needs.
         if (written as usize) < buffer.len() {
             return Ok(std::ffi::OsString::from_wide(&buffer[..written as usize]).into());
         }
@@ -520,5 +537,70 @@ mod tests {
 
         std::fs::remove_file(&held).expect("the newcomer should be removable");
         std::fs::remove_file(&moved).expect("the moved file should be removable");
+    }
+
+    /// Answers about a name that is one step further along on every call, in the shape the Win32
+    /// query uses: an empty or undersized buffer is answered with the room the name needs including
+    /// its terminator, and one that fits is filled and answered with the length without it. Because
+    /// the name moves on between the two calls of a round, a list that keeps growing is a name
+    /// being renamed out from under the caller, and a list that stops growing is one that settles.
+    fn query_over(names: &[&str]) -> impl FnMut(&mut [u16]) -> u32 {
+        let names: Vec<Vec<u16>> = names.iter().map(|n| n.encode_utf16().collect()).collect();
+        let mut call = 0usize;
+        move |buffer: &mut [u16]| {
+            let name = &names[call.min(names.len() - 1)];
+            call += 1;
+            if buffer.len() > name.len() {
+                buffer[..name.len()].copy_from_slice(name);
+                name.len() as u32
+            } else {
+                (name.len() + 1) as u32
+            }
+        }
+    }
+
+    #[test]
+    fn a_name_that_grows_once_and_then_settles_is_answered() {
+        // The first round measures for `ab` and is asked to hold `abcd`, so it is asked again.
+        let answered = path_from_sized_query(query_over(&["ab", "abcd", "abcd", "abcd"]))
+            .expect("a name that stops growing should be answered");
+
+        assert_eq!(answered, std::path::PathBuf::from("abcd"));
+    }
+
+    #[test]
+    fn a_name_that_never_settles_is_refused_rather_than_truncated() {
+        // Every round measures for one name and is asked to hold a longer one. Answering at all
+        // here would mean answering with a name that was cut to fit.
+        let error = path_from_sized_query(query_over(&[
+            "a", "ab", "abc", "abcd", "abcde", "abcdef", "abcdefg", "abcdefgh",
+        ]))
+        .expect_err("a name that keeps growing must not be answered");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::Other, "{error:?}");
+    }
+
+    #[test]
+    fn a_query_that_answers_zero_is_a_failure() {
+        // Which failure it is comes from the operating system and is not decided here; that it is
+        // one is.
+        path_from_sized_query(|_| 0).expect_err("zero must not be read as a name");
+    }
+
+    #[test]
+    fn an_answer_as_long_as_the_buffer_is_room_and_not_a_name() {
+        // The room a name needs includes its terminator, so an answer as long as the buffer is the
+        // room and not the name, and the buffer it came with was never written to. Reading it as a
+        // name hands back whatever that buffer happened to hold.
+        let error = path_from_sized_query(|buffer| {
+            if buffer.is_empty() {
+                4
+            } else {
+                buffer.len() as u32
+            }
+        })
+        .expect_err("an answer as long as the buffer must not be read as a name");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::Other, "{error:?}");
     }
 }
