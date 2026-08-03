@@ -243,7 +243,7 @@ fn path_from_sized_query(
     }
 
     Err(std::io::Error::other(
-        "the file's name grew every time it was asked for",
+        "the file's name never fit the room measured for it",
     ))
 }
 
