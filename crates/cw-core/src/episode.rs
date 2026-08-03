@@ -49,7 +49,7 @@ pub struct EpisodeMetadata {
 ///
 /// The epoch is aligned to midnight, so for any window length that divides 60 this is also
 /// aligned to the clock hour. Panics when `window_minutes` is zero; `Config::validate` rejects
-/// that, so reaching it means a caller built an `EpisodeConfig` by hand.
+/// that.
 pub fn window_start(
     at: chrono::DateTime<chrono::Utc>,
     window_minutes: u32,
