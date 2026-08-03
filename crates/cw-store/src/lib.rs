@@ -70,12 +70,12 @@ pub enum StoreError {
         /// Highest schema version this build understands.
         supported: i32,
     },
-    /// SQLite refused something: a statement, or a value in the type it was asked for. The second
-    /// is why reading a row's id reports this rather than `Encoding`, which names a row by the id
-    /// that read did not produce.
-    #[error("database statement failed: {source}")]
+    /// Whatever `rusqlite` refused: a statement SQLite rejected, or a value it would not hand back
+    /// in the type asked for. The second is why reading a row's id reports this rather than
+    /// `Encoding`, which names a row by the id that read did not produce.
+    #[error("database operation failed: {source}")]
     Sql {
-        /// Underlying SQLite error.
+        /// The error `rusqlite` produced.
         source: rusqlite::Error,
     },
     /// A row and the value it stands for could not be converted into one another.
