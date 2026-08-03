@@ -198,8 +198,8 @@ pub fn save(
 /// gone. Nothing that runs unasked may do that: [`orphan_rows`] reports a row whose file is gone
 /// and deletes nothing, and [`sweep_orphan_files`] removes a file only under the rule its own
 /// documentation gives, which states what that rule leaves out. Neither is allowed to decide a
-/// picture is expendable. Nothing records that the image existed once this row is gone, and that is
-/// deliberate.
+/// picture is expendable. The row is removed rather than marked, and that is deliberate; what goes
+/// on recording that there was a picture is the observation's payload, which keeps its path.
 ///
 /// The row is committed before the file is removed, so a failure in between leaves an unregistered
 /// file for the next sweep rather than a row whose file is gone. That is the residue worth having:
@@ -289,7 +289,8 @@ pub fn delete(
 /// A file is removed only when nothing registered names it, it still resolves to the name it was
 /// listed under, and it is not what one of the registered names reaches. That last question is put
 /// to the registered names no enumerated file spelled and not to every row; the comment inside says
-/// what that leaves out and what asking about all of them would cost. Reports how many went.
+/// what that leaves out and what asking about all of them would cost. Reports how many removals the
+/// filesystem accepted; one held open elsewhere leaves when that handle closes.
 ///
 /// This is a startup operation and must not run while anything is saving: a file renamed into place
 /// but not yet registered is indistinguishable from an orphan.
@@ -400,14 +401,17 @@ fn sweep_collected_files(
     // it reaches, and it is asked against every registered name that no enumerated file spelled —
     // the rows whose file, if it is there at all, is under some other name. On the ordinary
     // directory nothing reaches this point, because every enumerated file is registered under the
-    // name it was enumerated with. `canonicalize` answers with the name actually on disk, so two
-    // spellings of one file agree. A candidate whose identity cannot be established is kept: leaving
-    // a leftover costs disk, and removing a registered image costs the picture. Asking only about
-    // the names no enumerated file spelled is a cost decision and it leaves something out — a
-    // registered name that was an ordinary file when it was enumerated and has become a link by the
-    // time this runs is not asked about, so the file it now reaches can be taken as an orphan.
-    // Asking about every registered name instead is a filesystem round trip per registered row,
-    // paid on every startup where anything unregistered is under the root at all.
+    // name it was enumerated with. `canonicalize` answers with the name actually on disk, so a
+    // difference of case, a link, or any other way of writing one name collapses to a single
+    // answer. Two hardlinks are two names and stay two, which costs nothing here: removing the
+    // candidate's name leaves the registered one, and the picture with it. A candidate this cannot
+    // be answered about is kept: leaving a leftover costs disk, and removing a registered image
+    // costs the picture. Asking only about the names no enumerated file spelled is a cost decision
+    // and it leaves something out — a registered name that was an ordinary file when it was
+    // enumerated and has become a link by the time this runs is not asked about, so the file it now
+    // reaches can be taken as an orphan. Asking about every registered name instead is a filesystem
+    // round trip per registered row, paid on every startup where anything unregistered is under the
+    // root at all.
     let mut enumerated = Vec::with_capacity(files.len());
     for path in files {
         let relative = path_relative_to_root(root, path)?;
@@ -465,24 +469,26 @@ fn sweep_collected_files(
         // whatever the name reaches by then rather than about the file being removed. So the
         // question put here is what the open file calls itself. `collect_files` keeps only what the
         // filesystem calls a file and a link is not one, so every candidate was an ordinary file
-        // when it was listed, and an ordinary file opened by its listed name answers with that name
-        // — a hardlink, a non-ASCII name, names with spaces and dots and deep nesting all do, while
-        // a file reached through a replaced directory answers with a name under the replacement's
-        // target instead. Anything answering differently is not what was listed, and what the
-        // handle holds may be a registered image or may be outside the root entirely. This settles
-        // containment with it: every listed name is under the root by construction, so a handle
-        // that calls itself by its listed name is holding a file inside the root.
+        // when it was listed, and an ordinary file opened by its listed name answers with that
+        // name, while a file reached through a replaced directory answers with a name under the
+        // replacement's target instead. Anything answering differently is not what was listed, and
+        // what the handle holds may be a registered image or may be outside the root entirely. This
+        // settles containment with it: every listed name is under the root by construction, so a
+        // handle that calls itself by its listed name is holding a file inside the root.
         if identity.as_path() != path.as_path() || unspelled_identities.contains(&identity) {
             continue;
         }
 
         // Addressed to the handle opened above, so no name is resolved between the last check and
-        // the removal. A candidate that will not go is kept and the pass carries on, for the same
-        // reason as one that cannot be opened or resolved: a single file must not decide whether
-        // every other orphan is collected, and a file that fails the same way on every startup
-        // would mean none of them ever are. That is reachable with no race and no privilege: a
-        // read-only file opens for removal and then answers `PermissionDenied` to the disposition
-        // call. It is not counted, because the count is of files that went.
+        // the removal. What that settles is which file goes, not where it will be when it does:
+        // this handle shares the delete right, so the candidate can be renamed in between, and the
+        // removal follows the file rather than the name it had. A candidate that will not go is
+        // kept and the pass carries on, for the same reason as one that cannot be opened or
+        // resolved: a single file must not decide whether every other orphan is collected, and a
+        // file that fails the same way on every startup would mean none of them ever are. That is
+        // reachable with no race and no privilege: a read-only file opens for removal and then
+        // answers `PermissionDenied` to the disposition call. It is not counted, because the count
+        // is of removals the filesystem accepted.
         if cw_core::atomic_file::delete_by_handle(&file).is_ok() {
             removed += 1;
         }
@@ -575,8 +581,8 @@ fn collect_files(
             // walk was running, with nothing left under it to collect. At the root it is the root
             // itself going away after `sweep_orphan_files` resolved it, and no orphan exists under
             // a root that is not there. A root standing on something that cannot hold images takes
-            // the arm below instead: an ordinary file resolves, and listing it fails as
-            // `NotADirectory` rather than as an absence.
+            // the arm below instead: an ordinary file resolves, and listing it fails as something
+            // other than an absence, which is the whole of what this arm asks.
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => continue,
             // A root that will not be listed means nothing under it was seen at all, so answering
             // `Ok` there is a clean sweep reported on every startup of a store from which nothing
@@ -722,10 +728,10 @@ mod tests {
 
     /// Puts back what a `/deny` on `path` took away. A guard and not a call, because a panic — the
     /// failure the tests that use this exist to detect — unwinds past a restore written as a
-    /// statement, and a directory left holding such a deny cannot afterwards be removed by
-    /// anything, so the whole temporary tree stays on disk. Construct it before applying the deny,
-    /// so that the exit taken when `icacls` cannot even be waited on is covered, and after the
-    /// temporary directory, so that it runs before that directory is taken away.
+    /// statement, and a directory left holding such a deny is not removable by the `TempDir`
+    /// cleanup that follows, so the whole temporary tree stays on disk. Construct it before
+    /// applying the deny, so that the exit taken when `icacls` cannot even be waited on is covered,
+    /// and after the temporary directory, so that it runs before that directory is taken away.
     struct RestoreEntry<'a> {
         path: &'a str,
         user: &'a str,

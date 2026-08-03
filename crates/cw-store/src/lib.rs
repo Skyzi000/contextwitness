@@ -148,9 +148,10 @@ pub enum StoreError {
         /// Observation the frame belongs to.
         id: String,
     },
-    /// An operation on a path under the image root failed. Which operation is not recorded anywhere
-    /// on this variant: it is raised for creating, writing, syncing, renaming, reading, enumerating
-    /// and removing, and for a listed file that turns out not to be under the root at all.
+    /// An operation on the image root, or on a path being handled as one below it, failed. Which
+    /// operation is not recorded anywhere on this variant: it is raised for creating, writing,
+    /// syncing, renaming, reading, enumerating and removing, and for a listed file that turns out
+    /// not to be under the root at all.
     /// `source` does not close the gap — it says what went wrong and not what was attempted, so a
     /// `PermissionDenied` from a removal and one from creating a directory are the same value. A
     /// caller that has to tell them apart needs a field this variant does not have.
