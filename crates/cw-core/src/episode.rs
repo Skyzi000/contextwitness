@@ -83,12 +83,14 @@ pub fn build_episode(
     render_offset: chrono::FixedOffset,
     observations: &[crate::model::Observation],
 ) -> Option<Episode> {
-    use chrono::SubsecRound;
-
     // Everything below spells this to the second, `document_id` among them, so a start carrying a
     // fraction would answer for a window it does not bound and share an id with the rest of its
-    // second.
-    let window_start = window_start.trunc_subsecs(0);
+    // second. Taken through `timestamp` rather than by truncating the subsecond field, because that
+    // field also carries a leap second as a value at or above one second and truncating leaves it:
+    // measured, `12:34:58` with a nanosecond field of 1_000_000_000 keeps it, spells `12:34:59Z`
+    // exactly as the ordinary instant of that name does, and ends one second earlier than it does.
+    let window_start = chrono::DateTime::from_timestamp(window_start.timestamp(), 0)
+        .expect("a whole second taken from an instant must still be representable");
     let end_at = window_start + chrono::Duration::minutes(i64::from(window_minutes));
     let mut entries: Vec<_> = observations
         .iter()
@@ -414,6 +416,34 @@ mod tests {
         assert_eq!(episode.start_at, start);
         assert_eq!(episode.end_at, timestamp("2026-07-24T16:05:00Z"));
         assert_eq!(episode.document_id, "screen-2026-07-24T16:00:00Z-5m");
+    }
+
+    #[test]
+    fn a_start_inside_a_leap_second_is_not_the_window_it_spells_like() {
+        use chrono::Timelike;
+
+        let offset = FixedOffset::east_opt(9 * 3600).expect("test offset should be valid");
+        let observations = golden_observations();
+        let ordinary = timestamp("2026-07-24T15:59:59Z");
+        let leap = timestamp("2026-07-24T15:59:58Z")
+            .with_nanosecond(1_000_000_000)
+            .expect("a second should accept a leap nanosecond");
+
+        // The two are different instants that RFC 3339 spells alike once the fraction is dropped,
+        // which is the spelling `document_id` is built from. Built on `:58` rather than `:59`,
+        // because a leap nanosecond on `:59` spells `:60` and collides with no ordinary instant.
+        assert_ne!(leap, ordinary);
+        assert_eq!(
+            leap.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            ordinary.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        );
+
+        let from_ordinary = build_episode(ordinary, 5, offset, &observations)
+            .expect("the golden observations should build an episode");
+        let from_leap = build_episode(leap, 5, offset, &observations)
+            .expect("the leap start should build an episode of its own");
+
+        assert_ne!(from_leap.document_id, from_ordinary.document_id);
     }
 
     #[test]
