@@ -141,13 +141,14 @@ const REMOVABLE_ACCESS: u32 = 0x0001_0000;
 
 /// Open an existing file so that it can be removed through the handle rather than through its name.
 ///
-/// A name can be given to another file, and a directory above it can be replaced by a link, between
-/// deciding to remove something and removing it, so the caller holds the file it decided about.
-/// This opens an ordinary file with DELETE alone and refuses a directory, which is the guarantee
-/// the caller gets: a directory can never be removed this way. Which error a directory produces is
-/// not part of it, because the spelling changes the answer. The file stays readable, writable,
-/// renamable and removable by name while the handle is held; what holding it does cost anyone else
-/// is on `FULL_SHARE_MODE`.
+/// A name can be given to another file, and a directory above it can be replaced by a link, so
+/// resolving a name a second time to remove it can reach something else. The handle settles which
+/// file that is at the open, and nothing done to the name afterwards moves it; between deciding and
+/// the open there is no such hold. This opens an ordinary file with DELETE alone and refuses a
+/// directory, which is the guarantee the caller gets: a directory can never be removed this way.
+/// Which error a directory produces is not part of it, because the spelling changes the answer.
+/// The file stays readable, writable, renamable and removable by name while the handle is held;
+/// what holding it does cost anyone else is on `FULL_SHARE_MODE`.
 pub fn open_for_removal(path: &std::path::Path) -> std::io::Result<std::fs::File> {
     use std::os::windows::fs::OpenOptionsExt;
 
@@ -392,10 +393,11 @@ mod tests {
 
         let file = open_for_removal(&path).expect("an existing file should be openable to remove");
 
-        // What this handle gives away. Asserted here because `FULL_SHARE_MODE` is one constant and
-        // a bit missing from it shows up nowhere else: sharing is checked in both directions, so a
-        // newcomer whose own share mode leaves out a right this handle holds is refused, and
-        // anything that opens files exclusively is locked out while this is held.
+        // What this handle gives away. Sharing is checked in both directions, so a newcomer whose
+        // own share mode leaves out a right this handle holds is refused, and anything that opens
+        // files exclusively is locked out while this is held. The read and write bits are covered
+        // here and nowhere else. The removal bit is not: renaming a file needs it too, so every
+        // test that moves one out from under its handle fails without it as well.
         std::fs::File::open(&path).expect("a reader sharing what the library shares should get in");
         std::fs::OpenOptions::new()
             .write(true)

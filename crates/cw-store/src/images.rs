@@ -806,7 +806,7 @@ mod tests {
     }
 
     #[test]
-    fn save_writes_webp_atomically_and_registers_in_images_table() {
+    fn save_writes_a_decodable_webp_and_registers_it_in_the_images_table() {
         let (_dir, mut conn, root) = database();
         let id = ulid::Ulid::new();
         let taken_at = at(2026, 7, 30);

@@ -292,9 +292,11 @@ pub fn events_in_window(
         return Ok(Vec::new());
     }
 
-    // The window's last instant, which is what the statement compares against. `checked_sub_signed`
-    // rather than `-`: subtracting from the earliest instant chrono has would panic, and a window
-    // ending there holds nothing.
+    // The window's last instant, which is what the statement compares against; asking for it rather
+    // than for `end` is also what lets a window end where no spelling exists, as year 10000 does.
+    // The guard above leaves `end` later than the earliest instant chrono has, so the subtraction
+    // cannot fail. `checked_sub_signed` rather than `-` because `-` answers that case with a panic
+    // instead of an empty window.
     let Some(last) = end.checked_sub_signed(chrono::TimeDelta::nanoseconds(1)) else {
         return Ok(Vec::new());
     };

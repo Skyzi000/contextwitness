@@ -41,8 +41,8 @@ pub enum StoreError {
     },
     /// The database could not be put into WAL mode.
     #[error(
-        "database {path} is in {actual} mode, not WAL; the subsystems that each hold their own \
-         connection would block one another for as long as any write is in progress"
+        "database {path} is in {actual} mode, not WAL; this program runs several connections \
+         against it at once and requires WAL"
     )]
     JournalMode {
         /// Database file path.
@@ -70,7 +70,9 @@ pub enum StoreError {
         /// Highest schema version this build understands.
         supported: i32,
     },
-    /// A statement against the database failed.
+    /// SQLite refused something: a statement, or a value in the type it was asked for. The second
+    /// is why reading a row's id reports this rather than `Encoding`, which names a row by the id
+    /// that read did not produce.
     #[error("database statement failed: {source}")]
     Sql {
         /// Underlying SQLite error.
