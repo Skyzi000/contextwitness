@@ -301,8 +301,9 @@ pub fn sweep_orphan_files(
     // against is the one taken here rather than one taken after the walk. What this does not do is
     // pin the tree that gets enumerated: what is held is a path and not a handle, so `collect_files`
     // resolves this spelling again and a link put at the root's name in between is followed. What
-    // keeps that from costing anything is the per-candidate check further down — a file listed
-    // under the replacement does not resolve to the name it was listed under, so it is kept. That
+    // keeps that from costing anything is the per-candidate check further down — a file opened
+    // under the replacement answers with a name below the replacement's target rather than with the
+    // one it was listed under, so it is kept. That
     // check is load-bearing here and not merely a second opinion. Resolving the root after the walk
     // would move the baseline itself, and then every file under the replacement would compare as
     // though it belonged here.
@@ -448,31 +449,30 @@ fn sweep_collected_files(
         if registered.contains(relative) {
             continue;
         }
-        // Opened before anything is decided, so that what goes at the end is the file this
-        // iteration examined. `remove_file` would resolve the name a third time — after the walk
-        // that listed it and after the `canonicalize` below — and a directory replaced above it in
-        // between sends the removal wherever the replacement leads. A candidate that cannot be
-        // opened is kept, for the same reason as one that cannot be resolved: two startups can
-        // reach the same orphan, and the one that arrives second has nothing left to do. A
-        // directory cannot be opened this way at all, so no pass can remove one.
+        // Opened first, and then asked about itself, so that one file answers both the question and
+        // the removal. A candidate that cannot be opened is kept, for the same reason as one that
+        // cannot be identified: two startups can reach the same orphan, and the one that arrives
+        // second has nothing left to do. A directory cannot be opened this way at all, so no pass
+        // can remove one.
         let Ok(file) = cw_core::atomic_file::open_for_removal(path) else {
             continue;
         };
-        let Ok(identity) = std::fs::canonicalize(path) else {
+        let Ok(identity) = cw_core::atomic_file::final_path_by_handle(&file) else {
             continue;
         };
-        // Every name here is resolved once to list it and again to act on it, and what stands under
-        // it can be replaced in between — the entry itself, or a directory above it, since Windows
-        // follows a reparse point met partway along a path. No spelling protects against that, so
-        // the question is what the filesystem answers with. `collect_files` keeps only what the
+        // What stands under a name can be replaced between resolving it and acting on it — the
+        // entry itself, or a directory above it, since Windows follows a reparse point met partway
+        // along a path. Resolving the name a second time would only produce a second answer, about
+        // whatever the name reaches by then rather than about the file being removed. So the
+        // question put here is what the open file calls itself. `collect_files` keeps only what the
         // filesystem calls a file and a link is not one, so every candidate was an ordinary file
-        // when it was listed, and an ordinary file resolves to the name it was listed under.
-        // Every listed file canonicalizes to its own listed path — a hardlink, a non-ASCII name,
-        // names with spaces and dots and deep nesting all do — while a name reached through a
-        // directory link does not. Anything answering differently is no longer what was listed, and
-        // what it now reaches may be a registered image. This settles containment too: every listed
-        // name is under the root by construction, so a candidate that is its own name is inside the
-        // root.
+        // when it was listed, and an ordinary file opened by its listed name answers with that name
+        // — a hardlink, a non-ASCII name, names with spaces and dots and deep nesting all do, while
+        // a file reached through a replaced directory answers with a name under the replacement's
+        // target instead. Anything answering differently is not what was listed, and what the
+        // handle holds may be a registered image or may be outside the root entirely. This settles
+        // containment with it: every listed name is under the root by construction, so a handle
+        // that calls itself by its listed name is holding a file inside the root.
         if identity.as_path() != path.as_path() || unspelled_identities.contains(&identity) {
             continue;
         }

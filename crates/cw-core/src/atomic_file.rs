@@ -157,6 +157,33 @@ pub fn open_for_removal(path: &std::path::Path) -> std::io::Result<std::fs::File
         .open(path)
 }
 
+/// The name this handle refers to, as the filesystem spells it now.
+///
+/// Resolving a name twice can reach two files, so a check made against a freshly resolved name says
+/// nothing about a handle opened before it. This asks the handle. The answer comes back in the
+/// `\\?\` form `canonicalize` also produces, so the two compare without normalising either.
+pub fn final_path_by_handle(file: &std::fs::File) -> std::io::Result<std::path::PathBuf> {
+    use std::os::windows::{ffi::OsStringExt, io::AsRawHandle};
+    use windows::Win32::{
+        Foundation::HANDLE,
+        Storage::FileSystem::{FILE_NAME_NORMALIZED, GetFinalPathNameByHandleW},
+    };
+
+    let handle = HANDLE(file.as_raw_handle());
+    let required = unsafe { GetFinalPathNameByHandleW(handle, &mut [], FILE_NAME_NORMALIZED) };
+    if required == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let mut buffer = vec![0; required as usize];
+    let written = unsafe { GetFinalPathNameByHandleW(handle, &mut buffer, FILE_NAME_NORMALIZED) };
+    if written == 0 || written as usize >= buffer.len() {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    Ok(std::ffi::OsString::from_wide(&buffer[..written as usize]).into())
+}
+
 /// Remove the file this handle refers to, whatever name it answers to by now.
 ///
 /// A name can be given to another file between deciding to remove one and removing it, and every
@@ -439,5 +466,65 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&temp_dir).expect("the test directory should be removable");
+    }
+
+    #[test]
+    fn the_final_path_is_spelled_the_way_canonicalize_spells_it() {
+        let path = unique_temp_path("final-path-spelling");
+        std::fs::write(&path, b"contents").expect("the file should be creatable");
+        let canonical = std::fs::canonicalize(&path).expect("the file should canonicalize");
+
+        let file = open_for_removal(&path).expect("the file should open for removal");
+        let answered = final_path_by_handle(&file).expect("the handle should answer its own name");
+        drop(file);
+
+        // The sweep compares this against names taken from a walk over a canonicalized root, so an
+        // answer in any other form would never match one of them and every orphan would be kept.
+        assert_eq!(answered, canonical);
+
+        std::fs::remove_file(&path).expect("the test file should be removable");
+    }
+
+    #[test]
+    fn the_final_path_stays_with_the_open_file_when_the_name_is_given_to_another() {
+        let root = unique_temp_path("final-path-root");
+        let outside = unique_temp_path("final-path-outside");
+        std::fs::create_dir(&root).expect("the root directory should be creatable");
+        let inner = root.join("inner");
+
+        // Creating a directory link needs Developer Mode or SeCreateSymbolicLinkPrivilege, so this
+        // case cannot be built everywhere the suite runs.
+        let Ok(()) = std::os::windows::fs::symlink_dir(&outside, &inner) else {
+            std::fs::remove_dir(&root).expect("the root directory should be removable");
+            return;
+        };
+
+        std::fs::create_dir(&outside).expect("the outside directory should be creatable");
+        let held = outside.join("held.bin");
+        std::fs::write(&held, b"outside").expect("the outside file should be creatable");
+
+        // Opened while the name leads out of the root, and then the name is made to lead back in.
+        // A sweep resolving the name after this point would be told the candidate is where it was
+        // listed, and would then remove the file it is holding, which is the one outside.
+        let spelling = inner.join("held.bin");
+        let file = open_for_removal(&spelling).expect("the outside file should open");
+        std::fs::remove_dir(&inner).expect("the link should be removable");
+        std::fs::create_dir(&inner).expect("an ordinary directory should take the link's name");
+        std::fs::write(&spelling, b"inside").expect("a file should take the name inside the root");
+
+        let answered = final_path_by_handle(&file).expect("the handle should answer its own name");
+        drop(file);
+
+        let by_name = std::fs::canonicalize(&spelling).expect("the inside file should resolve");
+        let outside_now = std::fs::canonicalize(&held).expect("the outside file should resolve");
+
+        assert_eq!(answered, outside_now);
+        assert_ne!(answered, by_name);
+
+        std::fs::remove_file(&spelling).expect("the inside file should be removable");
+        std::fs::remove_dir(&inner).expect("the inside directory should be removable");
+        std::fs::remove_dir(&root).expect("the root directory should be removable");
+        std::fs::remove_file(&held).expect("the outside file should be removable");
+        std::fs::remove_dir(&outside).expect("the outside directory should be removable");
     }
 }
