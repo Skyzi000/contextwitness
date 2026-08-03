@@ -495,6 +495,7 @@ mod tests {
             "the test database should start in rollback-journal mode"
         );
         drop(conn);
+        let before = std::fs::read(&path).expect("the test database should be readable");
 
         match open(&path) {
             Err(StoreError::UnsupportedSchema { .. }) => {}
@@ -502,22 +503,15 @@ mod tests {
             Ok(_) => panic!("the unsupported schema version was accepted"),
         }
 
-        let conn = rusqlite::Connection::open(&path)
-            .expect("the refused database should still be openable");
-        let journal_mode: String = conn
-            .pragma_query_value(None, "journal_mode", |row| row.get(0))
-            .expect("the refused database journal mode should be readable");
-        let application_id: i32 = conn
-            .pragma_query_value(None, "application_id", |row| row.get(0))
-            .expect("the refused database application id should be readable");
-        let user_version: i32 = conn
-            .pragma_query_value(None, "user_version", |row| row.get(0))
-            .expect("the refused database version marker should be readable");
+        // Compared as bytes rather than by reading the three values back, because the name is about
+        // the whole file: `open` applies its connection settings before it looks at the version, so
+        // a settings line that turned out to write would change the file while all three of those
+        // read back exactly as they were.
+        let after = std::fs::read(&path).expect("the refused database should still be readable");
         assert_eq!(
-            (journal_mode.as_str(), application_id, user_version),
-            ("delete", APPLICATION_ID, SCHEMA_VERSION + 1),
-            "refusing a file this build cannot handle must leave these values as found, and a \
-             newer build's version marker is the one thing that build needs intact"
+            after, before,
+            "refusing a file this build cannot handle must leave it as found, and a newer build's \
+             version marker is the one thing that build needs intact"
         );
     }
 
