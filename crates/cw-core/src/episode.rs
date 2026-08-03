@@ -67,9 +67,9 @@ pub fn window_start(
 /// `render_offset` is the UTC offset used for the human-readable times in the body. Supplying the
 /// machine's local offset is what makes a memory read back in the time the user experienced, for
 /// any window that does not straddle an offset transition; ids and metadata stay UTC regardless. A
-/// window that does straddle one renders every line at the single supplied offset, so one side of
-/// it reads an hour from where it happened; the header prints the offset, so the result stays
-/// readable.
+/// window that does straddle one renders every line at the single supplied offset, so lines on the
+/// side that offset does not describe are shifted by whatever the transition was; the header prints
+/// the offset, so the result stays readable.
 ///
 /// The fold relation is field-wise equality and therefore an equivalence relation, so comparing
 /// against the last kept entry and comparing against the immediately preceding one agree here.

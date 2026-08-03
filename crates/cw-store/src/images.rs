@@ -192,7 +192,7 @@ pub fn save(
     Ok(relative)
 }
 
-/// Remove an image and the record that it existed.
+/// Remove an image and the row that registers it.
 ///
 /// This is an explicit request for one image, so it removes the row even when the file has already
 /// gone. Nothing that runs unasked may do that: [`orphan_rows`] reports a row whose file is gone
