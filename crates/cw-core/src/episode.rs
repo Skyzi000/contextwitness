@@ -8,8 +8,9 @@ const SCREEN_SOURCE: &str = "screen";
 /// inserted, so that building an episode twice yields two equal values.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Episode {
-    /// Source that produced this episode; goes straight into the `episodes.source` column and is
-    /// the prefix of `document_id`, so the two can never disagree.
+    /// Source that produced this episode; goes straight into the `episodes.source` column, and
+    /// `build_episode` derives the prefix of `document_id` from this same value rather than from a
+    /// second spelling of it.
     pub source: &'static str,
     /// Inclusive start of the window.
     pub start_at: chrono::DateTime<chrono::Utc>,
@@ -106,17 +107,16 @@ pub fn build_episode(
         },
     );
     entries.dedup_by(|current, previous| {
-        // Fold when this entry would put nothing in the document but its own time. The timestamp
-        // is excluded from the comparison: it is what a folded entry usually differs in, and
-        // collapsing repeated times is the point — two observations at one instant fold as
-        // readily. What is compared is the monitor, the foreground process and title, and the OCR
-        // status with both the text and the error it chooses between. Text and error are compared
-        // whether this entry's status renders them or not — `ocr_text` under one that shows no
-        // text, say — so this can keep two entries that read alike apart from the time, but it
-        // never folds two that differ in anything else. The size printed beside the monitor name
-        // is left out because it is written only where the monitor changes, and an entry matching
-        // the last kept one's monitor would not have written it. A folded entry takes its image
-        // path with it, so the episode carries no picture from a line it dropped.
+        // Fold on the six fields below and nothing else. The timestamp is excluded because it is
+        // what a folded entry usually differs in, and collapsing repeated times is the point — two
+        // observations at one instant fold as readily. Text and error are compared whether this
+        // entry's status renders them or not, so two that a reader could not tell apart are kept
+        // apart when a hidden `ocr_text` differs; erring towards keeping is the safer way for this
+        // to be wrong. The other direction is real too: the monitor's size, the image path and the
+        // OCR languages are not compared, so entries differing only in those do fold. The size is
+        // left out because it is written only where the monitor changes, and an entry matching the
+        // last kept one's monitor would not have written it. A folded entry takes its image path
+        // with it, so the episode carries no picture from a line it dropped.
         let current = current.1;
         let previous = previous.1;
 

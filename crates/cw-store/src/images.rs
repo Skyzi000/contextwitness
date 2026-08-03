@@ -274,6 +274,12 @@ pub fn delete(
     // is left over on failure. A leftover file is unregistered and the next sweep takes it; a
     // leftover row is one `orphan_rows` reports and nothing removes, and retention would keep
     // charging its `byte_size` against a disk budget that is already free.
+    //
+    // By name, unlike the sweep, which holds a handle so that a directory replaced above it cannot
+    // redirect the removal. The same replacement works here, and what it reaches is a file named by
+    // this observation's id under wherever the replacement leads. Closing it the sweep's way needs
+    // an open that does not follow a reparse point, because this name may be a link and it is the
+    // link's own entry that has to go — `open_for_removal` follows one, so it is not that open.
     if occupied {
         match std::fs::remove_file(&path) {
             Ok(()) => {}
@@ -471,10 +477,14 @@ fn sweep_collected_files(
         // filesystem calls a file and a link is not one, so every candidate was an ordinary file
         // when it was listed, and an ordinary file opened by its listed name answers with that
         // name, while a file reached through a replaced directory answers with a name under the
-        // replacement's target instead. Anything answering differently is not what was listed, and
-        // what the handle holds may be a registered image or may be outside the root entirely. This
-        // settles containment with it: every listed name is under the root by construction, so a
-        // handle that calls itself by its listed name is holding a file inside the root.
+        // replacement's target instead. Anything answering differently is not standing at that name
+        // at all, and what the handle holds may be a registered image or may be outside the root
+        // entirely. What this settles is where the file is and not that it is the one the walk saw:
+        // a candidate can be moved away and another file put under its name in between, and that
+        // one answers with the listed name and goes. It is unregistered and under the root, which
+        // is what this pass removes, so the substitution costs nothing. Containment comes with it:
+        // every listed name is under the root by construction, so a handle that calls itself by its
+        // listed name is holding a file inside the root.
         if identity.as_path() != path.as_path() || unspelled_identities.contains(&identity) {
             continue;
         }

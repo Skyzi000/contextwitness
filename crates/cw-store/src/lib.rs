@@ -42,7 +42,7 @@ pub enum StoreError {
     /// The database could not be put into WAL mode.
     #[error(
         "database {path} is in {actual} mode, not WAL; the subsystems that each hold their own \
-         connection cannot share a database without it"
+         connection would block one another for as long as any write is in progress"
     )]
     JournalMode {
         /// Database file path.
