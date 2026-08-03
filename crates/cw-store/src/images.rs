@@ -201,18 +201,22 @@ pub fn save(
 /// picture is expendable. The row is removed rather than marked, and that is deliberate; what goes
 /// on recording that there was a picture is the observation's payload, which keeps its path.
 ///
+/// The entry is opened before the row is committed and the removal is addressed to that handle, so
+/// a name that will not open — a directory, or a link to one — is reported with the row still in
+/// place, and whatever is published into the name after the commit is never taken for the file the
+/// row named.
+///
 /// The row is committed before the file is removed, so a failure in between leaves an unregistered
 /// file for the next sweep rather than a row whose file is gone. That is the residue worth having:
 /// the failure this has to survive is a full disk during retention, and a row kept for a file that
 /// is gone would go on charging its `byte_size` against a budget that is already free.
 ///
-/// Whether there is a file to remove is decided while the transaction still holds the lock. If the
-/// name is occupied, a `save` for the same observation whose rename reaches that name before the
-/// removal does finds it held and fails with [`StoreError::ImageIo`], because the rename refuses to
-/// replace. What that guarantees is only that no save can take the name before the removal is
-/// through; one whose rename lands after it finds the name free and succeeds the first time. If the
-/// name is empty — a row whose file has already gone — nothing is
-/// removed at all, so a save that follows this commit keeps the file it renames into that name.
+/// While that entry is held, a `save` for the same observation whose rename reaches the name fails
+/// with [`StoreError::ImageIo`], because the rename refuses to replace. What that guarantees is
+/// only that no save can take the name before the removal is through; one whose rename lands after
+/// it finds the name free and succeeds the first time. If the name is empty — a row whose file has
+/// already gone — nothing is removed at all, so a save that follows this commit keeps the file it
+/// renames into that name.
 ///
 /// The observation, its OCR text and its payload are untouched: they are the point of the record
 /// and outlive the picture. Empty day directories are left behind on purpose, because pruning one
@@ -245,22 +249,27 @@ pub fn delete(
         return Ok(());
     };
     let path = root.join(relative);
-    // Decided while the transaction still holds the lock, because after the commit this name stops
-    // being this call's business. A row whose file is already gone is a state this store tolerates,
-    // and there the work left is nothing: a `save` for this observation that follows the commit
-    // renames its new file into this very name, and a removal running afterwards would take it
-    // away while its fresh row said it was there. When the name is occupied, no save can reach it
-    // first — the rename refuses to replace, so it fails until this removal is through. A name that
-    // cannot even be asked about counts as occupied, so the removal below reports the real error
-    // rather than this line inventing one.
-    // Asked without following links, because the question is whether a directory entry exists under
-    // this name — the question `rename_without_replacing` answers — and not whether anything can be
-    // read through it. A link whose target is gone still has an entry, and leaving it would stand in
-    // the way of every later save for this observation, and not until the next startup either,
-    // because the sweep collects only entries the filesystem calls files and a link is not one.
-    let occupied = match path.symlink_metadata() {
-        Ok(_) => true,
-        Err(source) => source.kind() != std::io::ErrorKind::NotFound,
+    // Opened while the transaction still holds the lock, and the removal below is addressed to this
+    // handle, so the name is resolved once and never again. Deciding by name and then resolving it
+    // a second time after the commit would remove whatever it reached by then, which need not be
+    // the file the row named: the entry can be moved aside and a `save` for this same observation
+    // can publish a new file into the freed name, and that file has a fresh row saying it is there.
+    //
+    // Asked without following the last component, because clearing a name means taking the entry
+    // that carries it and not the file at the other end. A link whose target is gone still has an
+    // entry, and leaving it would stand in the way of every later save for this observation, and
+    // not until the next startup either, because the sweep collects only entries the filesystem
+    // calls files and a link is not one.
+    //
+    // A row whose file is already gone is a state this store tolerates, and there the work left is
+    // nothing. Anything else that will not open is reported with the row still in place: a
+    // directory or a link to one answers `PermissionDenied` here, and committing first would leave
+    // the name taken with no row to find it by, so every later save for this observation would
+    // collide with it and nothing would ever clear it.
+    let held = match cw_core::atomic_file::open_entry_for_removal(&path) {
+        Ok(file) => Some(file),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => None,
+        Err(source) => return Err(StoreError::ImageIo { path, source }),
     };
 
     transaction
@@ -274,23 +283,9 @@ pub fn delete(
     // is left over on failure. A leftover file is unregistered and the next sweep takes it; a
     // leftover row is one `orphan_rows` reports and nothing removes, and retention would keep
     // charging its `byte_size` against a disk budget that is already free.
-    //
-    // Opened once and then removed through the handle, so no name is resolved between deciding and
-    // removing. Resolving twice would let a directory replaced in between send the removal to a
-    // file of this name wherever the replacement leads. Not following the last component either:
-    // this name may be a link, and clearing a name means taking the entry that carries it and not
-    // the file at the other end.
-    if occupied {
-        match cw_core::atomic_file::open_entry_for_removal(&path) {
-            Ok(file) => {
-                if let Err(source) = cw_core::atomic_file::delete_by_handle(&file) {
-                    return Err(StoreError::ImageIo { path, source });
-                }
-            }
-            // Nothing left to remove is the outcome this was asked for.
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
-            Err(source) => return Err(StoreError::ImageIo { path, source }),
-        }
+    if let Some(file) = held {
+        cw_core::atomic_file::delete_by_handle(&file)
+            .map_err(|source| StoreError::ImageIo { path, source })?;
     }
 
     Ok(())
@@ -1356,17 +1351,18 @@ mod tests {
     }
 
     #[test]
-    fn a_file_that_cannot_be_removed_leaves_no_row_behind() {
+    fn a_name_that_will_not_open_keeps_its_row() {
         let (_dir, mut conn, root) = database();
         let id = ulid::Ulid::new();
         let relative = save_test_image(&mut conn, &root, id, at(2026, 7, 30), 52);
         let path = root.join(relative);
 
-        // On Windows `remove_file` against a directory fails with `PermissionDenied` and leaves it
-        // in place, while a missing file and a missing parent directory both come back as
-        // `NotFound`. That is the deterministic non-`NotFound` failure this needs, and the absent
-        // row is what tells this order apart from removing the file first — that one returns before
-        // the row is ever touched.
+        // A directory answers `PermissionDenied` to the open this removal needs, and measured, so
+        // does a link to one — the arrangement that would otherwise need a privilege to build. A
+        // missing file and a missing parent both come back as `NotFound`, so this is the
+        // deterministic failure that is neither. The surviving row is what tells this order apart
+        // from committing first, which would leave the name taken with no row to find it by while
+        // every later save for this observation collided with it.
         std::fs::remove_file(&path).expect("the saved file should be removable before replacement");
         std::fs::create_dir(&path).expect("a directory should be creatable at the image path");
 
@@ -1385,7 +1381,7 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("the image count should be readable");
-        assert_eq!(count, 0);
+        assert_eq!(count, 1);
         assert!(path.is_dir());
     }
 
