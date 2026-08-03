@@ -211,12 +211,14 @@ pub fn save(
 /// the failure this has to survive is a full disk during retention, and a row kept for a file that
 /// is gone would go on charging its `byte_size` against a budget that is already free.
 ///
-/// While that entry is held, a `save` for the same observation whose rename reaches the name fails
-/// with [`StoreError::ImageIo`], because the rename refuses to replace. What that guarantees is
-/// only that no save can take the name before the removal is through; one whose rename lands after
-/// it finds the name free and succeeds the first time. If the name is empty — a row whose file has
-/// already gone — nothing is removed at all, so a save that follows this commit keeps the file it
-/// renames into that name.
+/// The name stays taken from before the commit until this call returns, because a removal through
+/// a handle frees the name only when the last handle to it closes and this one closes here. A
+/// `save` for the same observation whose rename reaches the name meanwhile is refused rather than
+/// replacing anything; one whose rename lands after finds the name free and succeeds the first
+/// time. What refuses that rename is the name being taken and not this call holding it: the handle
+/// excludes nobody, and anything free to move the entry aside frees the name while it is held. If
+/// the name is empty — a row whose file has already gone — nothing is removed at all, so a save
+/// that follows this commit keeps the file it renames into that name.
 ///
 /// The observation, its OCR text and its payload are untouched: they are the point of the record
 /// and outlive the picture. Empty day directories are left behind on purpose, because pruning one
