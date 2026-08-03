@@ -738,6 +738,20 @@ mod tests {
         (dir, conn, root)
     }
 
+    /// A directory junction at `link` leading to `target`. A directory symlink reaches the same
+    /// branches and needs Developer Mode or SeCreateSymbolicLinkPrivilege, which is why the tests
+    /// built on one returned without asserting wherever that was absent. `mklink` is a `cmd`
+    /// builtin and has no executable of its own.
+    fn junction(link: &std::path::Path, target: &std::path::Path) {
+        let created = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .expect("cmd should be spawnable");
+        assert!(created.status.success(), "the junction should be creatable");
+    }
+
     /// Puts back what a `/deny` on `path` took away. A guard and not a call, because a panic — the
     /// failure the tests that use this exist to detect — unwinds past a restore written as a
     /// statement, and a directory left holding such a deny is not removable by the `TempDir`
@@ -1607,6 +1621,10 @@ mod tests {
         // Both were ordinary files when they were listed, so the registered one is spelled by a
         // listed file and is not among the names the sweep asks about. The orphan then becomes a
         // link to it.
+        // Creating a file link needs Developer Mode or SeCreateSymbolicLinkPrivilege, so this case
+        // cannot be built everywhere the suite runs. The junction the sweep tests use is no
+        // substitute: it names a directory, and a hard link answers its own name to the very check
+        // this test is about.
         std::fs::remove_file(&orphan).expect("the hand-placed file should be removable");
         let Ok(()) = std::os::windows::fs::symlink_file(&picture, &orphan) else {
             return;
@@ -1750,11 +1768,7 @@ mod tests {
         std::fs::create_dir_all(&root).expect("the image root should be creatable");
         let redirected = root.join("2026");
 
-        // Creating a directory link needs Developer Mode or SeCreateSymbolicLinkPrivilege, so this
-        // case cannot be built everywhere the suite runs.
-        let Ok(()) = std::os::windows::fs::symlink_dir(&outside, &redirected) else {
-            return;
-        };
+        junction(&redirected, &outside);
 
         // The root itself is an ordinary directory, so resolving it after the link exists answers
         // the same as resolving it before.
@@ -1784,11 +1798,7 @@ mod tests {
         std::fs::rename(&root, dir.path().join("moved"))
             .expect("the image root should be movable aside");
 
-        // Creating a directory link needs Developer Mode or SeCreateSymbolicLinkPrivilege, so this
-        // case cannot be built everywhere the suite runs.
-        let Ok(()) = std::os::windows::fs::symlink_dir(&outside, &root) else {
-            return;
-        };
+        junction(&root, &outside);
 
         // The whole root now leads elsewhere. A sweep that resolved it here rather than before its
         // walk would take the replacement for its own baseline and find this file inside it.
@@ -1818,11 +1828,7 @@ mod tests {
         let (dir, conn, root) = database();
         let nowhere = dir.path().join("nowhere");
 
-        // Creating a directory link needs Developer Mode or SeCreateSymbolicLinkPrivilege, so this
-        // case cannot be built everywhere the suite runs.
-        let Ok(()) = std::os::windows::fs::symlink_dir(&nowhere, &root) else {
-            return;
-        };
+        junction(&root, &nowhere);
 
         // `canonicalize` answers `NotFound` here, exactly as it does for a name that was never
         // there — but this name is taken, and every save will fail on it until someone clears it.
@@ -1853,11 +1859,7 @@ mod tests {
         let parent = dir.path().join("data");
         let root = parent.join("images");
 
-        // Creating a directory link needs Developer Mode or SeCreateSymbolicLinkPrivilege, so this
-        // case cannot be built everywhere the suite runs.
-        let Ok(()) = std::os::windows::fs::symlink_dir(dir.path().join("nowhere"), &parent) else {
-            return;
-        };
+        junction(&parent, &dir.path().join("nowhere"));
 
         // The root's own entry is absent here exactly as it is in the test above, and the two are
         // told apart by what is standing above it: a link whose target is gone, under which
