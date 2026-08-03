@@ -275,14 +275,18 @@ pub fn delete(
     // leftover row is one `orphan_rows` reports and nothing removes, and retention would keep
     // charging its `byte_size` against a disk budget that is already free.
     //
-    // By name, unlike the sweep, which holds a handle so that a directory replaced above it cannot
-    // redirect the removal. The same replacement works here, and what it reaches is a file named by
-    // this observation's id under wherever the replacement leads. Closing it the sweep's way needs
-    // an open that does not follow a reparse point, because this name may be a link and it is the
-    // link's own entry that has to go — `open_for_removal` follows one, so it is not that open.
+    // Opened once and then removed through the handle, so no name is resolved between deciding and
+    // removing. Resolving twice would let a directory replaced in between send the removal to a
+    // file of this name wherever the replacement leads. Not following the last component either:
+    // this name may be a link, and clearing a name means taking the entry that carries it and not
+    // the file at the other end.
     if occupied {
-        match std::fs::remove_file(&path) {
-            Ok(()) => {}
+        match cw_core::atomic_file::open_entry_for_removal(&path) {
+            Ok(file) => {
+                if let Err(source) = cw_core::atomic_file::delete_by_handle(&file) {
+                    return Err(StoreError::ImageIo { path, source });
+                }
+            }
             // Nothing left to remove is the outcome this was asked for.
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
             Err(source) => return Err(StoreError::ImageIo { path, source }),
@@ -1324,6 +1328,31 @@ mod tests {
             .expect("the image count should be readable");
         assert_eq!(count, 0);
         assert!(path.symlink_metadata().is_err());
+    }
+
+    #[test]
+    fn deleting_a_name_that_is_a_link_takes_the_link_and_not_what_it_points_at() {
+        let (_dir, mut conn, root) = database();
+        let id = ulid::Ulid::new();
+        let relative = save_test_image(&mut conn, &root, id, at(2026, 7, 30), 80);
+        let path = root.join(relative);
+        let target = path.with_file_name("pointed-at.webp");
+        std::fs::write(&target, b"the file at the other end")
+            .expect("the link target should be writable");
+        std::fs::remove_file(&path)
+            .expect("the saved file should be removable before replacement with a symlink");
+
+        // Creating a symlink needs Developer Mode or SeCreateSymbolicLinkPrivilege, so this case
+        // cannot be built everywhere the suite runs, and the test returns without asserting where
+        // it cannot.
+        let Ok(()) = std::os::windows::fs::symlink_file(&target, &path) else {
+            return;
+        };
+
+        delete(&mut conn, &root, id).expect("the link standing at the name should be deleted");
+
+        assert!(path.symlink_metadata().is_err());
+        assert!(target.is_file());
     }
 
     #[test]

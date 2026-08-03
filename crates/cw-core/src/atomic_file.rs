@@ -157,6 +157,29 @@ pub fn open_for_removal(path: &std::path::Path) -> std::io::Result<std::fs::File
         .open(path)
 }
 
+/// FILE_FLAG_OPEN_REPARSE_POINT. Opens the entry standing at the name rather than whatever it leads
+/// to, and only for the last component: directories on the way are still followed.
+const OPEN_ENTRY_ITSELF: u32 = 0x0020_0000;
+
+/// Open whatever entry stands at `path` so that it can be removed through the handle, without
+/// following it.
+///
+/// Same as [`open_for_removal`] except in what it does with a link: that one opens the file at the
+/// other end, and this one opens the link. Removing a name means removing the entry that carries
+/// it, so a caller that was asked to clear a name wants this; a caller that decided about a file's
+/// contents wants the other.
+///
+/// A directory is still refused, so no pass can remove one this way.
+pub fn open_entry_for_removal(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    std::fs::OpenOptions::new()
+        .access_mode(REMOVABLE_ACCESS)
+        .share_mode(FULL_SHARE_MODE)
+        .custom_flags(OPEN_ENTRY_ITSELF)
+        .open(path)
+}
+
 /// How many rounds of asking for the room and then for the name before giving up. The file can be
 /// renamed while a handle to it is held, so an answer that outgrew the buffer measured for it is an
 /// outcome and not a fault; what must not happen is asking forever.
