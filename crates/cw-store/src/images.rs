@@ -96,7 +96,7 @@ pub fn save(
     if let Err(source) = write_result {
         // Addressed to the handle and not to a name: nothing else in this function needs to know
         // what the temporary was called.
-        discard_written_file(&file, &destination)?;
+        discard_written_file(&file);
         drop(file);
         return Err(StoreError::ImageIo {
             path: destination,
@@ -116,7 +116,7 @@ pub fn save(
     {
         Ok(transaction) => transaction,
         Err(source) => {
-            discard_written_file(&file, &destination)?;
+            discard_written_file(&file);
             return Err(StoreError::Sql { source });
         }
     };
@@ -136,7 +136,7 @@ pub fn save(
                 .get::<_, i64>(0)),
             Ok(1..)
         );
-        discard_written_file(&file, &destination)?;
+        discard_written_file(&file);
         if already_registered {
             return Err(StoreError::ImageAlreadyRegistered { id: id_text });
         }
@@ -146,7 +146,7 @@ pub fn save(
     match cw_core::atomic_file::rename_without_replacing(&file, &destination) {
         Ok(true) => {}
         Ok(false) => {
-            discard_written_file(&file, &destination)?;
+            discard_written_file(&file);
             // Not `ImageAlreadyRegistered`: the insert above has already succeeded, so once this
             // rolls back the observation has no row, and saying the database already knows about
             // the image would point recovery the wrong way. Nothing this program registered can
@@ -159,7 +159,7 @@ pub fn save(
             });
         }
         Err(source) => {
-            discard_written_file(&file, &destination)?;
+            discard_written_file(&file);
             return Err(StoreError::ImageIo {
                 path: destination,
                 source,
@@ -170,7 +170,7 @@ pub fn save(
     // The rename is a metadata change on this handle, and Windows buffers those; closing the
     // handle does not push them.
     if let Err(source) = file.sync_all() {
-        discard_written_file(&file, &destination)?;
+        discard_written_file(&file);
         return Err(StoreError::ImageIo {
             path: destination,
             source,
@@ -530,16 +530,14 @@ pub fn orphan_rows(
     Ok(orphaned)
 }
 
-/// Discard the file `save` wrote, whichever name it answers to now. `destination` is only what the
-/// failure is reported against; nothing is looked up by it.
-fn discard_written_file(
-    file: &std::fs::File,
-    destination: &std::path::Path,
-) -> Result<(), StoreError> {
-    cw_core::atomic_file::delete_by_handle(file).map_err(|source| StoreError::ImageIo {
-        path: destination.to_path_buf(),
-        source,
-    })
+/// Discard the file `save` wrote, whichever name it answers to now.
+///
+/// A discard that will not go is not reported. Every caller is already holding the error that says
+/// why the save did not happen, and answering with this one instead would leave the caller with no
+/// account of what it asked about. What a failed discard leaves behind is an unregistered file,
+/// which is what the startup sweep collects.
+fn discard_written_file(file: &std::fs::File) {
+    let _ = cw_core::atomic_file::delete_by_handle(file);
 }
 
 fn registered_paths(conn: &rusqlite::Connection) -> Result<HashSet<String>, StoreError> {
@@ -1443,7 +1441,7 @@ mod tests {
     }
 
     #[test]
-    fn a_row_whose_id_is_spelled_any_other_way_is_refused() {
+    fn a_row_whose_id_is_spelled_any_other_way_is_refused_by_what_reads_rows() {
         let (_dir, mut conn, root) = database();
         let stored_id = "0000000000000128ggyhyyk08n";
         let id = ulid::Ulid::from_string(stored_id)

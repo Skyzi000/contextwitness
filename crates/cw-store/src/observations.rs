@@ -515,7 +515,7 @@ mod tests {
     }
 
     #[test]
-    fn every_observation_the_schema_can_store_is_inside_a_window_it_can_search() {
+    fn the_last_observation_the_schema_can_spell_is_inside_a_window_that_finds_it() {
         let dir = tempdir().expect("the temporary database directory should be creatable");
         let path = dir.path().join("db.sqlite3");
         let conn = db::open(&path).expect("the fresh database should initialize");

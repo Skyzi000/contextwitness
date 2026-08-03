@@ -189,6 +189,10 @@ pub fn final_path_by_handle(file: &std::fs::File) -> std::io::Result<std::path::
 /// right — the same number means the name or means the room it needs, and reading it the wrong way
 /// either abandons a file that was identified or hands back a truncated name as an identity. A
 /// Win32 call cannot be made to answer to order, and this can.
+///
+/// A `query` that breaks the convention is refused rather than believed. An answer as long as the
+/// buffer is one the convention cannot produce — it would be asking for room the buffer already
+/// has — and the buffer behind it was never written to, so this gives back no name for it.
 fn path_from_sized_query(
     mut query: impl FnMut(&mut [u16]) -> u32,
 ) -> std::io::Result<std::path::PathBuf> {
@@ -588,10 +592,10 @@ mod tests {
     }
 
     #[test]
-    fn an_answer_as_long_as_the_buffer_is_room_and_not_a_name() {
-        // The room a name needs includes its terminator, so an answer as long as the buffer is the
-        // room and not the name, and the buffer it came with was never written to. Reading it as a
-        // name hands back whatever that buffer happened to hold.
+    fn a_query_that_breaks_the_convention_is_given_back_no_name() {
+        // An answer as long as the buffer asks for room the buffer already has, so no query that
+        // follows the convention produces it. Believing it would hand back a buffer that was never
+        // written to, as a name.
         let error = path_from_sized_query(|buffer| {
             if buffer.is_empty() {
                 4

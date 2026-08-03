@@ -345,7 +345,7 @@ mod tests {
     }
 
     #[test]
-    fn window_start_is_stable_regardless_of_input_order() {
+    fn an_episode_is_the_same_whatever_order_its_observations_arrive_in() {
         let ordered = golden_observations();
         let mut reversed_and_interleaved = ordered.clone();
         reversed_and_interleaved.reverse();
@@ -604,10 +604,15 @@ Monitor DISPLAY2 (1920x1080):
     #[test]
     fn a_failed_entry_never_folds_into_a_no_text_one() {
         let observations = vec![
+            // The same error on both sides, so the status is the only thing that differs and the
+            // only thing that can be keeping them apart. Only the `Failed` one renders it.
             observation(
                 1,
                 "2026-07-24T16:00:01Z",
-                screen_payload("DISPLAY1", OcrStatus::NoText, None),
+                ScreenPayload {
+                    ocr_error: Some("engine unavailable".to_owned()),
+                    ..screen_payload("DISPLAY1", OcrStatus::NoText, None)
+                },
             ),
             observation(
                 2,
