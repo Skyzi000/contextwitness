@@ -1536,6 +1536,29 @@ mod tests {
     }
 
     #[test]
+    fn a_temporary_no_discard_removed_is_swept_and_its_destination_is_not() {
+        let (_dir, mut conn, root) = database();
+        let id = ulid::Ulid::new();
+        let relative = save_test_image(&mut conn, &root, id, at(2026, 7, 30), 80);
+        let saved = root.join(relative);
+
+        // Named the way `create_temporary_beside` names one, because a discard that will not go
+        // leaves exactly this and says nothing. Two things could keep this pass from reaching it:
+        // the name is not a `.webp`, and it starts with the whole name of a registered image.
+        let mut leftover = saved.clone().into_os_string();
+        leftover.push(format!(".tmp-{}-0", std::process::id()));
+        let leftover = std::path::PathBuf::from(leftover);
+        std::fs::write(&leftover, b"a temporary nothing removed")
+            .expect("the leftover temporary should be writable");
+
+        let removed = sweep_orphan_files(&conn, &root).expect("the orphan sweep should succeed");
+
+        assert_eq!(removed, 1);
+        assert!(!leftover.exists());
+        assert!(saved.is_file());
+    }
+
+    #[test]
     fn an_orphan_that_became_a_link_to_a_registered_image_is_not_removed() {
         let (_dir, mut conn, root) = database();
         let id = ulid::Ulid::new();
