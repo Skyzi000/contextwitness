@@ -61,9 +61,9 @@ pub fn window_start(
         .expect("a truncated timestamp must still be representable")
 }
 
-/// Render the observations that fall in `[window_start, window_start + window_minutes)` into one
-/// episode. Returns `None` when nothing falls in the window — an empty window must not become an
-/// empty document.
+/// Render the screen observations that fall in `[window_start, window_start + window_minutes)`
+/// into one episode. Returns `None` when none do — an empty window must not become an empty
+/// document.
 ///
 /// `window_start` is taken down to the second it falls in, and that second's window is the one
 /// rendered.
