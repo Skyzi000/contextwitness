@@ -297,7 +297,10 @@ pub fn delete(
 /// listed under, and it is not what one of the registered names reaches. That last question is put
 /// to the registered names no enumerated file spelled and not to every row; the comment inside says
 /// what that leaves out and what asking about all of them would cost. Reports how many removals the
-/// filesystem accepted; one held open elsewhere leaves when that handle closes.
+/// filesystem accepted; one held open elsewhere leaves when that handle closes. A registered name
+/// that is there and will not say which file it reaches stops the pass with nothing removed,
+/// because any candidate could be the file it reaches — so `Ok(0)` also means that, and not only
+/// that there was nothing to collect.
 ///
 /// This is a startup operation and must not run while anything is saving: a file renamed into place
 /// but not yet registered is indistinguishable from an orphan.
