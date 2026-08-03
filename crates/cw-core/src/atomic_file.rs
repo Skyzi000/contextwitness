@@ -157,6 +157,11 @@ pub fn open_for_removal(path: &std::path::Path) -> std::io::Result<std::fs::File
         .open(path)
 }
 
+/// How many times the name is asked for before giving up. The file can be renamed while this call
+/// holds it, so an answer that outgrew the buffer measured for it is an outcome and not a fault;
+/// what must not happen is asking forever.
+const FINAL_PATH_ATTEMPTS: u32 = 4;
+
 /// The name this handle refers to, as the filesystem spells it now.
 ///
 /// Resolving a name twice can reach two files, so a check made against a freshly resolved name says
@@ -170,18 +175,31 @@ pub fn final_path_by_handle(file: &std::fs::File) -> std::io::Result<std::path::
     };
 
     let handle = HANDLE(file.as_raw_handle());
-    let required = unsafe { GetFinalPathNameByHandleW(handle, &mut [], FILE_NAME_NORMALIZED) };
-    if required == 0 {
-        return Err(std::io::Error::last_os_error());
+    for _ in 0..FINAL_PATH_ATTEMPTS {
+        // Zero is the only failure this call reports. A buffer too small for the answer is reported
+        // by answering with the length that would hold it, so the second call below is asked again
+        // rather than mistaken for an error and given whatever `GetLastError` was left holding.
+        let required = unsafe { GetFinalPathNameByHandleW(handle, &mut [], FILE_NAME_NORMALIZED) };
+        if required == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        let mut buffer = vec![0; required as usize];
+        let written =
+            unsafe { GetFinalPathNameByHandleW(handle, &mut buffer, FILE_NAME_NORMALIZED) };
+        if written == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // The length that came back excludes the terminator on success and includes it when the
+        // buffer was too small, so fitting strictly inside is what separates the two.
+        if (written as usize) < buffer.len() {
+            return Ok(std::ffi::OsString::from_wide(&buffer[..written as usize]).into());
+        }
     }
 
-    let mut buffer = vec![0; required as usize];
-    let written = unsafe { GetFinalPathNameByHandleW(handle, &mut buffer, FILE_NAME_NORMALIZED) };
-    if written == 0 || written as usize >= buffer.len() {
-        return Err(std::io::Error::last_os_error());
-    }
-
-    Ok(std::ffi::OsString::from_wide(&buffer[..written as usize]).into())
+    Err(std::io::Error::other(
+        "the file's name grew every time it was asked for",
+    ))
 }
 
 /// Remove the file this handle refers to, whatever name it answers to by now.
@@ -480,44 +498,27 @@ mod tests {
 
     #[test]
     fn the_final_path_stays_with_the_open_file_when_the_name_is_given_to_another() {
-        let root = unique_temp_path("final-path-root");
-        let outside = unique_temp_path("final-path-outside");
-        std::fs::create_dir(&root).expect("the root directory should be creatable");
-        let inner = root.join("inner");
+        let held = unique_temp_path("final-path-held");
+        let moved = unique_temp_path("final-path-held-under-a-longer-name-than-before");
+        std::fs::write(&held, b"held").expect("the file should be creatable");
 
-        // Creating a directory link needs Developer Mode or SeCreateSymbolicLinkPrivilege, so this
-        // case cannot be built everywhere the suite runs.
-        let Ok(()) = std::os::windows::fs::symlink_dir(&outside, &inner) else {
-            std::fs::remove_dir(&root).expect("the root directory should be removable");
-            return;
-        };
-
-        std::fs::create_dir(&outside).expect("the outside directory should be creatable");
-        let held = outside.join("held.bin");
-        std::fs::write(&held, b"outside").expect("the outside file should be creatable");
-
-        // Opened while the name leads out of the root, and then the name is made to lead back in.
-        // A sweep resolving the name after this point would be told the candidate is where it was
-        // listed, and would then remove the file it is holding, which is the one outside.
-        let spelling = inner.join("held.bin");
-        let file = open_for_removal(&spelling).expect("the outside file should open");
-        std::fs::remove_dir(&inner).expect("the link should be removable");
-        std::fs::create_dir(&inner).expect("an ordinary directory should take the link's name");
-        std::fs::write(&spelling, b"inside").expect("a file should take the name inside the root");
+        // Opened under one name, which is then given to a different file. Anything that resolved
+        // the name after this point would be told about the newcomer while still holding the file
+        // it decided about, which is the confusion the sweep's check has to be immune to.
+        let file = open_for_removal(&held).expect("the file should open for removal");
+        std::fs::rename(&held, &moved).expect("a file open for removal should still be renamable");
+        std::fs::write(&held, b"newcomer").expect("the freed name should take another file");
 
         let answered = final_path_by_handle(&file).expect("the handle should answer its own name");
         drop(file);
 
-        let by_name = std::fs::canonicalize(&spelling).expect("the inside file should resolve");
-        let outside_now = std::fs::canonicalize(&held).expect("the outside file should resolve");
+        let by_name = std::fs::canonicalize(&held).expect("the newcomer should resolve");
+        let moved_now = std::fs::canonicalize(&moved).expect("the moved file should resolve");
 
-        assert_eq!(answered, outside_now);
+        assert_eq!(answered, moved_now);
         assert_ne!(answered, by_name);
 
-        std::fs::remove_file(&spelling).expect("the inside file should be removable");
-        std::fs::remove_dir(&inner).expect("the inside directory should be removable");
-        std::fs::remove_dir(&root).expect("the root directory should be removable");
-        std::fs::remove_file(&held).expect("the outside file should be removable");
-        std::fs::remove_dir(&outside).expect("the outside directory should be removable");
+        std::fs::remove_file(&held).expect("the newcomer should be removable");
+        std::fs::remove_file(&moved).expect("the moved file should be removable");
     }
 }
