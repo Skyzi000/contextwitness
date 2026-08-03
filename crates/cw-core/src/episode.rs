@@ -107,10 +107,14 @@ pub fn build_episode(
         // Fold only when this entry renders what the last kept one already put in the document.
         // The timestamp is excluded: it is what a folded entry usually differs in, and collapsing
         // repeated timestamps is the point — two observations at one instant fold as readily.
-        // Everything else is compared whether the status renders it or not — `ocr_text` under one
-        // that shows no text, say — so this can keep two entries that would read alike, but it
-        // never folds two that would not. A folded entry takes its image path with it, so the
-        // episode carries no picture from a line it dropped.
+        // What is compared is the monitor, the foreground process and title, and the OCR status
+        // with both the text and the error it chooses between. Text and error are compared whether
+        // this entry's status renders them or not — `ocr_text` under one that shows no text, say —
+        // so this can keep two entries that would read alike, but it never folds two that would
+        // not. The size printed beside the monitor name is left out because it is written only
+        // where the monitor changes, and an entry matching the last kept one's monitor would not
+        // have written it. A folded entry takes its image path with it, so the episode carries no
+        // picture from a line it dropped.
         let current = current.1;
         let previous = previous.1;
 
@@ -455,8 +459,9 @@ Monitor DISPLAY2 (1920x1080):
 
     #[test]
     fn consecutive_entries_with_different_text_are_never_collapsed() {
-        // Text is what this product exists to deliver, so the difference here being one character
-        // is not a reason to lose one of them.
+        // Every field the fold compares is equal in these two except the text, so this is the case
+        // where text alone decides. Text is what this product delivers, and one entry standing for
+        // another would lose it.
         let observations = vec![
             observation(
                 1,

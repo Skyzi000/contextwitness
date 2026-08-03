@@ -343,8 +343,8 @@ mod tests {
         let start = at("2026-07-25T12:00:00Z");
         let end = at("2026-07-25T12:05:00Z");
         let before = screen_observation_at(start - TimeDelta::nanoseconds(1));
-        // Fixed ids running against the timestamps, so a swap to `ORDER BY id, observed_at` fails every
-        // run: ids generated in one test almost always share a millisecond and then sort at random.
+        // Fixed ids running against the timestamps, so a swap to `ORDER BY id, observed_at` fails
+        // every run.
         let mut at_start = screen_observation_at(start);
         at_start.id = ulid::Ulid::from(9u128);
         let mut before_end = screen_observation_at(end - TimeDelta::nanoseconds(1));
@@ -366,8 +366,8 @@ mod tests {
         let path = dir.path().join("db.sqlite3");
         let conn = db::open(&path).expect("the fresh database should initialize");
         let start = at("2026-07-25T12:00:00Z");
-        // Fixed ids running against the timestamps, so a swap to `ORDER BY id, observed_at` fails every
-        // run: ids generated in one test almost always share a millisecond and then sort at random.
+        // Fixed ids running against the timestamps, so a swap to `ORDER BY id, observed_at` fails
+        // every run.
         let mut oldest = screen_observation_at(start);
         oldest.id = ulid::Ulid::from(9u128);
         let mut middle = screen_observation_at(start + TimeDelta::seconds(1));
@@ -414,8 +414,8 @@ mod tests {
         let path = dir.path().join("db.sqlite3");
         let conn = db::open(&path).expect("the fresh database should initialize");
         let start = at("2026-07-25T12:00:00Z");
-        // Fixed ids running against the timestamps, so a swap to `ORDER BY id, observed_at` fails every
-        // run: ids generated in one test almost always share a millisecond and then sort at random.
+        // Fixed ids running against the timestamps, so a swap to `ORDER BY id, observed_at` fails
+        // every run.
         let mut whole_second = screen_observation_at(start);
         whole_second.id = ulid::Ulid::from(9u128);
         let mut last_fraction = screen_observation_at(at("2026-07-25T12:00:00.999999999Z"));

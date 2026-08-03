@@ -303,10 +303,9 @@ pub fn sweep_orphan_files(
     // resolves this spelling again and a link put at the root's name in between is followed. What
     // keeps that from costing anything is the per-candidate check further down — a file opened
     // under the replacement answers with a name below the replacement's target rather than with the
-    // one it was listed under, so it is kept. That
-    // check is load-bearing here and not merely a second opinion. Resolving the root after the walk
-    // would move the baseline itself, and then every file under the replacement would compare as
-    // though it belonged here.
+    // one it was listed under, so it is kept. That check is load-bearing here and not merely a
+    // second opinion. Resolving the root after the walk would move the baseline itself, and then
+    // every file under the replacement would compare as though it belonged here.
     let root = match std::fs::canonicalize(root) {
         Ok(resolved) => resolved,
         // Nothing there at all is the ordinary state before the first save and there is nothing to
@@ -558,9 +557,12 @@ fn registered_paths(conn: &rusqlite::Connection) -> Result<HashSet<String>, Stor
 /// image root rather than only what this program wrote there, so its depth is not this program's
 /// to assume. Running out of stack aborts the process, and this runs at startup.
 ///
-/// `root` must be the spelling `canonicalize` answered, and is the only name whose enumeration
-/// failing is reported. Anything below it, and any single entry that cannot be answered about, is
-/// passed over: what was not collected never becomes a candidate, so nothing is removed on a guess.
+/// `root` must be the spelling `canonicalize` answered. Anything that fails below it is passed
+/// over, and so is any single entry that cannot be answered about, wherever it sits: what was not
+/// collected never becomes a candidate, so nothing is removed on a guess. Two failures at the root
+/// are reported instead, since either leaves the whole candidate list unseen — its listing not
+/// opening for any reason other than absence, and its listing stopping partway. Absence is not one
+/// of them, because a root that is not there has nothing under it to sweep.
 fn collect_files(
     root: &std::path::Path,
     files: &mut Vec<std::path::PathBuf>,

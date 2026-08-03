@@ -509,8 +509,7 @@ mod tests {
         let (_dir, mut conn) = database();
         let first_at = at(2026, 7, 30, 12, 0, 0);
         let second_at = at(2026, 7, 30, 12, 1, 0);
-        // Fixed ids running against the timestamps, so a swap to `ORDER BY id, at` fails every
-        // run: ids generated in one test almost always share a millisecond and then sort at random.
+        // Fixed ids running against the timestamps, so a swap to `ORDER BY id, at` fails every run.
         let first_id = ulid::Ulid::from(9u128);
         let second_id = ulid::Ulid::from(1u128);
 
@@ -804,8 +803,7 @@ mod tests {
         let paused_at = at(2026, 7, 30, 12, 1, 0);
         let resumed_at = at(2026, 7, 30, 12, 2, 0);
         let deadline = at(2026, 7, 30, 13, 0, 0);
-        // Fixed ids running against the timestamps, so a swap to `ORDER BY id, at` fails every
-        // run: ids generated in one test almost always share a millisecond and then sort at random.
+        // Fixed ids running against the timestamps, so a swap to `ORDER BY id, at` fails every run.
         let pause_id = ulid::Ulid::from(9u128);
         let resume_id = ulid::Ulid::from(1u128);
 
@@ -924,8 +922,7 @@ mod tests {
     #[test]
     fn adjacent_event_windows_tile_without_sharing_an_event() {
         let (_dir, conn) = database();
-        // Fixed ids running against the timestamps, so a swap to `ORDER BY id, at` fails every
-        // run: ids generated in one test almost always share a millisecond and then sort at random.
+        // Fixed ids running against the timestamps, so a swap to `ORDER BY id, at` fails every run.
         let first = ControlEvent {
             id: ulid::Ulid::from(4u128),
             kind: EventKind::BlacklistSkip,

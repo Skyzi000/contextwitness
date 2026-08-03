@@ -351,16 +351,9 @@ mod tests {
         let path = unique_temp_path("open-for-removal-directory");
         std::fs::create_dir(&path).expect("the directory should be creatable");
 
-        // The kind is pinned for this spelling and is not what the caller is promised: the same
-        // directory named with a trailing separator answers `NotFound`, so only the refusal itself
-        // holds however the name is written.
-        let error = open_for_removal(&path).expect_err("a directory must not open for removal");
+        // The refusal is the guarantee; which kind carries it is not, and no caller reads it.
+        open_for_removal(&path).expect_err("a directory must not open for removal");
 
-        assert_eq!(
-            error.kind(),
-            std::io::ErrorKind::PermissionDenied,
-            "{error:?}"
-        );
         std::fs::remove_dir(&path).expect("the test directory should be removable");
     }
 

@@ -179,9 +179,9 @@ pub fn open(path: &std::path::Path) -> Result<rusqlite::Connection, StoreError> 
     //
     // Ownership before the version gate, because whose file this is has to be settled before which
     // schema it is at. Settling it first keeps this program from asking for a write lock on a
-    // stranger's database, where `migrate` would wait out the busy timeout and report SQLITE_BUSY
-    // rather than name the owner. Neither is authoritative: `migrate` takes both again inside its
-    // write transaction, on the view its own writes land on.
+    // stranger's database, where an owner that happens to be writing would have `migrate` wait out
+    // the busy timeout and report SQLITE_BUSY rather than name the owner. Neither is authoritative:
+    // `migrate` takes both again inside its write transaction, on the view its own writes land on.
     {
         let snapshot = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)

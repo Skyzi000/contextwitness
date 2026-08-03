@@ -30,8 +30,9 @@ const NANOSECONDS_PER_SECOND: u32 = 1_000_000_000;
 /// spelled into the following second, so it either takes text an ordinary instant already owns or,
 /// at second 59, becomes a `:60`. That one sorts after every instant of the minute it belongs to
 /// and before the minute that follows, so a window ending inside that minute passes over it while
-/// a window reaching past it selects text nothing can decode. A width check cannot see either,
-/// because the wrong spelling is exactly as wide as the right one.
+/// a window reaching past it selects text `from_sql` refuses: chrono parses `:60`, and it is the
+/// re-spelling check that will not take it back. A width check cannot see either, because the wrong
+/// spelling is exactly as wide as the right one.
 ///
 /// Requiring a real nanosecond field is what keeps stored instants on a grid, and that is what lets
 /// a half-open `[start, end)` be asked as `[start, end - 1ns]`. `Utc::now()` cannot produce a

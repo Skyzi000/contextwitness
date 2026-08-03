@@ -28,8 +28,7 @@ pub fn is_blacklisted(foreground_process: &str, blacklist: &[String]) -> bool {
 ///
 /// Reporting two distinct files equal, which a case-sensitive directory can produce, is accepted:
 /// what reaches here is a file-name component — the caller reduces a full path to its last one — so
-/// there is no directory left to ask, and case-sensitive directories exist for WSL interop rather
-/// than for installed Windows applications.
+/// there is no directory left to ask.
 fn file_names_equal(left: &str, right: &str) -> bool {
     let left: Vec<u16> = left.encode_utf16().collect();
     let right: Vec<u16> = right.encode_utf16().collect();
