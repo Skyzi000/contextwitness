@@ -65,6 +65,9 @@ pub fn window_start(
 /// episode. Returns `None` when nothing falls in the window — an empty window must not become an
 /// empty document.
 ///
+/// `window_start` is taken down to the second it falls in, and that second's window is the one
+/// rendered.
+///
 /// `render_offset` is the UTC offset used for the human-readable times in the body. Supplying the
 /// machine's local offset is what makes a memory read back in the time the user experienced, for
 /// any window that does not straddle an offset transition; ids and metadata stay UTC regardless. A
@@ -80,6 +83,12 @@ pub fn build_episode(
     render_offset: chrono::FixedOffset,
     observations: &[crate::model::Observation],
 ) -> Option<Episode> {
+    use chrono::SubsecRound;
+
+    // Everything below spells this to the second, `document_id` among them, so a start carrying a
+    // fraction would answer for a window it does not bound and share an id with the rest of its
+    // second.
+    let window_start = window_start.trunc_subsecs(0);
     let end_at = window_start + chrono::Duration::minutes(i64::from(window_minutes));
     let mut entries: Vec<_> = observations
         .iter()
@@ -382,6 +391,29 @@ mod tests {
             ten_minute_episode.document_id,
             five_minute_episode.document_id
         );
+    }
+
+    #[test]
+    fn a_window_start_carrying_a_fraction_describes_the_second_it_falls_in() {
+        let start = timestamp("2026-07-24T16:00:00Z");
+        let offset = FixedOffset::east_opt(9 * 3600).expect("test offset should be valid");
+        let observations = vec![observation(
+            1,
+            "2026-07-24T16:00:00Z",
+            screen_payload("DISPLAY1", OcrStatus::Succeeded, Some("line one")),
+        )];
+
+        let episode = build_episode(
+            start + chrono::Duration::milliseconds(900),
+            5,
+            offset,
+            &observations,
+        )
+        .expect("an observation at the whole second belongs to the window that second starts");
+
+        assert_eq!(episode.start_at, start);
+        assert_eq!(episode.end_at, timestamp("2026-07-24T16:05:00Z"));
+        assert_eq!(episode.document_id, "screen-2026-07-24T16:00:00Z-5m");
     }
 
     #[test]
