@@ -80,7 +80,9 @@ pub fn insert(conn: &rusqlite::Connection, observation: &Observation) -> Result<
     Ok(())
 }
 
-/// The observation with this id, or `None` when the database holds no such row.
+/// The observation with this id, or `None` when no row spells this id the way this program
+/// writes one — a corrupt row holding the id in another spelling is answered with `None` here
+/// and refused as [`StoreError::Encoding`] by a window search that selects it.
 pub fn find_by_id(
     conn: &rusqlite::Connection,
     id: ulid::Ulid,
