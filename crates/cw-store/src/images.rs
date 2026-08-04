@@ -212,14 +212,15 @@ pub fn save(
 /// the failure this has to survive is a full disk during retention, and a row kept for a file that
 /// is gone would go on charging its `byte_size` against a budget that is already free.
 ///
-/// The name stays taken from before the commit until this call returns, because a removal through
-/// a handle frees the name only when the last handle to it closes and this one closes here. A
-/// `save` for the same observation whose rename reaches the name meanwhile is refused rather than
-/// replacing anything; one whose rename lands after finds the name free and succeeds the first
-/// time. What refuses that rename is the name being taken and not this call holding it: the handle
-/// excludes nobody, and anything free to move the entry aside frees the name while it is held. If
-/// the name is empty — a row whose file has already gone — nothing is removed at all, so a save
-/// that follows this commit keeps the file it renames into that name.
+/// The removal itself never frees the name early: a removal through a handle frees it only when
+/// the last handle closes, and this call's handle closes before this call returns. A `save` for
+/// the same observation whose rename reaches the name while it is still taken is refused rather
+/// than replacing anything; one whose rename lands after it is freed finds it free and succeeds
+/// the first time. What refuses the earlier rename is the name being taken and not this call
+/// holding it: the handle leaves the entry renamable and removable by name, and anything free to
+/// move the entry aside frees the name sooner. If the name is empty — a row whose file has
+/// already gone — only the row is removed, so a save that follows this commit keeps the file it
+/// renames into that name.
 ///
 /// The observation, its OCR text and its payload are untouched: they are the point of the record
 /// and outlive the picture. Empty day directories are left behind on purpose, because pruning one
