@@ -586,12 +586,14 @@ fn registered_paths(conn: &rusqlite::Connection) -> Result<HashSet<String>, Stor
 /// image root rather than only what this program wrote there, so its depth is not this program's
 /// to assume. Running out of stack aborts the process, and this runs at startup.
 ///
-/// `root` must be the spelling `canonicalize` answered. Anything that fails below it is passed
-/// over, and so is any single entry that cannot be answered about, wherever it sits: what was not
-/// collected never becomes a candidate, so nothing is removed on a guess. Two failures at the root
-/// are reported instead, since either leaves the whole candidate list unseen — its listing not
-/// opening for any reason other than absence, and its listing stopping partway. Absence is not one
-/// of them, because a root that is not there has nothing under it to sweep.
+/// `root` arrives in the spelling `canonicalize` answered: the sweep's identity checks need that
+/// spelling and say so, nothing in this walk does, and the collected paths simply inherit it.
+/// Anything that fails below the root is passed over, and so is any single entry that cannot be
+/// answered about, wherever it sits: what was not collected never becomes a candidate, so nothing
+/// is removed on a guess. Two failures at the root are reported instead, since either leaves the
+/// whole candidate list unseen — its listing not opening for any reason other than absence, and
+/// its listing stopping partway. Absence is not one of them, because a root that is not there has
+/// nothing under it to sweep.
 fn collect_files(
     root: &std::path::Path,
     files: &mut Vec<std::path::PathBuf>,
