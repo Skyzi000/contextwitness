@@ -597,6 +597,43 @@ Monitor DISPLAY2 (1920x1080):
     }
 
     #[test]
+    fn an_identical_scene_on_another_monitor_keeps_the_entry() {
+        // The two entries differ in nothing the fold compares except the monitor, and folding
+        // across that boundary would tell the reader one screen was on when two were: the second
+        // monitor's heading, its entry line and its metadata slot all travel with the entry.
+        let observations = vec![
+            observation(
+                1,
+                "2026-07-24T16:00:01Z",
+                ScreenPayload {
+                    foreground_process: Some("vlc.exe".to_owned()),
+                    foreground_window_title: Some("Movie".to_owned()),
+                    ..screen_payload("DISPLAY1", OcrStatus::NoText, None)
+                },
+            ),
+            observation(
+                2,
+                "2026-07-24T16:00:02Z",
+                ScreenPayload {
+                    foreground_process: Some("vlc.exe".to_owned()),
+                    foreground_window_title: Some("Movie".to_owned()),
+                    ..screen_payload("DISPLAY2", OcrStatus::NoText, None)
+                },
+            ),
+        ];
+        let episode = build_episode(
+            timestamp("2026-07-24T16:00:00Z"),
+            5,
+            FixedOffset::east_opt(0).expect("UTC offset should be valid"),
+            &observations,
+        )
+        .expect("the observations should build an episode");
+
+        assert_eq!(episode.metadata.entry_count, "2");
+        assert_eq!(episode.metadata.monitors, r#"["DISPLAY1","DISPLAY2"]"#);
+    }
+
+    #[test]
     fn a_different_application_keeps_the_entry() {
         // The switch between two text-free applications is the only thing these entries record, so
         // folding them would leave the document with nothing to show for it.
