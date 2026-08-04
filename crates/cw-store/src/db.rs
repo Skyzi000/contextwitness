@@ -384,15 +384,15 @@ mod tests {
 
     #[test]
     fn the_wal_switch_outwaits_a_lock_released_within_its_deadline() {
-        // The deterministic counterpart of the test above: that one needs the scheduler to
-        // produce a collision, this one manufactures one. The blocker holds a write
+        // The manufactured counterpart of the test above: that one needs the scheduler to
+        // produce a collision, this one arranges its own. The blocker holds a write
         // transaction, and against a held write lock the conversion comes back busy at once
         // instead of waiting out the busy timeout — measured, a switch stripped of its
         // retries still gets past a read transaction, and fails on the spot against this.
-        // The lock is taken before the switching thread exists and released 300ms later, far
-        // inside WAL_SWITCH_DEADLINE — so unless spawning that thread and opening its
-        // connection takes longer than the hold, a switch that does not retry fails here and
-        // the switch that retries succeeds.
+        // The lock is taken before the switching thread exists and released 300ms after that
+        // thread reports its connection ready, far inside WAL_SWITCH_DEADLINE — so all that
+        // is left outside the arrangement is the step from the report to the first attempt,
+        // and a switch that does not retry passes only if that one step outlasts the hold.
         let dir = tempdir().expect("the temporary database directory should be creatable");
         let path = dir.path().join("db.sqlite3");
         let blocker =
@@ -404,6 +404,7 @@ mod tests {
             .execute_batch("BEGIN IMMEDIATE")
             .expect("the blocking transaction should begin");
 
+        let (ready, started) = std::sync::mpsc::channel();
         let switcher = std::thread::spawn({
             let path = path.clone();
             move || {
@@ -411,10 +412,16 @@ mod tests {
                     .expect("the switching connection should open");
                 conn.execute_batch(CONNECTION_SETTINGS)
                     .expect("the switching connection settings should apply");
+                ready
+                    .send(())
+                    .expect("the main thread should be waiting for the report");
                 enable_wal(&conn, &path)
             }
         });
 
+        started
+            .recv()
+            .expect("the switching thread should report its connection ready");
         std::thread::sleep(std::time::Duration::from_millis(300));
         blocker
             .execute_batch("COMMIT")
