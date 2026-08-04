@@ -207,10 +207,12 @@ pub fn save(
 /// row named.
 ///
 /// The row is committed before the file is removed, so a failure in between leaves an unregistered
-/// file — collected by a later sweep once whatever refused the removal has cleared — rather than
-/// a row whose file is gone. That is the residue worth having:
-/// the failure this has to survive is a full disk during retention, and a row kept for a file that
-/// is gone would go on charging its `byte_size` against a budget that is already free.
+/// entry rather than a row whose file is gone. An unregistered file is collected by a later sweep
+/// once whatever refused the removal has cleared; an unregistered link never is — the sweep
+/// collects only files — so a link the removal could not take keeps the name until something
+/// other than this store clears it. That is still the residue worth having: the failure this has
+/// to survive is a full disk during retention, and a row kept for a file that is gone would go on
+/// charging its `byte_size` against a budget that is already free.
 ///
 /// The removal itself never frees the name early: a removal through a handle frees it only when
 /// the last handle closes, and this call's handle closes before this call returns. A `save` for
@@ -286,7 +288,8 @@ pub fn delete(
     // A file removal cannot be rolled back, so the two media cannot commit together and one of them
     // is left over on failure. A leftover file is unregistered and a sweep collects it once
     // whatever refused the removal has cleared — a lasting cause, a read-only attribute say,
-    // keeps it and the sweep skips it the same way; a
+    // keeps it and the sweep skips it the same way, and a leftover link no sweep collects at
+    // all, cleared or not, because files are all the sweep takes; a
     // leftover row is one `orphan_rows` reports and nothing removes, and retention would keep
     // charging its `byte_size` against a disk budget that is already free.
     if let Some(file) = held {
