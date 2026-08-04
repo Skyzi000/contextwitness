@@ -67,7 +67,11 @@ fn ownership(conn: &rusqlite::Connection, path: &std::path::Path) -> Result<Owne
                     path: path.to_path_buf(),
                     source,
                 })?;
-            if entries == 0 && read_user_version(conn, path)? == 0 {
+            let version = read_user_version(conn).map_err(|source| StoreError::Open {
+                path: path.to_path_buf(),
+                source,
+            })?;
+            if entries == 0 && version == 0 {
                 Ok(Ownership::FreeToClaim)
             } else {
                 Err(StoreError::ForeignDatabase {
@@ -84,15 +88,12 @@ fn ownership(conn: &rusqlite::Connection, path: &std::path::Path) -> Result<Owne
 }
 
 /// Read `PRAGMA user_version`, the marker that decides which migrations still have to run.
-fn read_user_version(
-    conn: &rusqlite::Connection,
-    path: &std::path::Path,
-) -> Result<i32, StoreError> {
+///
+/// The failure is the caller's to map: of the three call sites only [`migrate`] is applying a
+/// migration, and an error spelled "failed to migrate" from the two that are still gating the
+/// database would name work that never began.
+fn read_user_version(conn: &rusqlite::Connection) -> rusqlite::Result<i32> {
     conn.pragma_query_value(None, "user_version", |row| row.get(0))
-        .map_err(|source| StoreError::Migrate {
-            path: path.to_path_buf(),
-            source,
-        })
 }
 
 /// Put the database into WAL mode, failing when it does not take.
@@ -190,7 +191,10 @@ pub fn open(path: &std::path::Path) -> Result<rusqlite::Connection, StoreError> 
                 source,
             })?;
         ownership(&snapshot, path)?;
-        let current = read_user_version(&snapshot, path)?;
+        let current = read_user_version(&snapshot).map_err(|source| StoreError::Open {
+            path: path.to_path_buf(),
+            source,
+        })?;
         if !(0..=SCHEMA_VERSION).contains(&current) {
             return Err(StoreError::UnsupportedSchema {
                 path: path.to_path_buf(),
@@ -227,7 +231,10 @@ fn migrate(conn: &mut rusqlite::Connection, path: &std::path::Path) -> Result<()
             source,
         })?;
     let ownership = ownership(&transaction, path)?;
-    let current = read_user_version(&transaction, path)?;
+    let current = read_user_version(&transaction).map_err(|source| StoreError::Migrate {
+        path: path.to_path_buf(),
+        source,
+    })?;
 
     // The lower bound is not decoration: `current as usize` on a negative number is an index far
     // past the end of MIGRATIONS — -1 becomes `usize::MAX` — and the slice below panics on it. A
