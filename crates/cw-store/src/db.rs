@@ -568,7 +568,15 @@ mod tests {
                 .expect("the version-marked database should be openable");
             conn.pragma_update(None, "user_version", found)
                 .expect("the version marker should be writable");
+            let journal_mode: String = conn
+                .pragma_query_value(None, "journal_mode", |row| row.get(0))
+                .expect("the starting journal mode should be readable");
+            assert_eq!(
+                journal_mode, "delete",
+                "the test database should start in rollback-journal mode"
+            );
             drop(conn);
+            let before = std::fs::read(&path).expect("the test database should be readable");
 
             match open(&path) {
                 Err(StoreError::ForeignDatabase { found, .. }) => assert_eq!(found, 0),
@@ -576,33 +584,10 @@ mod tests {
                 Ok(_) => panic!("the unclaimed version-marked database was accepted"),
             }
 
-            let conn = rusqlite::Connection::open(&path)
-                .expect("the refused database should still be openable");
-            let journal_mode: String = conn
-                .pragma_query_value(None, "journal_mode", |row| row.get(0))
-                .expect("the refused database journal mode should be readable");
-            let application_id: i32 = conn
-                .pragma_query_value(None, "application_id", |row| row.get(0))
-                .expect("the refused database application id should be readable");
-            let user_version: i32 = conn
-                .pragma_query_value(None, "user_version", |row| row.get(0))
-                .expect("the refused database version marker should be readable");
-            let observations: i64 = conn
-                .query_row(
-                    "SELECT count(*) FROM sqlite_master WHERE name = 'observations'",
-                    [],
-                    |row| row.get(0),
-                )
-                .expect("the ContextWitness table count should be readable");
-
+            let after =
+                std::fs::read(&path).expect("the refused database should still be readable");
             assert_eq!(
-                (
-                    journal_mode.as_str(),
-                    application_id,
-                    user_version,
-                    observations
-                ),
-                ("delete", 0, found, 0),
+                after, before,
                 "a marker that is not zero is one somebody wrote, so the file is not ours to \
                  take and refusing it must leave it exactly as found — SCHEMA_VERSION included, \
                  which is the value that looks most like ours"
@@ -647,7 +632,15 @@ mod tests {
             ["someone else's data"],
         )
         .expect("the other application's row should be writable");
+        let journal_mode: String = conn
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .expect("the starting journal mode should be readable");
+        assert_eq!(
+            journal_mode, "delete",
+            "the test database should start in rollback-journal mode"
+        );
         drop(conn);
+        let before = std::fs::read(&path).expect("the test database should be readable");
 
         match open(&path) {
             Err(StoreError::ForeignDatabase { found, .. }) => assert_eq!(found, 0),
@@ -655,39 +648,11 @@ mod tests {
             Ok(_) => panic!("the other application's database was accepted"),
         }
 
-        let conn = rusqlite::Connection::open(&path)
-            .expect("the refused database should still be openable");
-        let body: String = conn
-            .query_row("SELECT body FROM notes", [], |row| row.get(0))
-            .expect("the other application's row should remain readable");
-        let journal_mode: String = conn
-            .pragma_query_value(None, "journal_mode", |row| row.get(0))
-            .expect("the refused database journal mode should be readable");
-        let application_id: i32 = conn
-            .pragma_query_value(None, "application_id", |row| row.get(0))
-            .expect("the refused database application id should be readable");
-        let user_version: i32 = conn
-            .pragma_query_value(None, "user_version", |row| row.get(0))
-            .expect("the refused database schema version should be readable");
-        let observations: i64 = conn
-            .query_row(
-                "SELECT count(*) FROM sqlite_master WHERE name = 'observations'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("the ContextWitness table count should be readable");
-
+        let after = std::fs::read(&path).expect("the refused database should still be readable");
         assert_eq!(
-            (
-                body.as_str(),
-                journal_mode.as_str(),
-                application_id,
-                user_version,
-                observations
-            ),
-            ("someone else's data", "delete", 0, 0, 0),
-            "the values this program could have written must be exactly as they were found, and \
-             user_version in particular is the field that program would be using for its own \
+            after, before,
+            "refusing another program's database must leave the whole file as found — its data, \
+             its journal mode, and the user_version that program would be using for its own \
              migrations"
         );
     }
@@ -701,6 +666,7 @@ mod tests {
         conn.pragma_update(None, "application_id", 0x0000_0001)
             .expect("the other application's application id should be writable");
         drop(conn);
+        let before = std::fs::read(&path).expect("the test database should be readable");
 
         // An empty file someone else has already put their name on is still theirs.
         match open(&path) {
@@ -709,19 +675,10 @@ mod tests {
             Ok(_) => panic!("the other application's database was accepted"),
         }
 
-        let conn = rusqlite::Connection::open(&path)
-            .expect("the refused database should still be openable");
-        let application_id: i32 = conn
-            .pragma_query_value(None, "application_id", |row| row.get(0))
-            .expect("the refused database application id should be readable");
-        let journal_mode: String = conn
-            .pragma_query_value(None, "journal_mode", |row| row.get(0))
-            .expect("the refused database journal mode should be readable");
+        let after = std::fs::read(&path).expect("the refused database should still be readable");
         assert_eq!(
-            (application_id, journal_mode.as_str()),
-            (0x0000_0001, "delete"),
-            "a file somebody else has put their name on must still carry their name afterwards, \
-             and refusing it must not switch its journal mode"
+            after, before,
+            "refusing an empty file another application claimed must leave the whole file as found"
         );
     }
 }
