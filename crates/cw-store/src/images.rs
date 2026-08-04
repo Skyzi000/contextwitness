@@ -1679,24 +1679,30 @@ mod tests {
             .expect("the fixed image id should parse");
         let relative = save_test_image(&mut conn, &root, id, at(2026, 7, 30), 81);
         let differently_spelled = relative.to_ascii_lowercase();
+        assert_ne!(differently_spelled, relative);
         std::fs::rename(root.join(&relative), root.join(&differently_spelled))
             .expect("the saved image should be renameable to another case");
 
         let removed = sweep_orphan_files(&conn, &root).expect("the orphan sweep should succeed");
 
         assert_eq!(removed, 0);
-        let mut entries = std::fs::read_dir(
+        let names: Vec<_> = std::fs::read_dir(
             root.join(&differently_spelled)
                 .parent()
                 .expect("the differently-spelled image should have a day directory"),
         )
-        .expect("the day directory should remain readable");
-        assert!(entries.any(|entry| {
+        .expect("the day directory should remain readable")
+        .map(|entry| {
             entry
                 .expect("the day directory entry should be readable")
-                .path()
-                .is_file()
-        }));
+                .file_name()
+        })
+        .collect();
+        let kept = std::path::Path::new(&differently_spelled)
+            .file_name()
+            .expect("the differently-spelled image should have a file name")
+            .to_os_string();
+        assert_eq!(names, [kept]);
     }
 
     #[test]
