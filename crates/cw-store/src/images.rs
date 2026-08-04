@@ -2107,10 +2107,13 @@ mod tests {
     fn an_orphan_that_will_not_go_does_not_stop_the_others() {
         let (_dir, conn, root) = database();
         std::fs::create_dir_all(&root).expect("the image root should be creatable");
+        // Named so the read-only candidate is enumerated first — NTFS lists a directory by name —
+        // and what removes the second one is the pass carrying on past the refusal rather than
+        // never reaching it.
         let stubborn = root.join("stubborn.webp");
-        let ordinary = root.join("ordinary.webp");
+        let trailing = root.join("trailing.webp");
         std::fs::write(&stubborn, b"an orphan").expect("the file should be writable");
-        std::fs::write(&ordinary, b"an orphan").expect("the file should be writable");
+        std::fs::write(&trailing, b"an orphan").expect("the file should be writable");
         // A read-only file opens for removal and then refuses the disposition call with
         // `PermissionDenied`, which is the reachable form of a candidate that will not go.
         let mut attributes = std::fs::metadata(&stubborn)
@@ -2129,7 +2132,7 @@ mod tests {
             1
         );
         assert!(stubborn.exists(), "the one that will not go should be kept");
-        assert!(!ordinary.exists(), "the other one should have gone");
+        assert!(!trailing.exists(), "the other one should have gone");
     }
 
     #[test]
