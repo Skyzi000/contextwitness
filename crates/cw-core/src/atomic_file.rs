@@ -465,6 +465,7 @@ mod tests {
             temporary, planted,
             "the planted name should have been left alone"
         );
+        assert!(planted.exists(), "the planted entry should still be there");
         assert_eq!(
             std::fs::read_to_string(&victim).expect("the victim should remain readable"),
             contents
