@@ -207,7 +207,8 @@ pub fn save(
 /// row named.
 ///
 /// The row is committed before the file is removed, so a failure in between leaves an unregistered
-/// file for the next sweep rather than a row whose file is gone. That is the residue worth having:
+/// file — collected by a later sweep once whatever refused the removal has cleared — rather than
+/// a row whose file is gone. That is the residue worth having:
 /// the failure this has to survive is a full disk during retention, and a row kept for a file that
 /// is gone would go on charging its `byte_size` against a budget that is already free.
 ///
@@ -282,7 +283,9 @@ pub fn delete(
         .map_err(|source| StoreError::Sql { source })?;
 
     // A file removal cannot be rolled back, so the two media cannot commit together and one of them
-    // is left over on failure. A leftover file is unregistered and the next sweep takes it; a
+    // is left over on failure. A leftover file is unregistered and a sweep collects it once
+    // whatever refused the removal has cleared — a lasting cause, a read-only attribute say,
+    // keeps it and the sweep skips it the same way; a
     // leftover row is one `orphan_rows` reports and nothing removes, and retention would keep
     // charging its `byte_size` against a disk budget that is already free.
     if let Some(file) = held {
