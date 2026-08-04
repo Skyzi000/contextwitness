@@ -2177,22 +2177,24 @@ mod tests {
     #[test]
     fn orphan_rows_without_file_are_reported_and_kept() {
         let (_dir, mut conn, root) = database();
-        let id = ulid::Ulid::new();
-        let relative = save_test_image(&mut conn, &root, id, at(2026, 7, 30), 90);
-        std::fs::remove_file(root.join(&relative))
+        // Saved newest-first, so the promised order — the order the pictures were taken — cannot
+        // be mistaken for the insertion order an unordered scan would answer with.
+        let later = ulid::Ulid::new();
+        let later_relative = save_test_image(&mut conn, &root, later, at(2026, 7, 30), 90);
+        let earlier = ulid::Ulid::new();
+        let earlier_relative = save_test_image(&mut conn, &root, earlier, at(2026, 7, 29), 93);
+        std::fs::remove_file(root.join(&later_relative))
+            .expect("the saved file should be removable without touching its row");
+        std::fs::remove_file(root.join(&earlier_relative))
             .expect("the saved file should be removable without touching its row");
 
         let rows = orphan_rows(&conn, &root).expect("orphan rows should be reportable");
 
-        assert_eq!(rows, [relative]);
+        assert_eq!(rows, [earlier_relative, later_relative]);
         let count: i64 = conn
-            .query_row(
-                "SELECT count(*) FROM images WHERE observation_id = ?1",
-                [id.to_string()],
-                |row| row.get(0),
-            )
+            .query_row("SELECT count(*) FROM images", [], |row| row.get(0))
             .expect("the image count should be readable");
-        assert_eq!(count, 1);
+        assert_eq!(count, 2);
     }
 
     #[test]
