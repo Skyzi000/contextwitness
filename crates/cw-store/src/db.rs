@@ -282,7 +282,7 @@ fn migrate(conn: &mut rusqlite::Connection, path: &std::path::Path) -> Result<()
 
 #[cfg(test)]
 mod tests {
-    use super::{APPLICATION_ID, SCHEMA_VERSION, open};
+    use super::{APPLICATION_ID, CONNECTION_SETTINGS, SCHEMA_VERSION, enable_wal, open};
     use crate::StoreError;
     use tempfile::tempdir;
 
@@ -380,6 +380,50 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn the_wal_switch_outwaits_a_lock_released_within_its_deadline() {
+        // The deterministic counterpart of the test above: that one needs the scheduler to
+        // produce a collision, this one manufactures one. The blocker holds a write
+        // transaction, and against a held write lock the conversion comes back busy at once
+        // instead of waiting out the busy timeout — measured, a switch stripped of its
+        // retries still gets past a read transaction, and fails on the spot against this.
+        // The lock is taken before the switching thread exists and released 300ms later, far
+        // inside WAL_SWITCH_DEADLINE — so unless spawning that thread and opening its
+        // connection takes longer than the hold, a switch that does not retry fails here and
+        // the switch that retries succeeds.
+        let dir = tempdir().expect("the temporary database directory should be creatable");
+        let path = dir.path().join("db.sqlite3");
+        let blocker =
+            rusqlite::Connection::open(&path).expect("the blocking connection should open");
+        blocker
+            .execute("CREATE TABLE t (x INTEGER)", [])
+            .expect("the rollback-journal database should be creatable");
+        blocker
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("the blocking transaction should begin");
+
+        let switcher = std::thread::spawn({
+            let path = path.clone();
+            move || {
+                let conn = rusqlite::Connection::open(&path)
+                    .expect("the switching connection should open");
+                conn.execute_batch(CONNECTION_SETTINGS)
+                    .expect("the switching connection settings should apply");
+                enable_wal(&conn, &path)
+            }
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        blocker
+            .execute_batch("COMMIT")
+            .expect("the blocking transaction should release its lock");
+
+        switcher
+            .join()
+            .expect("the switching thread should not panic")
+            .expect("the WAL switch should outwait a lock released within its deadline");
     }
 
     #[test]
