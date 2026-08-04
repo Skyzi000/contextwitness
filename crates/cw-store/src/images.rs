@@ -416,9 +416,13 @@ fn sweep_collected_files(
     // the rows whose file, if it is there at all, is under some other name. On the ordinary
     // directory nothing reaches this point, because every enumerated file is registered under the
     // name it was enumerated with. `canonicalize` answers with the name actually on disk, so a
-    // difference of case, a link, or any other way of writing one name collapses to a single
-    // answer. Two hardlinks are two names and stay two, which costs nothing here: removing the
-    // candidate's name leaves the registered one, and the picture with it. A candidate this cannot
+    // difference of case, a link, or any other spelling inside the drive's namespace collapses to
+    // a single answer. A spelling through another namespace need not — measured, one file reached
+    // over a loopback share answers with the share's spelling against the walk's drive-letter one
+    // — so a registered link written that way is not matched, and the file it reaches can be taken
+    // as an orphan exactly as in the enumeration gap below. Two hardlinks are two names and stay
+    // two, which costs nothing here: removing the candidate's name leaves the registered one, and
+    // the picture with it. A candidate this cannot
     // be answered about is kept: leaving a leftover costs disk, and removing a registered image
     // costs the picture. Asking only about the names no enumerated file spelled is a cost decision
     // and it leaves something out — a registered name that was an ordinary file when it was
