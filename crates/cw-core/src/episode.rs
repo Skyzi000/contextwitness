@@ -48,8 +48,9 @@ pub struct EpisodeMetadata {
 /// Truncate `at` down to a multiple of `window_minutes` counted from the Unix epoch.
 ///
 /// The epoch is aligned to midnight, so for any window length that divides 60 this is also
-/// aligned to the clock hour. Panics when `window_minutes` is zero; `Config::validate` rejects
-/// that.
+/// aligned to the clock hour. Panics when `window_minutes` is zero (`Config::validate` rejects
+/// that) and when truncation lands before `chrono::DateTime::<Utc>::MIN_UTC`, which only an `at`
+/// less than one window length above that bound can reach.
 pub fn window_start(
     at: chrono::DateTime<chrono::Utc>,
     window_minutes: u32,
@@ -77,6 +78,8 @@ pub fn window_start(
 ///
 /// The fold relation is field-wise equality and therefore an equivalence relation, so comparing
 /// against the last kept entry and comparing against the immediately preceding one agree here.
+///
+/// Panics when the window's end would land past `chrono::DateTime::<Utc>::MAX_UTC`.
 pub fn build_episode(
     window_start: chrono::DateTime<chrono::Utc>,
     window_minutes: u32,
