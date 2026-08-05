@@ -356,6 +356,13 @@ mod tests {
             window_start(timestamp("2026-07-25T01:05:00Z"), 5),
             timestamp("2026-07-25T01:05:00Z")
         );
+        // A clock set wrong can observe before the epoch, and only there do flooring and
+        // truncating toward zero part ways: truncated, 23:57 would get the window start
+        // 00:00:00, which is after the instant.
+        assert_eq!(
+            window_start(timestamp("1969-12-31T23:57:00Z"), 5),
+            timestamp("1969-12-31T23:55:00Z")
+        );
     }
 
     #[test]
