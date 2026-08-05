@@ -165,7 +165,8 @@ pub enum StoreError {
         /// was reserved rather than chosen — the temporary a publish writes into — this is the
         /// destination, which is the only name the caller can act on.
         path: PathBuf,
-        /// Underlying filesystem error.
+        /// Underlying error, spelled as I/O even when no filesystem call produced it: a listed
+        /// path that escapes the image root is a spelling failure, wrapped as `InvalidData`.
         source: std::io::Error,
     },
     /// An image is already registered for an observation.
