@@ -599,7 +599,10 @@ mod tests {
 
     #[test]
     fn an_unclaimed_database_with_a_version_marker_is_refused_and_left_alone() {
-        for found in [SCHEMA_VERSION, SCHEMA_VERSION + 1] {
+        // -1 pins the refusal to "not zero" rather than "positive": past a weakened check, a
+        // negative marker would fall through to the version gate and be refused as an
+        // unsupported schema of ours rather than as a file somebody else is using.
+        for found in [-1, SCHEMA_VERSION, SCHEMA_VERSION + 1] {
             let dir = tempdir().expect("the temporary database directory should be creatable");
             let path = dir.path().join("db.sqlite3");
             let conn = rusqlite::Connection::open(&path)
