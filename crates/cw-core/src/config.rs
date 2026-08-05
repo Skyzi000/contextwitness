@@ -44,10 +44,6 @@ context_label = "screen capture"
 [episode]
 # Observations are grouped into episodes of this length (1-1440).
 window_minutes = 5
-
-[activitywatch]
-# Reserved for a future release; ActivityWatch is not part of v1.
-enabled = false
 "#;
 
 /// Complete ContextWitness configuration.
@@ -67,8 +63,6 @@ pub struct Config {
     pub hindsight: HindsightConfig,
     /// Episode grouping settings.
     pub episode: EpisodeConfig,
-    /// ActivityWatch integration settings.
-    pub activitywatch: ActivityWatchConfig,
 }
 
 /// Screen capture settings.
@@ -180,15 +174,6 @@ impl Default for EpisodeConfig {
     fn default() -> Self {
         Self { window_minutes: 5 }
     }
-}
-
-/// ActivityWatch integration settings.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-#[serde(default)]
-pub struct ActivityWatchConfig {
-    /// Whether ActivityWatch integration is enabled.
-    pub enabled: bool,
 }
 
 /// Errors produced while reading, writing or resolving configuration.
@@ -455,7 +440,6 @@ mod tests {
         assert_eq!(config.hindsight.bank_id, "contextwitness");
         assert_eq!(config.hindsight.context_label, "screen capture");
         assert_eq!(config.episode.window_minutes, 5);
-        assert!(!config.activitywatch.enabled);
     }
 
     #[test]
