@@ -866,7 +866,8 @@ mod tests {
         assert_eq!(&bytes[8..12], b"WEBP");
         // Decoding here is a test reading back what this test just wrote; the program itself still
         // only encodes. Without this, handing the encoder its height and width the other way round
-        // stores a transposed picture and every assertion above still holds.
+        // stores the same rows rewrapped at the wrong stride — a scrambled picture with its
+        // dimensions swapped — and every assertion above still holds.
         let decoded = webp::Decoder::new(&bytes)
             .decode()
             .expect("the saved WebP should decode");
