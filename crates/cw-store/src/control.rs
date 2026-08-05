@@ -40,7 +40,7 @@ pub enum EventKind {
 pub struct ControlEvent {
     /// Primary key.
     pub id: ulid::Ulid,
-    /// What happened.
+    /// What was asked for or observed.
     pub kind: EventKind,
     /// When it happened.
     pub at: chrono::DateTime<chrono::Utc>,
@@ -195,7 +195,9 @@ pub fn set_pause(
         .map_err(|source| StoreError::Sql { source })
 }
 
-/// Start capture again, and record that it was asked for.
+/// Clear the recorded pause, and record that starting again was asked for. Whether anything
+/// starts is its reader's side: [`get_pause`] answers what remains recorded, and a resume with
+/// nothing to resume records the same event.
 pub fn resume(
     conn: &mut rusqlite::Connection,
     event_id: ulid::Ulid,
