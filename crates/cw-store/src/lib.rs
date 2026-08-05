@@ -28,9 +28,9 @@ pub enum StoreError {
         /// Underlying SQLite error.
         source: rusqlite::Error,
     },
-    /// The database was not created by ContextWitness.
+    /// The database does not carry ContextWitness's application id.
     #[error(
-        "database {path} was not created by ContextWitness (application id {found}); point \
+        "database {path} carries application id {found}, not ContextWitness's; point \
          storage.data_dir at a directory of its own"
     )]
     ForeignDatabase {

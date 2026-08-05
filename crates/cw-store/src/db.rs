@@ -40,7 +40,7 @@ enum Ownership {
     FreeToClaim,
 }
 
-/// Refuse a database that belongs to another program.
+/// Refuse a database whose marks say another program is using it.
 ///
 /// `user_version` cannot answer this: zero is SQLite's default and most applications never set it,
 /// so "version 0" means "not one of ours yet" only once the file is known to be ours in the first
