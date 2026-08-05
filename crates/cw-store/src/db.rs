@@ -241,9 +241,7 @@ fn migrate(conn: &mut rusqlite::Connection, path: &std::path::Path) -> Result<()
     })?;
 
     // The lower bound is not decoration: `current as usize` on a negative number is an index far
-    // past the end of MIGRATIONS — -1 becomes `usize::MAX` — and the slice below panics on it. A
-    // guard that only excluded values above SCHEMA_VERSION would leave the daemon a value that
-    // crashes it.
+    // past the end of MIGRATIONS — -1 becomes `usize::MAX` — and the slice below panics on it.
     if !(0..=SCHEMA_VERSION).contains(&current) {
         return Err(StoreError::UnsupportedSchema {
             path: path.to_path_buf(),
@@ -361,10 +359,6 @@ mod tests {
 
     #[test]
     fn a_first_start_where_every_subsystem_opens_at_once_succeeds() {
-        // Every subsystem holds its own connection, so a first start is several opens at the same
-        // moment against a database still in rollback-journal mode. They all meet on the WAL
-        // conversion, which needs an exclusive lock and does not go through the busy timeout, so
-        // without the wait `enable_wal` does on its own behalf most such starts fail.
         const CONNECTIONS: usize = 8;
         // Two races live here and each spacing favours one of them. Starting together, the
         // connections collide on the WAL conversion. Starting about a millisecond apart, a later

@@ -105,11 +105,7 @@ pub fn save(
         });
     }
 
-    // The INSERT decides a conflict before anything is published. Every failure from here
-    // through the post-rename sync discards by this handle; at the commit the handle has nothing
-    // left to do, because a failure there keeps the picture — that arm says why. A crash before
-    // the commit leaves at most an unregistered file, which the sweep exists for and collects
-    // from where its walk reaches, once nothing refuses the removal.
+    // The INSERT decides a conflict before anything is published.
     // `delete` takes the same IMMEDIATE lock, so no two decisions about this observation's row can
     // be made at once. A `delete` whose transaction ran before this one cannot take this file: it
     // removes nothing unless the name was occupied while it still held the lock, and while the name
@@ -229,10 +225,9 @@ pub fn save(
 /// already gone — only the row is removed, so a save that follows this commit keeps the file it
 /// renames into that name.
 ///
-/// The observation, its OCR text and its payload are untouched: they are the point of the record
-/// and outlive the picture. Empty day directories are left behind on purpose, because pruning one
-/// could race with [`save`] between creating that directory and opening its temporary file, while
-/// a few hundred empty entries a year cost nothing and only the startup sweep walks them.
+/// Empty day directories are left behind on purpose, because pruning one could race with [`save`]
+/// between creating that directory and opening its temporary file, while a few hundred empty
+/// entries a year cost nothing and only the startup sweep walks them.
 pub fn delete(
     conn: &mut rusqlite::Connection,
     root: &std::path::Path,
@@ -268,9 +263,7 @@ pub fn delete(
     //
     // Asked without following the last component, because clearing a name means taking the entry
     // that carries it and not the file at the other end. A link whose target is gone still has an
-    // entry, and leaving it would stand in the way of every later save for this observation, and
-    // not until the next startup either, because the sweep collects only entries the filesystem
-    // calls files and a link is not one.
+    // entry, and leaving it would stand in the way of every later save for this observation.
     //
     // A row whose file is already gone is a state this store tolerates, and there the work left is
     // nothing. Anything else that will not open is reported with the row still in place: a
@@ -291,13 +284,7 @@ pub fn delete(
         .map_err(|source| StoreError::Sql { source })?;
 
     // A file removal cannot be rolled back, so the two media cannot commit together and one of them
-    // is left over on failure. A leftover file is unregistered and a sweep collects it from
-    // where its walk reaches, once whatever refused the removal has cleared — a lasting cause, a
-    // read-only attribute say,
-    // keeps it and the sweep skips it the same way, and a leftover link no sweep collects at
-    // all, cleared or not, because files are all the sweep takes; a
-    // leftover row is one `orphan_rows` reports and nothing unasked removes, and retention would
-    // keep charging its `byte_size` against a disk budget that is already free.
+    // is left over on failure.
     if let Some(file) = held {
         cw_core::atomic_file::delete_by_handle(&file)
             .map_err(|source| StoreError::ImageIo { path, source })?;
@@ -638,13 +625,11 @@ fn collect_files(
         for entry in entries {
             let entry = match entry {
                 Ok(entry) => entry,
-                // The listing stopped partway, which is the arm above arriving one step later: the
-                // root's listing is the whole candidate list, so a clean sweep reported from one
-                // that stopped is a clean sweep reported over what was never seen, while a
-                // directory under it is one place among many. Broken out of rather than skipped,
-                // because `ReadDir` promises nothing about what follows an error: an iterator that
-                // keeps answering with one would never let this loop end, while ending the listing
-                // early costs at most a leftover left uncollected until some later startup.
+                // The listing stopped partway, which is the arm above arriving one step later.
+                // Broken out of rather than skipped, because `ReadDir` promises nothing about what
+                // follows an error: an iterator that keeps answering with one would never let this
+                // loop end, while ending the listing early costs at most a leftover left
+                // uncollected until some later startup.
                 Err(source) if directory == root => {
                     return Err(StoreError::ImageIo {
                         path: directory.clone(),

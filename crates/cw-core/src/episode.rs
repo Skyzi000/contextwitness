@@ -121,7 +121,7 @@ pub fn build_episode(
         },
     );
     entries.dedup_by(|current, previous| {
-        // Fold on the six fields below and nothing else. The timestamp is excluded because it is
+        // Fold on the fields below and nothing else. The timestamp is excluded because it is
         // what a folded entry usually differs in, and collapsing repeated times is the point — two
         // observations at one instant fold as readily. Text and error are compared whether this
         // entry's status renders them or not, so two that a reader could not tell apart are kept
@@ -129,8 +129,7 @@ pub fn build_episode(
         // to be wrong. The other direction is real too: the monitor's size, the image path and the
         // OCR languages are not compared, so entries differing only in those do fold. The size is
         // left out because it is written only where the monitor changes, and an entry matching the
-        // last kept one's monitor would not have written it. A folded entry takes its image path
-        // with it, so the episode carries no picture from a line it dropped.
+        // last kept one's monitor would not have written it.
         let current = current.1;
         let previous = previous.1;
 

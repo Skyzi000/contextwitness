@@ -9,9 +9,7 @@ use chrono::{DateTime, SecondsFormat, Timelike, Utc};
 const SPELLED_LENGTH: usize = 30;
 
 /// One more than the largest value a real nanosecond field can hold. chrono spends everything at or
-/// above this on the second that follows, which goes wrong two different ways: mid-minute the value
-/// takes text an ordinary instant already owns, and at second 59 it takes a `:60` that no instant
-/// this schema can store owns at all.
+/// above this on the second that follows.
 const NANOSECONDS_PER_SECOND: u32 = 1_000_000_000;
 
 /// Spell `at` for a TEXT column: fixed width, nanosecond precision, `Z`.

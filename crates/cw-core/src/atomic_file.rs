@@ -210,9 +210,7 @@ pub fn final_path_by_handle(file: &std::fs::File) -> std::io::Result<std::path::
 /// included.
 ///
 /// Separate from the call that supplies those answers because the arithmetic is what has to be
-/// right — the same number means the name or means the room it needs, and reading it the wrong way
-/// either abandons a file that was identified or hands back a truncated name as an identity. A
-/// Win32 call cannot be made to answer to order, and this can.
+/// right. A Win32 call cannot be made to answer to order, and this can.
 ///
 /// A break in the convention is refused rather than believed when the answer's length shows it:
 /// an answer as long as the buffer would be asking for room the buffer already has, and the
@@ -395,11 +393,9 @@ mod tests {
 
         let file = open_for_removal(&path).expect("an existing file should be openable to remove");
 
-        // What this handle gives away. Sharing is checked in both directions, so a newcomer whose
-        // own share mode leaves out a right this handle holds is refused, and anything that opens
-        // files exclusively is locked out while this is held. The read and write bits are covered
-        // here and nowhere else. The removal bit is not: renaming a file needs it too, so every
-        // test that moves one out from under its handle fails without it as well.
+        // What this handle gives away. The read and write bits are covered here and nowhere
+        // else. The removal bit is not: renaming a file needs it too, so every test that moves
+        // one out from under its handle fails without it as well.
         std::fs::File::open(&path).expect("a reader sharing what the library shares should get in");
         std::fs::OpenOptions::new()
             .write(true)
@@ -622,8 +618,7 @@ mod tests {
     #[test]
     fn an_answer_as_long_as_the_buffer_is_given_back_no_name() {
         // An answer as long as the buffer asks for room the buffer already has, so no query that
-        // follows the convention produces it. Believing it would hand back a buffer that was never
-        // written to, as a name.
+        // follows the convention produces it.
         let error = path_from_sized_query(|buffer| {
             if buffer.is_empty() {
                 4
