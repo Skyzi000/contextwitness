@@ -117,12 +117,12 @@ pub fn get_pause(conn: &rusqlite::Connection) -> Result<Option<Pause>, StoreErro
 
     while let Some(row) = rows.next().map_err(|source| StoreError::Sql { source })? {
         let key: String = row.get(0).map_err(|source| StoreError::Sql { source })?;
-        let value =
-            row.get::<_, rusqlite::types::Value>(1)
-                .map_err(|source| StoreError::Control {
-                    subject: key.clone(),
-                    source: Box::new(source),
-                })?;
+        let value = row
+            .get::<_, String>(1)
+            .map_err(|source| StoreError::Control {
+                subject: key.clone(),
+                source: Box::new(source),
+            })?;
         if key == PAUSE_UNTIL {
             pause_until = Some(value);
         } else if key == PAUSE_INDEFINITE {
@@ -136,7 +136,7 @@ pub fn get_pause(conn: &rusqlite::Connection) -> Result<Option<Pause>, StoreErro
             source: invalid_data("both keys are set and only one of them can be true"),
         }),
         (None, Some(value)) => {
-            if text_value(PAUSE_INDEFINITE, value)? == INDEFINITELY {
+            if value == INDEFINITELY {
                 Ok(Some(Pause::Indefinite))
             } else {
                 Err(StoreError::Control {
@@ -145,7 +145,7 @@ pub fn get_pause(conn: &rusqlite::Connection) -> Result<Option<Pause>, StoreErro
                 })
             }
         }
-        (Some(value), None) => read_timestamp(PAUSE_UNTIL, value)
+        (Some(value), None) => read_timestamp(PAUSE_UNTIL, &value)
             .map(Pause::Until)
             .map(Some),
         (None, None) => Ok(None),
@@ -252,13 +252,13 @@ pub fn get_health(
         return Ok(None);
     };
     let value = row
-        .get::<_, rusqlite::types::Value>(0)
+        .get::<_, String>(0)
         .map_err(|source| StoreError::Control {
             subject: which.key().to_owned(),
             source: Box::new(source),
         })?;
 
-    read_timestamp(which.key(), value).map(Some)
+    read_timestamp(which.key(), &value).map(Some)
 }
 
 /// Append one row to the audit trail.
@@ -318,26 +318,8 @@ pub fn events_in_window(
     Ok(events)
 }
 
-fn text_value(subject: &str, value: rusqlite::types::Value) -> Result<String, StoreError> {
-    match value {
-        rusqlite::types::Value::Text(value) => Ok(value),
-        rusqlite::types::Value::Null => Err(StoreError::Control {
-            subject: subject.to_owned(),
-            source: invalid_data("the control state value is NULL"),
-        }),
-        _ => Err(StoreError::Control {
-            subject: subject.to_owned(),
-            source: invalid_data("the control state value is not TEXT"),
-        }),
-    }
-}
-
-fn read_timestamp(
-    subject: &str,
-    value: rusqlite::types::Value,
-) -> Result<chrono::DateTime<chrono::Utc>, StoreError> {
-    let value = text_value(subject, value)?;
-    timestamp::from_sql(&value).map_err(|source| StoreError::Control {
+fn read_timestamp(subject: &str, value: &str) -> Result<chrono::DateTime<chrono::Utc>, StoreError> {
+    timestamp::from_sql(value).map_err(|source| StoreError::Control {
         subject: subject.to_owned(),
         source,
     })
