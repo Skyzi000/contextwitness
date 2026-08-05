@@ -79,7 +79,10 @@ pub fn window_start(
 /// The fold relation is field-wise equality and therefore an equivalence relation, so comparing
 /// against the last kept entry and comparing against the immediately preceding one agree here.
 ///
-/// Panics when the window's end would land past `chrono::DateTime::<Utc>::MAX_UTC`.
+/// Panics when the window's end would land past `chrono::DateTime::<Utc>::MAX_UTC`, and when a
+/// bound rendered at `render_offset` leaves chrono's representable range — a start by `MIN_UTC`
+/// with a westward offset, or an end by `MAX_UTC` with an eastward one (measured: both panic in
+/// chrono's offset addition).
 pub fn build_episode(
     window_start: chrono::DateTime<chrono::Utc>,
     window_minutes: u32,
