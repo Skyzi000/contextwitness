@@ -163,6 +163,18 @@ pub fn open(path: &std::path::Path) -> Result<rusqlite::Connection, StoreError> 
         path: path.to_path_buf(),
         source,
     })?;
+    // Held for the whole decision: a refusal below ends with this connection's close, and the
+    // clean close of a WAL database's last connection folds the log into the main file and
+    // deletes it — a change to a file a refusal leaves as found. Put back once the database is
+    // accepted as ours.
+    conn.set_db_config(
+        rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+        true,
+    )
+    .map_err(|source| StoreError::Open {
+        path: path.to_path_buf(),
+        source,
+    })?;
     conn.execute_batch(CONNECTION_SETTINGS)
         .map_err(|source| StoreError::Open {
             path: path.to_path_buf(),
@@ -219,6 +231,14 @@ pub fn open(path: &std::path::Path) -> Result<rusqlite::Connection, StoreError> 
     // the refusal, its journal gone. What a refusal leaves as found is the file at rest.
     migrate(&mut conn, path)?;
     enable_wal(&conn, path)?;
+    conn.set_db_config(
+        rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+        false,
+    )
+    .map_err(|source| StoreError::Open {
+        path: path.to_path_buf(),
+        source,
+    })?;
     Ok(conn)
 }
 
@@ -588,6 +608,52 @@ mod tests {
             after, before,
             "refusing a file this build cannot handle must leave it as found, and a newer build's \
              version marker is the one thing that build needs intact"
+        );
+    }
+
+    #[test]
+    fn an_unsupported_wal_database_keeps_its_log() {
+        // A newer build's database is in WAL mode — `enable_wal` writes it into the header — and
+        // an interrupted daemon leaves its log beside it, so the realistic refusal closes a WAL
+        // connection. That close would fold the log into the main file and delete it; the fixture
+        // holds the log back the same way `open` does, so there is one for the refusal to leave.
+        let dir = tempdir().expect("the temporary database directory should be creatable");
+        let path = dir.path().join("db.sqlite3");
+        let conn = rusqlite::Connection::open(&path)
+            .expect("the WAL-refusal test database should be openable");
+        conn.set_db_config(
+            rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+            true,
+        )
+        .expect("the fixture should hold its log back");
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))
+            .expect("the fixture should switch to WAL");
+        assert_eq!(mode, "wal");
+        conn.pragma_update(None, "application_id", APPLICATION_ID)
+            .expect("the ContextWitness application id should be writable");
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+            .expect("the unsupported schema version should be writable");
+        drop(conn);
+        let log = path.with_extension("sqlite3-wal");
+        let main_before = std::fs::read(&path).expect("the test database should be readable");
+        let log_before = std::fs::read(&log).expect("the fixture should have left a log");
+
+        match open(&path) {
+            Err(StoreError::UnsupportedSchema { .. }) => {}
+            Err(error) => panic!("expected UnsupportedSchema, got {error:?}"),
+            Ok(_) => panic!("the unsupported schema version was accepted"),
+        }
+
+        assert_eq!(
+            std::fs::read(&path).expect("the refused database should still be readable"),
+            main_before,
+            "the main file must be left as found"
+        );
+        assert_eq!(
+            std::fs::read(&log).expect("the refused database's log should still be there"),
+            log_before,
+            "the log must be left as found, not folded in and deleted"
         );
     }
 
