@@ -184,7 +184,8 @@ pub fn save(
         // The picture stays. An error here does not prove the row is not there — SQLite does not
         // promise that every failed commit rolled back — and discarding it would turn that
         // uncertainty into the one outcome this store refuses: a registered row whose file is gone,
-        // which nothing removes and retention keeps charging against a budget that is already free.
+        // which nothing unasked removes and retention keeps charging against a budget that is
+        // already free.
         // If the transaction did roll back, what is left is an unregistered file, which the
         // startup sweep collects from where its walk reaches. Every other failure above can
         // discard, because none of them has reached the commit.
@@ -295,8 +296,8 @@ pub fn delete(
     // read-only attribute say,
     // keeps it and the sweep skips it the same way, and a leftover link no sweep collects at
     // all, cleared or not, because files are all the sweep takes; a
-    // leftover row is one `orphan_rows` reports and nothing removes, and retention would keep
-    // charging its `byte_size` against a disk budget that is already free.
+    // leftover row is one `orphan_rows` reports and nothing unasked removes, and retention would
+    // keep charging its `byte_size` against a disk budget that is already free.
     if let Some(file) = held {
         cw_core::atomic_file::delete_by_handle(&file)
             .map_err(|source| StoreError::ImageIo { path, source })?;
