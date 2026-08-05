@@ -80,6 +80,9 @@ pub enum StoreError {
     },
     /// An observation and its stored form could not be converted into one another: on the way in,
     /// before anything reaches the database, or on the way out, from a row that is already there.
+    /// The row is not always the observation's own: an image-registration row whose id, timestamp
+    /// or path is not one this program would have written reports here too, under the observation
+    /// id the row claims.
     #[error("observation {id} cannot be converted to or from its stored form: {source}")]
     Encoding {
         /// Primary key as the failing side spells it: the spelling this store writes on the way
