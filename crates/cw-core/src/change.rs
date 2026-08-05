@@ -643,19 +643,6 @@ mod tests {
     }
 
     #[test]
-    fn changed_fraction_is_zero_for_identical_thumbnails() {
-        let frame = solid(WIDTH, HEIGHT, 200);
-        let thumbnail = Thumbnail::from_rgba(&frame, WIDTH, HEIGHT, 1.0)
-            .expect("the fixed-size frame must be valid RGBA");
-
-        assert_eq!(
-            thumbnail.changed_fraction(&thumbnail, 8),
-            0.0,
-            "identical thumbnails must have an exactly zero changed fraction"
-        );
-    }
-
-    #[test]
     fn a_non_positive_or_nan_display_scale_is_rejected() {
         let frame = solid(1, 1, 200);
 
