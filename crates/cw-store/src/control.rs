@@ -860,23 +860,6 @@ mod tests {
     }
 
     #[test]
-    fn a_blacklist_skip_is_recorded_with_its_detail() {
-        let (_dir, conn) = database();
-        let event = ControlEvent {
-            id: ulid::Ulid::new(),
-            kind: EventKind::BlacklistSkip,
-            at: at(2026, 7, 30, 12, 0, 0),
-            detail: Some("notepad.exe".to_owned()),
-        };
-
-        record_event(&conn, &event).expect("the blacklist skip should be stored");
-        let events = events_in_window(&conn, event.at, event.at + TimeDelta::seconds(1))
-            .expect("the audit window should be readable");
-
-        assert_eq!(events, [event]);
-    }
-
-    #[test]
     fn an_empty_or_reversed_event_window_is_empty_rather_than_an_error() {
         let (_dir, conn) = database();
         let t = at(2026, 7, 30, 12, 34, 56);
@@ -912,6 +895,8 @@ mod tests {
     fn adjacent_event_windows_tile_without_sharing_an_event() {
         let (_dir, conn) = database();
         // Fixed ids running against the timestamps, so a swap to `ORDER BY id, at` fails every run.
+        // The rows carry `Some(detail)` and are compared whole, so a stored detail's round-trip is
+        // pinned here too.
         let first = ControlEvent {
             id: ulid::Ulid::from(4u128),
             kind: EventKind::BlacklistSkip,
