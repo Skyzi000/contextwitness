@@ -208,11 +208,15 @@ pub fn open(path: &std::path::Path) -> Result<rusqlite::Connection, StoreError> 
 
     // Migrate first, switch second. Everything applied above is per-connection; the WAL switch is
     // written into the database header, where it would outlive a refusal. Ordering it after the
-    // migration means the only thing that changes the file is reached through the write transaction
+    // migration means the only change this program orders is reached through the write transaction
     // that decided the file is ours, and that decision cannot be overtaken: reading ownership and
     // then switching left a window in which another program could create its own database at this
     // path between the two, and a permanent journal mode change would already have landed on it by
-    // the time `migrate` refused.
+    // the time `migrate` refused. One change is not this program's to order at all: a database
+    // left mid-write with a hot rollback journal is recovered by SQLite before its first read
+    // answers, so ownership cannot be read from such a file without restoring it — measured, a
+    // foreign file copied out from under a live write stands at its owner's last commit after
+    // the refusal, its journal gone. What a refusal leaves as found is the file at rest.
     migrate(&mut conn, path)?;
     enable_wal(&conn, path)?;
     Ok(conn)
@@ -688,6 +692,60 @@ mod tests {
             "refusing another program's database must leave the whole file as found — its data, \
              its journal mode, and the user_version that program would be using for its own \
              migrations"
+        );
+    }
+
+    #[test]
+    fn a_foreign_database_with_a_hot_journal_is_recovered_before_refusal() {
+        // The one boundary of "left as found": SQLite plays a hot rollback journal back before
+        // the first read answers, so a file left mid-crash is restored before any refusal can
+        // land — SQLite's own act, the same one the owner's next open would perform. Copying
+        // the database and journal out from under a live write stands in for the crash: the
+        // copies hold no locks, so the copied journal is hot.
+        let dir = tempdir().expect("the temporary database directory should be creatable");
+        let path = dir.path().join("db.sqlite3");
+        let conn = rusqlite::Connection::open(&path)
+            .expect("the other application's database should be openable");
+        // A one-page cache spills pages to disk mid-transaction, so the copy taken below holds
+        // uncommitted writes for the journal to take back.
+        conn.execute_batch("PRAGMA cache_size = 1; CREATE TABLE notes (body BLOB)")
+            .expect("the other application's table should be creatable");
+        conn.execute("INSERT INTO notes VALUES (zeroblob(100000))", [])
+            .expect("the other application's row should be writable");
+        let committed = std::fs::read(&path).expect("the committed state should be readable");
+        conn.execute_batch("BEGIN IMMEDIATE")
+            .expect("the write transaction should begin");
+        for _ in 0..50 {
+            conn.execute("INSERT INTO notes VALUES (zeroblob(100000))", [])
+                .expect("the uncommitted row should be writable");
+        }
+        let crash_dir = tempdir().expect("the crash-copy directory should be creatable");
+        let crashed = crash_dir.path().join("db.sqlite3");
+        let crashed_journal = crash_dir.path().join("db.sqlite3-journal");
+        std::fs::copy(&path, &crashed).expect("the database should copy mid-transaction");
+        std::fs::copy(dir.path().join("db.sqlite3-journal"), &crashed_journal)
+            .expect("the journal should copy mid-transaction");
+        drop(conn);
+        let as_crashed = std::fs::read(&crashed).expect("the crashed copy should be readable");
+        assert_ne!(
+            as_crashed, committed,
+            "the copy should hold uncommitted pages for recovery to take back"
+        );
+
+        match open(&crashed) {
+            Err(StoreError::ForeignDatabase { found, .. }) => assert_eq!(found, 0),
+            Err(error) => panic!("expected ForeignDatabase, got {error:?}"),
+            Ok(_) => panic!("the crashed foreign database was accepted"),
+        }
+
+        let after = std::fs::read(&crashed).expect("the refused database should be readable");
+        assert_eq!(
+            after, committed,
+            "recovery must land the file at its owner's last commit, not leave it as copied"
+        );
+        assert!(
+            !crashed_journal.exists(),
+            "recovery must remove the journal it played back"
         );
     }
 
