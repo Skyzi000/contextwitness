@@ -36,7 +36,8 @@ fn relative_path(id: ulid::Ulid, at: chrono::DateTime<chrono::Utc>) -> String {
 ///
 /// The file is written to a temporary name and flushed before a transaction registers it, renames
 /// it into place, flushes the rename and commits. A crash before the commit leaves at most a file
-/// [`sweep_orphan_files`] removes; a crash after it leaves nothing to clean.
+/// [`sweep_orphan_files`] removes from where its walk reaches; a crash after it leaves nothing to
+/// clean.
 #[allow(clippy::too_many_arguments)]
 pub fn save(
     conn: &mut rusqlite::Connection,
@@ -107,7 +108,8 @@ pub fn save(
     // The INSERT decides a conflict before anything is published. Every failure from here
     // through the post-rename sync discards by this handle; at the commit the handle has nothing
     // left to do, because a failure there keeps the picture — that arm says why. A crash before
-    // the commit leaves at most an unregistered file, which is what the sweep exists for.
+    // the commit leaves at most an unregistered file, which the sweep exists for and collects
+    // from where its walk reaches.
     // `delete` takes the same IMMEDIATE lock, so no two decisions about this observation's row can
     // be made at once. A `delete` whose transaction ran before this one cannot take this file: it
     // removes nothing unless the name was occupied while it still held the lock, and while the name
@@ -183,9 +185,9 @@ pub fn save(
         // promise that every failed commit rolled back — and discarding it would turn that
         // uncertainty into the one outcome this store refuses: a registered row whose file is gone,
         // which nothing removes and retention keeps charging against a budget that is already free.
-        // If the transaction did roll back, what is left is an unregistered file, which is what the
-        // startup sweep collects. Every other failure above can discard, because none of them has
-        // reached the commit.
+        // If the transaction did roll back, what is left is an unregistered file, which the
+        // startup sweep collects from where its walk reaches. Every other failure above can
+        // discard, because none of them has reached the commit.
         return Err(StoreError::Sql { source });
     }
     drop(file);
@@ -209,7 +211,8 @@ pub fn save(
 ///
 /// The row is committed before the file is removed, so a failure in between leaves an unregistered
 /// entry rather than a row whose file is gone. An unregistered file is collected by a later sweep
-/// once whatever refused the removal has cleared; an unregistered link never is — the sweep
+/// from where its walk reaches, once whatever refused the removal has cleared; an unregistered
+/// link never is — the sweep
 /// collects only files — so a link the removal could not take keeps the name until something
 /// other than this store clears it. That is still the residue worth having: the failure this has
 /// to survive is a full disk during retention, and a row kept for a file that is gone would go on
@@ -287,8 +290,9 @@ pub fn delete(
         .map_err(|source| StoreError::Sql { source })?;
 
     // A file removal cannot be rolled back, so the two media cannot commit together and one of them
-    // is left over on failure. A leftover file is unregistered and a sweep collects it once
-    // whatever refused the removal has cleared — a lasting cause, a read-only attribute say,
+    // is left over on failure. A leftover file is unregistered and a sweep collects it from
+    // where its walk reaches, once whatever refused the removal has cleared — a lasting cause, a
+    // read-only attribute say,
     // keeps it and the sweep skips it the same way, and a leftover link no sweep collects at
     // all, cleared or not, because files are all the sweep takes; a
     // leftover row is one `orphan_rows` reports and nothing removes, and retention would keep
@@ -309,6 +313,11 @@ pub fn delete(
 /// that is there and will not say which file it reaches stops the pass with nothing removed,
 /// because any candidate could be the file it reaches — so `Ok(0)` also means that, and not only
 /// that there was nothing to collect.
+///
+/// The walk beneath the root enters real directories and takes real files only. An entry that is
+/// neither — a junction standing where a date directory should, which only something outside this
+/// store puts there, because [`save`] creates real directories — is not entered, and a file
+/// beneath it is out of this walk's reach.
 ///
 /// This is a startup operation and must not run while anything is saving: a file renamed into place
 /// but not yet registered is indistinguishable from an orphan.
@@ -561,7 +570,7 @@ pub fn orphan_rows(
 /// A discard that will not go is not reported. Every caller is already holding the error that says
 /// why the save did not happen, and answering with this one instead would leave the caller with no
 /// account of what it asked about. What a failed discard leaves behind is an unregistered file,
-/// which is what the startup sweep collects.
+/// which the startup sweep collects from where its walk reaches.
 fn discard_written_file(file: &std::fs::File) {
     let _ = cw_core::atomic_file::delete_by_handle(file);
 }
