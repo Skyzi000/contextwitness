@@ -2115,17 +2115,18 @@ mod tests {
     #[test]
     fn an_orphan_that_will_not_go_does_not_stop_the_others() {
         let (_dir, conn, root) = database();
-        std::fs::create_dir_all(&root).expect("the image root should be creatable");
-        // Named so the order NTFS answers a listing in — alphabetical when these names were
-        // measured, promised nowhere — puts the read-only candidate between two removable ones:
-        // a pass that stops at the refusal cannot have removed both sides of it, whichever end
-        // the listing starts from.
-        let leading = root.join("leading.webp");
+        // The refused candidate sits at the root beside one removable file, with another a
+        // directory deeper: the walk lists a directory's own files before it opens any directory
+        // under it, so the deeper file always comes after the refusal, and a pass that stopped
+        // there leaves it standing whichever way the root's own listing was ordered.
+        let deeper = root.join("2026");
+        std::fs::create_dir_all(&deeper).expect("the deeper directory should be creatable");
         let stubborn = root.join("stubborn.webp");
-        let trailing = root.join("trailing.webp");
-        std::fs::write(&leading, b"an orphan").expect("the file should be writable");
+        let beside = root.join("beside.webp");
+        let below = deeper.join("below.webp");
         std::fs::write(&stubborn, b"an orphan").expect("the file should be writable");
-        std::fs::write(&trailing, b"an orphan").expect("the file should be writable");
+        std::fs::write(&beside, b"an orphan").expect("the file should be writable");
+        std::fs::write(&below, b"an orphan").expect("the file should be writable");
         // A read-only file opens for removal and then refuses the disposition call with
         // `PermissionDenied`, which is the reachable form of a candidate that will not go.
         let mut attributes = std::fs::metadata(&stubborn)
@@ -2144,8 +2145,8 @@ mod tests {
             2
         );
         assert!(stubborn.exists(), "the one that will not go should be kept");
-        assert!(!leading.exists(), "the leading one should have gone");
-        assert!(!trailing.exists(), "the trailing one should have gone");
+        assert!(!beside.exists(), "the one beside it should have gone");
+        assert!(!below.exists(), "the one below it should have gone");
     }
 
     #[test]
