@@ -771,6 +771,7 @@ mod tests {
         // Creating symlinks needs a privilege ordinary dev machines may not grant.
         let Ok(()) = std::os::windows::fs::symlink_file(temp_dir.join("missing.toml"), &path)
         else {
+            std::fs::remove_dir_all(&temp_dir).expect("the test directory should be removable");
             return;
         };
 
