@@ -392,7 +392,7 @@ mod tests {
     }
 
     #[test]
-    fn the_same_edit_is_detected_at_every_display_scale() {
+    fn the_same_edit_is_detected_in_each_measured_configuration() {
         // Measured logical minima: 853, 1138, 1238, 1125, 900 — all above the 600 default, against a
         // source-pixel spread that put 5120x2880 @200% carets above Full HD ten-character edits.
         // 3840x2160 appears at both 100% and 150% on purpose: unscaled 4K is an ordinary setup on a
@@ -438,7 +438,7 @@ mod tests {
     }
 
     #[test]
-    fn a_caret_is_ignored_at_every_display_scale() {
+    fn a_caret_is_ignored_in_each_measured_configuration() {
         // Measured logical maxima: 149, 171, 225, 450, 400. 3840x2160 at 100% is the tightest
         // configuration in the supported range — 450 against a 600 default — and the only realistic
         // one where a caret can measure exactly 0, because at that sample granularity one character
@@ -531,7 +531,7 @@ mod tests {
     }
 
     #[test]
-    fn position_does_not_change_the_verdict() {
+    fn sampled_positions_do_not_change_the_verdict() {
         let width = 1366;
         let height = 768;
         let before = solid(width, height, 200);
