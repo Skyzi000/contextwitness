@@ -214,9 +214,11 @@ pub fn final_path_by_handle(file: &std::fs::File) -> std::io::Result<std::path::
 /// either abandons a file that was identified or hands back a truncated name as an identity. A
 /// Win32 call cannot be made to answer to order, and this can.
 ///
-/// A `query` that breaks the convention is refused rather than believed. An answer as long as the
-/// buffer is one the convention cannot produce — it would be asking for room the buffer already
-/// has — and the buffer behind it was never written to, so this gives back no name for it.
+/// A break in the convention is refused rather than believed when the answer's length shows it:
+/// an answer as long as the buffer would be asking for room the buffer already has, and the
+/// buffer behind it was never written to, so this gives back no name for it. The length is all
+/// that is read, so a break the length cannot show — an answer short of a buffer the query never
+/// filled — is believed.
 fn path_from_sized_query(
     mut query: impl FnMut(&mut [u16]) -> u32,
 ) -> std::io::Result<std::path::PathBuf> {
@@ -618,7 +620,7 @@ mod tests {
     }
 
     #[test]
-    fn a_query_that_breaks_the_convention_is_given_back_no_name() {
+    fn an_answer_as_long_as_the_buffer_is_given_back_no_name() {
         // An answer as long as the buffer asks for room the buffer already has, so no query that
         // follows the convention produces it. Believing it would hand back a buffer that was never
         // written to, as a name.
