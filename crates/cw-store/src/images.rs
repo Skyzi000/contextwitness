@@ -1284,6 +1284,9 @@ mod tests {
         let id = ulid::Ulid::new();
         let relative = save_test_image(&mut conn, &root, id, at(2026, 7, 30), 50);
         let path = root.join(relative);
+        // Every column, not a count: untouched is a claim about the row's contents, and a count
+        // of one still passes with the payload rewritten in place.
+        let before = observation_row(&conn, &id.to_string());
 
         delete(&mut conn, &root, id).expect("the image should be deleted");
 
@@ -1296,6 +1299,11 @@ mod tests {
             )
             .expect("the image count should be readable");
         assert_eq!(count, 0);
+        assert_eq!(
+            observation_row(&conn, &id.to_string()),
+            before,
+            "the observation row must read back exactly as saved"
+        );
     }
 
     fn observation_row(conn: &rusqlite::Connection, id: &str) -> Vec<rusqlite::types::Value> {
@@ -1305,24 +1313,6 @@ mod tests {
                 .collect()
         })
         .expect("the observation row should be readable")
-    }
-
-    #[test]
-    fn delete_leaves_the_observation_row_untouched() {
-        let (_dir, mut conn, root) = database();
-        let id = ulid::Ulid::new();
-        save_test_image(&mut conn, &root, id, at(2026, 7, 30), 60);
-        // Every column, not a count: untouched is a claim about the row's contents, and a count
-        // of one still passes with the payload rewritten in place.
-        let before = observation_row(&conn, &id.to_string());
-
-        delete(&mut conn, &root, id).expect("the image should be deleted");
-
-        assert_eq!(
-            observation_row(&conn, &id.to_string()),
-            before,
-            "the observation row must read back exactly as saved"
-        );
     }
 
     #[test]
