@@ -398,9 +398,10 @@ mod tests {
         // 3840x2160 appears at both 100% and 150% on purpose: unscaled 4K is an ordinary setup on a
         // large panel, and which configuration is tightest does not follow from the pixel count
         // alone.
-        // Bounds are the measured range over every glyph offset within one thumbnail sample period
-        // — `width / THUMBNAIL_WIDTH` by `height / THUMBNAIL_HEIGHT` — rounded outward, so a value
-        // on a measured edge is inside. Nothing in the tree reruns that sweep and the loop below
+        // Bounds are the measured range over every glyph offset within one full sampling-phase
+        // period — `width / gcd(width, 256)` by `height / gcd(height, 144)` source pixels, which
+        // a fractional stride stretches to 683x16 at 1366x768 — rounded outward, so a value on a
+        // measured edge is inside. Nothing in the tree reruns that sweep and the loop below
         // places its glyph at one offset, so a change to the resize filter, the glyph fixture or
         // the pixel threshold means deriving these again by hand.
         for (width, height, scale, logical_min, logical_max) in [
@@ -442,9 +443,10 @@ mod tests {
         // configuration in the supported range — 450 against a 600 default — and the only realistic
         // one where a caret can measure exactly 0, because at that sample granularity one character
         // can split across four samples with none of them crossing the per-pixel threshold.
-        // Bounds are the measured range over every glyph offset within one thumbnail sample period
-        // — `width / THUMBNAIL_WIDTH` by `height / THUMBNAIL_HEIGHT` — rounded outward, so a value
-        // on a measured edge is inside. Nothing in the tree reruns that sweep and the loop below
+        // Bounds are the measured range over every glyph offset within one full sampling-phase
+        // period — `width / gcd(width, 256)` by `height / gcd(height, 144)` source pixels, which
+        // a fractional stride stretches to 683x16 at 1366x768 — rounded outward, so a value on a
+        // measured edge is inside. Nothing in the tree reruns that sweep and the loop below
         // places its glyph at one offset, so a change to the resize filter, the glyph fixture or
         // the pixel threshold means deriving these again by hand.
         for (width, height, scale, logical_min, logical_max) in [
@@ -452,7 +454,7 @@ mod tests {
             (1366, 768, 1.0, 85.0, 171.0),
             (1920, 1080, 1.0, 112.0, 225.0),
             (3840, 2160, 1.0, 0.0, 450.0),
-            (3840, 2160, 1.5, 100.0, 400.0),
+            (3840, 2160, 1.5, 99.0, 400.0),
         ] {
             let before = solid(width, height, 200);
             let mut after = before.clone();
@@ -538,8 +540,8 @@ mod tests {
         let config = CaptureConfig::default();
 
         // A single-offset measurement is a sample, not a bound: this fixture varies about 1.3x
-        // across one thumbnail-sample period, which is how an earlier default was validated against
-        // a number that was never an upper bound.
+        // across its full 683x16 sampling-phase period, of which this loop samples a 6x6 block.
+        // An earlier default was validated against one such sample as if it were an upper bound.
         for left in 100..=105 {
             for top in height / 2..=height / 2 + 5 {
                 let mut after = solid(width, height, 200);
