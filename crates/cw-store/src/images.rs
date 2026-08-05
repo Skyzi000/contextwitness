@@ -104,9 +104,10 @@ pub fn save(
         });
     }
 
-    // The INSERT decides a conflict before anything is published. The handle stays open through
-    // the commit so the destination remains removable while anything can still fail. A crash
-    // before the commit leaves at most an unregistered file, which is what the sweep exists for.
+    // The INSERT decides a conflict before anything is published. Every failure from here
+    // through the post-rename sync discards by this handle; at the commit the handle has nothing
+    // left to do, because a failure there keeps the picture — that arm says why. A crash before
+    // the commit leaves at most an unregistered file, which is what the sweep exists for.
     // `delete` takes the same IMMEDIATE lock, so no two decisions about this observation's row can
     // be made at once. A `delete` whose transaction ran before this one cannot take this file: it
     // removes nothing unless the name was occupied while it still held the lock, and while the name
