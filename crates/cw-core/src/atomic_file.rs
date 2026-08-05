@@ -620,6 +620,14 @@ mod tests {
     }
 
     #[test]
+    fn a_zero_after_room_was_granted_is_a_failure() {
+        // The first answer promised room for a name; the second withdrew it. Reading that zero
+        // as a length would answer with an empty path.
+        path_from_sized_query(|buffer| if buffer.is_empty() { 4 } else { 0 })
+            .expect_err("a zero after room was granted must not be read as a name");
+    }
+
+    #[test]
     fn an_answer_as_long_as_the_buffer_is_given_back_no_name() {
         // An answer as long as the buffer asks for room the buffer already has, so no query that
         // follows the convention produces it.
