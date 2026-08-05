@@ -78,10 +78,12 @@ pub enum StoreError {
         /// The error `rusqlite` produced.
         source: rusqlite::Error,
     },
-    /// A row and the value it stands for could not be converted into one another.
+    /// An observation and its stored form could not be converted into one another: on the way in,
+    /// before anything reaches the database, or on the way out, from a row that is already there.
     #[error("observation {id} cannot be converted to or from its stored form: {source}")]
     Encoding {
-        /// Primary key of the row, as it is spelled in the database.
+        /// Primary key as the failing side spells it: the spelling this store writes on the way
+        /// in, the row's own on the way out.
         id: String,
         /// What made the conversion fail.
         #[source]
