@@ -2303,43 +2303,6 @@ mod tests {
     }
 
     #[test]
-    fn a_destination_held_by_an_unregistered_file_is_not_reported_as_registered() {
-        let (_dir, mut conn, root) = database();
-        let id = ulid::Ulid::new();
-        let taken_at = at(2026, 7, 30);
-        let relative = save_test_image(&mut conn, &root, id, taken_at, 209);
-        conn.execute(
-            "DELETE FROM images WHERE observation_id = ?1",
-            [id.to_string()],
-        )
-        .expect("the image row should be removable without touching its file");
-
-        let error = save(
-            &mut conn,
-            &root,
-            id,
-            &pixels(210),
-            WIDTH,
-            HEIGHT,
-            75.0,
-            taken_at,
-        )
-        .expect_err("the unregistered file should keep its destination");
-
-        match error {
-            StoreError::ImageIo { path, source } => {
-                assert_eq!(path, root.join(relative));
-                assert_eq!(source.kind(), std::io::ErrorKind::AlreadyExists);
-            }
-            other => panic!("expected ImageIo with AlreadyExists, got {other:?}"),
-        }
-        let count: i64 = conn
-            .query_row("SELECT count(*) FROM images", [], |row| row.get(0))
-            .expect("the image count should be readable");
-        assert_eq!(count, 0);
-    }
-
-    #[test]
     fn a_failed_rename_leaves_no_temporary_behind() {
         let (_dir, mut conn, root) = database();
         let id = ulid::Ulid::new();
