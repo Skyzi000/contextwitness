@@ -1696,6 +1696,12 @@ mod tests {
         let relative = save_test_image(&mut conn, &root, id, at(2026, 7, 30), 81);
         let differently_spelled = relative.to_ascii_lowercase();
         assert_ne!(differently_spelled, relative);
+        // A directory flagged case-sensitive keeps the two spellings apart: the rename would
+        // abandon the registered name and sweeping the result would be right, so the premise —
+        // one file answering both spellings — is absent and there is nothing to assert.
+        if !root.join(&differently_spelled).exists() {
+            return;
+        }
         std::fs::rename(root.join(&relative), root.join(&differently_spelled))
             .expect("the saved image should be renameable to another case");
 
