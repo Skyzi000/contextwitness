@@ -453,8 +453,12 @@ mod tests {
         let mut planted = destination.as_os_str().to_os_string();
         planted.push(format!(".tmp-{}-0", std::process::id()));
         let planted = std::path::PathBuf::from(planted);
-        std::fs::hard_link(&victim, &planted)
-            .expect("a hard link on one volume should be creatable");
+        // exFAT and FAT32 have no hard links, and the module supports them for the rename
+        // itself, so a volume that cannot make the planted link is stepped past, not failed.
+        let Ok(()) = std::fs::hard_link(&victim, &planted) else {
+            std::fs::remove_dir_all(&temp_dir).expect("the test directory should be removable");
+            return;
+        };
 
         let (temporary, file) = create_temporary_beside(&destination)
             .expect("a taken name should not stop the publish");
