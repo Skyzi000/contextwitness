@@ -144,10 +144,12 @@ pub enum StoreError {
         source: rusqlite::Error,
     },
     /// Encoding a frame to WebP failed.
-    #[error("failed to encode the image for observation {id}")]
+    #[error("failed to encode the image for observation {id}: {reason}")]
     Encode {
         /// Observation the frame belongs to.
         id: String,
+        /// What refused: the input check that failed, or the encoder's own answer.
+        reason: String,
     },
     /// An operation on the image root, or on a path being handled as one below it, failed. Which
     /// operation is not recorded anywhere on this variant: it is raised for creating, writing,

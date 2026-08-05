@@ -55,15 +55,25 @@ pub fn save(
         || !(1..=16_383).contains(&height)
         || !(0.0..=100.0).contains(&quality)
     {
-        return Err(StoreError::Encode { id: id_text });
+        return Err(StoreError::Encode {
+            id: id_text,
+            reason: format!(
+                "width {width}, height {height}, quality {quality}; the encoder takes dimensions \
+                 in 1..=16383 and quality in 0..=100"
+            ),
+        });
     }
 
     let expected_len = u64::from(width) * u64::from(height) * 3;
     let actual_len = u64::try_from(pixels.len()).map_err(|_| StoreError::Encode {
         id: id_text.clone(),
+        reason: "the pixel buffer length does not fit u64".to_owned(),
     })?;
     if actual_len != expected_len {
-        return Err(StoreError::Encode { id: id_text });
+        return Err(StoreError::Encode {
+            id: id_text,
+            reason: format!("{actual_len} bytes cannot be {width} x {height} RGB pixels"),
+        });
     }
 
     let created_at = timestamp::to_sql(at)?;
@@ -71,11 +81,13 @@ pub fn save(
     // `encode` would unwrap this error and panic on the capture path.
     let encoded = webp::Encoder::from_rgb(pixels, width, height)
         .encode_simple(false, quality)
-        .map_err(|_| StoreError::Encode {
+        .map_err(|source| StoreError::Encode {
             id: id_text.clone(),
+            reason: format!("{source:?}"),
         })?;
     let byte_size = i64::try_from(encoded.len()).map_err(|_| StoreError::Encode {
         id: id_text.clone(),
+        reason: "the encoded size does not fit SQLite's INTEGER".to_owned(),
     })?;
 
     let destination = root.join(&relative);
@@ -1071,7 +1083,7 @@ mod tests {
             .expect_err("the short frame should be refused");
 
         match error {
-            StoreError::Encode { id: actual } => assert_eq!(actual, id.to_string()),
+            StoreError::Encode { id: actual, .. } => assert_eq!(actual, id.to_string()),
             other => panic!("expected Encode, got {other:?}"),
         }
 
@@ -1082,7 +1094,7 @@ mod tests {
         let error = save(&mut conn, &root, id, &long, WIDTH, HEIGHT, 75.0, taken_at)
             .expect_err("the long frame should be refused");
         match error {
-            StoreError::Encode { id: actual } => assert_eq!(actual, id.to_string()),
+            StoreError::Encode { id: actual, .. } => assert_eq!(actual, id.to_string()),
             other => panic!("expected Encode, got {other:?}"),
         }
         assert!(!root.exists());
