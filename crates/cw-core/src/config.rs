@@ -75,7 +75,8 @@ pub struct CaptureConfig {
     /// Per-pixel luma delta, 0 through 254. A pixel counts as changed when it moves by strictly
     /// more than this, so 255 would mean nothing ever changed and [`Config::validate`] refuses it.
     pub change_pixel_threshold: u8,
-    /// Capture once more than this many logical pixels changed since the stored frame.
+    /// Store and OCR a frame once more than this many logical pixels changed since the stored
+    /// frame.
     pub change_area_logical_pixels: u32,
     /// WebP encoding quality, 0 through 100.
     pub webp_quality: u8,
@@ -148,7 +149,7 @@ pub struct PrivacyConfig {
 pub struct HindsightConfig {
     /// Hindsight bank identifier.
     pub bank_id: String,
-    /// Context label attached to stored observations.
+    /// Context label sent with every episode.
     pub context_label: String,
 }
 
