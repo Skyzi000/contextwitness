@@ -22,8 +22,8 @@ const CONNECTION_SETTINGS: &str = "\
     PRAGMA foreign_keys = ON;\n";
 
 /// How long to keep retrying the WAL switch. The same budget as the busy timeout and a separate
-/// constant on purpose: SQLite's busy handler does not cover this statement, so the waiting is ours
-/// to do.
+/// constant on purpose: the conversion meets its contention while taking the RESERVED lock, a
+/// transition the busy handler is never invoked for, so that waiting is ours to do.
 const WAL_SWITCH_DEADLINE: std::time::Duration = std::time::Duration::from_millis(5000);
 
 /// How long to leave a contending connection alone between attempts. Long enough that the retries
@@ -105,9 +105,12 @@ fn read_user_version(conn: &rusqlite::Connection) -> rusqlite::Result<i32> {
 /// does instead, so an `SQLITE_IOERR` or `SQLITE_FULL` from that commit would be dropped and this
 /// function would report success.
 ///
-/// Converting a rollback-journal database to WAL needs an exclusive lock, and this is the one
-/// statement `PRAGMA busy_timeout` does not reach — it comes back `SQLITE_BUSY` at once instead of
-/// waiting. Every subsystem opens its own connection, so a first start is several of them meeting
+/// Converting a rollback-journal database to WAL runs in a write transaction, and the contention
+/// is met while its RESERVED lock is taken — a transition the pager never invokes the busy
+/// handler for (its own table: taking SHARED from nothing waits, RESERVED from SHARED does not),
+/// and the btree retry above the pager is bypassed with the conversion's read transaction open.
+/// So contention comes back `SQLITE_BUSY` at once instead of waiting out `PRAGMA busy_timeout`.
+/// Every subsystem opens its own connection, so a first start is several of them meeting
 /// on this one conversion, and without the wait below most such starts fail. Reasserting WAL on a
 /// database that already has it needs no exclusive lock and succeeds even while another connection
 /// is writing, so no open waits here once the file is in WAL.
