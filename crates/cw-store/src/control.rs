@@ -2,12 +2,14 @@
 
 use crate::{StoreError, timestamp};
 
-/// Whether capture is stopped, and until when.
+/// The recorded pause, as [`get_pause`] answers it: no clock is consulted, so whether capture
+/// is stopped is its reader's side.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pause {
-    /// Stopped until this instant, and running by itself afterwards.
+    /// Asked to stop until this instant. A deadline already past is still answered, for the
+    /// reader to compare against its one notion of now.
     Until(chrono::DateTime<chrono::Utc>),
-    /// Stopped with no end, until somebody resumes.
+    /// Asked to stop with no end, until somebody resumes.
     Indefinite,
 }
 
