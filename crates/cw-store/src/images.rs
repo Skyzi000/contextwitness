@@ -762,15 +762,17 @@ mod tests {
     /// A directory junction at `link` leading to `target`. A directory symlink reaches the same
     /// branches and needs Developer Mode or SeCreateSymbolicLinkPrivilege, which is why the tests
     /// built on one returned without asserting wherever that was absent. `mklink` is a `cmd`
-    /// builtin and has no executable of its own.
-    fn junction(link: &std::path::Path, target: &std::path::Path) {
+    /// builtin and has no executable of its own. Answers whether the volume took the junction —
+    /// reparse points are a filesystem feature — so a test steps past a volume that refuses them
+    /// instead of failing over coverage it never provided.
+    fn junction(link: &std::path::Path, target: &std::path::Path) -> bool {
         let created = std::process::Command::new("cmd")
             .args(["/c", "mklink", "/J"])
             .arg(link)
             .arg(target)
             .output()
             .expect("cmd should be spawnable");
-        assert!(created.status.success(), "the junction should be creatable");
+        created.status.success()
     }
 
     /// Puts back what a `/deny` on `path` took away. A guard and not a call, because a panic — the
@@ -1801,7 +1803,9 @@ mod tests {
         std::fs::create_dir_all(&root).expect("the image root should be creatable");
         let redirected = root.join("2026");
 
-        junction(&redirected, &outside);
+        if !junction(&redirected, &outside) {
+            return;
+        }
 
         // The root itself is an ordinary directory, so resolving it after the link exists answers
         // the same as resolving it before.
@@ -1831,7 +1835,9 @@ mod tests {
         std::fs::rename(&root, dir.path().join("moved"))
             .expect("the image root should be movable aside");
 
-        junction(&root, &outside);
+        if !junction(&root, &outside) {
+            return;
+        }
 
         // The whole root now leads elsewhere. A sweep that resolved it here rather than before its
         // walk would take the replacement for its own baseline and find this file inside it.
@@ -1861,7 +1867,9 @@ mod tests {
         let (dir, conn, root) = database();
         let nowhere = dir.path().join("nowhere");
 
-        junction(&root, &nowhere);
+        if !junction(&root, &nowhere) {
+            return;
+        }
 
         // `canonicalize` answers `NotFound` here, exactly as it does for a name that was never
         // there — but this name is taken, and every save will fail on it until someone clears it.
@@ -1892,7 +1900,9 @@ mod tests {
         let parent = dir.path().join("data");
         let root = parent.join("images");
 
-        junction(&parent, &dir.path().join("nowhere"));
+        if !junction(&parent, &dir.path().join("nowhere")) {
+            return;
+        }
 
         // The root's own entry is absent here exactly as it is in the test above, and the two are
         // told apart by what is standing above it: a link whose target is gone, under which
