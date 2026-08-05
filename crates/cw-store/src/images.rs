@@ -1298,22 +1298,31 @@ mod tests {
         assert_eq!(count, 0);
     }
 
+    fn observation_row(conn: &rusqlite::Connection, id: &str) -> Vec<rusqlite::types::Value> {
+        conn.query_row("SELECT * FROM observations WHERE id = ?1", [id], |row| {
+            (0..row.as_ref().column_count())
+                .map(|column| row.get(column))
+                .collect()
+        })
+        .expect("the observation row should be readable")
+    }
+
     #[test]
     fn delete_leaves_the_observation_row_untouched() {
         let (_dir, mut conn, root) = database();
         let id = ulid::Ulid::new();
         save_test_image(&mut conn, &root, id, at(2026, 7, 30), 60);
+        // Every column, not a count: untouched is a claim about the row's contents, and a count
+        // of one still passes with the payload rewritten in place.
+        let before = observation_row(&conn, &id.to_string());
 
         delete(&mut conn, &root, id).expect("the image should be deleted");
 
-        let count: i64 = conn
-            .query_row(
-                "SELECT count(*) FROM observations WHERE id = ?1",
-                [id.to_string()],
-                |row| row.get(0),
-            )
-            .expect("the observation count should be readable");
-        assert_eq!(count, 1);
+        assert_eq!(
+            observation_row(&conn, &id.to_string()),
+            before,
+            "the observation row must read back exactly as saved"
+        );
     }
 
     #[test]
