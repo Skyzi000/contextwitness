@@ -377,6 +377,49 @@ mod tests {
     }
 
     #[test]
+    fn two_observations_at_one_instant_render_in_id_order() {
+        // Only the id rung of the sort decides between these two — one monitor, one instant, two
+        // ids — so this pair is what keeps the rendered order independent of arrival order when
+        // the other keys tie. The titles differ so the fold keeps both entries visible.
+        let lower = observation(
+            1,
+            "2026-07-24T16:00:02Z",
+            ScreenPayload {
+                foreground_window_title: Some("Alpha".to_owned()),
+                ..screen_payload("DISPLAY1", OcrStatus::NoText, None)
+            },
+        );
+        let higher = observation(
+            2,
+            "2026-07-24T16:00:02Z",
+            ScreenPayload {
+                foreground_window_title: Some("Beta".to_owned()),
+                ..screen_payload("DISPLAY1", OcrStatus::NoText, None)
+            },
+        );
+        let start = timestamp("2026-07-24T16:00:00Z");
+        let offset = FixedOffset::east_opt(9 * 3600).expect("test offset should be valid");
+        let forward_input = [lower.clone(), higher.clone()];
+        let swapped_input = [higher, lower];
+
+        let forward = build_episode(start, 5, offset, &forward_input)
+            .expect("two observations should build an episode");
+        let swapped = build_episode(start, 5, offset, &swapped_input)
+            .expect("two observations should build an episode");
+
+        assert_eq!(forward, swapped);
+        let alpha = forward
+            .content
+            .find("Alpha")
+            .expect("the lower id's entry should render");
+        let beta = forward
+            .content
+            .find("Beta")
+            .expect("the higher id's entry should render");
+        assert!(alpha < beta, "the lower id should render first");
+    }
+
+    #[test]
     fn document_id_identifies_the_window_including_its_length() {
         let start = timestamp("2026-07-24T16:00:00Z");
         let offset = FixedOffset::east_opt(9 * 3600).expect("test offset should be valid");
