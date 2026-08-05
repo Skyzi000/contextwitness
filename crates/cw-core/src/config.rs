@@ -486,8 +486,8 @@ mod tests {
             "user-owned contents",
             "an existing config file must never be overwritten"
         );
-        // An existing config is answered without writing anything, so nothing may appear in the
-        // directory alongside it.
+        // Nothing may appear beside the config: no scratch left over from its creation, and
+        // nothing from the second call, which is answered without writing at all.
         let entries: Vec<_> = std::fs::read_dir(
             path.parent()
                 .expect("the test config path should have a parent directory"),
@@ -499,34 +499,6 @@ mod tests {
             entries.len(),
             1,
             "the existing config should remain the only directory entry"
-        );
-
-        std::fs::remove_dir_all(&temp_dir)
-            .expect("the default config test directory should be removable");
-    }
-
-    #[test]
-    fn write_default_if_missing_leaves_only_the_config_file() {
-        let temp_dir = unique_temp_path("write-default-only-the-config-file");
-        let path = temp_dir.join("config.toml");
-        assert!(!temp_dir.exists());
-
-        let created = Config::write_default_if_missing(&path)
-            .expect("the default config should be creatable");
-
-        assert!(created, "the first call should create the config file");
-        // Creation must put exactly one file in the directory, so no future scheme leaves scratch
-        // files behind for the user to mistake for a stale config.
-        let entries: Vec<_> = std::fs::read_dir(&temp_dir)
-            .expect("the test config directory should be readable")
-            .collect::<Result<_, _>>()
-            .expect("the test config directory entries should be readable");
-        assert_eq!(entries.len(), 1, "only the config file should remain");
-        assert_eq!(
-            entries[0].file_name(),
-            path.file_name()
-                .expect("the test config path should have a file name"),
-            "the remaining entry should be the destination config"
         );
 
         std::fs::remove_dir_all(&temp_dir)
