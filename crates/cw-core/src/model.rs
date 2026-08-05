@@ -43,12 +43,6 @@ pub struct Observation {
     pub payload: SourcePayload,
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum ModelError {
-    #[error("payload JSON error: {0}")]
-    Payload(#[from] serde_json::Error),
-}
-
 impl SourcePayload {
     /// "screen" for Screen; the stored source string for Unknown.
     pub fn kind(&self) -> &str {
@@ -59,7 +53,7 @@ impl SourcePayload {
     }
 
     /// Payload-only JSON (no discriminator inside). Unknown returns its raw value unchanged.
-    pub fn to_payload_json(&self) -> Result<serde_json::Value, ModelError> {
+    pub fn to_payload_json(&self) -> Result<serde_json::Value, serde_json::Error> {
         match self {
             Self::Screen(payload) => Ok(serde_json::to_value(payload)?),
             Self::Unknown { raw, .. } => Ok(raw.clone()),
@@ -68,7 +62,10 @@ impl SourcePayload {
 
     /// Inverse: "screen" parses ScreenPayload (unknown JSON fields are ignored for forward
     /// compatibility); any other source becomes Unknown{source, raw} without validation.
-    pub fn from_parts(source: &str, raw: serde_json::Value) -> Result<SourcePayload, ModelError> {
+    pub fn from_parts(
+        source: &str,
+        raw: serde_json::Value,
+    ) -> Result<SourcePayload, serde_json::Error> {
         if source == "screen" {
             Ok(Self::Screen(serde_json::from_value(raw)?))
         } else {
