@@ -335,13 +335,30 @@ impl Config {
         }
     }
 
-    /// Read `path`. A missing file is NOT an error: returns `Config::default()`.
+    /// Read `path`. A missing file is NOT an error: returns `Config::default()`. An occupied
+    /// name that still reads as missing — a link whose target is gone — IS one, because it
+    /// blocks [`Config::write_default_if_missing`] and would keep the defaults in force while
+    /// looking configured.
     /// Any other IO error -> ConfigError::Read; invalid TOML -> ConfigError::Parse.
     pub fn load_from_path(path: &std::path::Path) -> Result<Config, ConfigError> {
         let text = match std::fs::read_to_string(path) {
             Ok(text) => text,
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Self::default());
+                // A name that answers NotFound can still be occupied: a link whose target is
+                // gone reads that way, and treating it as absence would run on defaults forever
+                // — writing the default template is refused by that very name, so nothing
+                // would ever surface it.
+                return if path.symlink_metadata().is_ok() {
+                    Err(ConfigError::Read {
+                        path: path.to_path_buf(),
+                        source: std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            "the name is occupied by a link whose target is missing",
+                        ),
+                    })
+                } else {
+                    Ok(Self::default())
+                };
             }
             Err(source) => {
                 return Err(ConfigError::Read {
@@ -737,6 +754,26 @@ mod tests {
             Config::load_from_path(&path).expect("a missing config file should use defaults");
 
         assert_eq!(config, Config::default());
+    }
+
+    #[test]
+    fn a_dangling_config_link_is_an_error_not_absence() {
+        let temp_dir = unique_temp_path("dangling-config-link");
+        std::fs::create_dir(&temp_dir).expect("the unique test directory should be creatable");
+        let path = temp_dir.join("config.toml");
+        // Creating symlinks needs a privilege ordinary dev machines may not grant.
+        let Ok(()) = std::os::windows::fs::symlink_file(temp_dir.join("missing.toml"), &path)
+        else {
+            return;
+        };
+
+        let result = Config::load_from_path(&path);
+
+        std::fs::remove_dir_all(&temp_dir).expect("the test directory should be removable");
+        assert!(
+            matches!(result, Err(ConfigError::Read { .. })),
+            "a name occupied by a dead link must not read as the defaults, got {result:?}"
+        );
     }
 
     #[test]
