@@ -349,16 +349,22 @@ impl Config {
                 // gone reads that way, and treating it as absence would run on defaults forever
                 // — writing the default template is refused by that very name, so nothing
                 // would ever surface it.
-                return if path.symlink_metadata().is_ok() {
-                    Err(ConfigError::Read {
+                return match path.symlink_metadata() {
+                    Ok(_) => Err(ConfigError::Read {
                         path: path.to_path_buf(),
                         source: std::io::Error::new(
                             std::io::ErrorKind::NotFound,
                             "the name is occupied by a link whose target is missing",
                         ),
-                    })
-                } else {
-                    Ok(Self::default())
+                    }),
+                    Err(meta) if meta.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+                    // Any other answer is not absence but the ordinary read error the doc
+                    // promises; reading it as absence would hide a denied name behind the
+                    // defaults.
+                    Err(meta) => Err(ConfigError::Read {
+                        path: path.to_path_buf(),
+                        source: meta,
+                    }),
                 };
             }
             Err(source) => {
