@@ -2120,11 +2120,14 @@ mod tests {
     fn an_orphan_that_will_not_go_does_not_stop_the_others() {
         let (_dir, conn, root) = database();
         std::fs::create_dir_all(&root).expect("the image root should be creatable");
-        // Named so the read-only candidate is enumerated first — NTFS lists a directory by name —
-        // and what removes the second one is the pass carrying on past the refusal rather than
-        // never reaching it.
+        // Named so the order NTFS answers a listing in — alphabetical when these names were
+        // measured, promised nowhere — puts the read-only candidate between two removable ones:
+        // a pass that stops at the refusal cannot have removed both sides of it, whichever end
+        // the listing starts from.
+        let leading = root.join("leading.webp");
         let stubborn = root.join("stubborn.webp");
         let trailing = root.join("trailing.webp");
+        std::fs::write(&leading, b"an orphan").expect("the file should be writable");
         std::fs::write(&stubborn, b"an orphan").expect("the file should be writable");
         std::fs::write(&trailing, b"an orphan").expect("the file should be writable");
         // A read-only file opens for removal and then refuses the disposition call with
@@ -2142,10 +2145,11 @@ mod tests {
 
         assert_eq!(
             removed.expect("one file that will not go must not fail the pass"),
-            1
+            2
         );
         assert!(stubborn.exists(), "the one that will not go should be kept");
-        assert!(!trailing.exists(), "the other one should have gone");
+        assert!(!leading.exists(), "the leading one should have gone");
+        assert!(!trailing.exists(), "the trailing one should have gone");
     }
 
     #[test]
