@@ -152,7 +152,8 @@ pub fn get_pause(conn: &rusqlite::Connection) -> Result<Option<Pause>, StoreErro
     }
 }
 
-/// Stop capture, and record that it was asked for.
+/// Record that capture was asked to stop. Whether anything stops is its reader's side:
+/// [`get_pause`] answers what was recorded, and a deadline already in the past is stored as given.
 ///
 /// One transaction, because the two keys are one fact: a crash between writing the new key and
 /// clearing the old one would leave a pair no reader is allowed to resolve.
