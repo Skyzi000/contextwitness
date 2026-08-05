@@ -333,6 +333,26 @@ mod tests {
         assert_eq!(journal_mode, "wal");
         assert_eq!(busy_timeout, 5000);
         assert_eq!(foreign_keys, 1);
+
+        // Only the journal mode persists in the file. The other two live and die with a
+        // connection, so the contract has to come back on a reopen of an existing database, not
+        // only on the open that created it. What this pins is the answer, not who supplies it:
+        // measured on the bundled build, a bare connection already answers both values, so only
+        // a default that drifts away from the contract would make these assertions bite.
+        drop(conn);
+        let conn = open(&path).expect("the existing database should reopen with the contract");
+        let journal_mode: String = conn
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .expect("the reopened journal mode should be readable");
+        let busy_timeout: i32 = conn
+            .pragma_query_value(None, "busy_timeout", |row| row.get(0))
+            .expect("the reopened busy timeout should be readable");
+        let foreign_keys: i32 = conn
+            .pragma_query_value(None, "foreign_keys", |row| row.get(0))
+            .expect("the reopened foreign key setting should be readable");
+        assert_eq!(journal_mode, "wal");
+        assert_eq!(busy_timeout, 5000);
+        assert_eq!(foreign_keys, 1);
     }
 
     #[test]
