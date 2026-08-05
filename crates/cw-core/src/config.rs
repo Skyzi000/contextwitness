@@ -42,7 +42,7 @@ bank_id = "contextwitness"
 context_label = "screen capture"
 
 [episode]
-# Observations are grouped into episodes of this length.
+# Observations are grouped into episodes of this length (1-1440).
 window_minutes = 5
 
 [activitywatch]
@@ -172,7 +172,7 @@ impl Default for HindsightConfig {
 #[serde(deny_unknown_fields)]
 #[serde(default)]
 pub struct EpisodeConfig {
-    /// Duration of an episode window in minutes. At least 1.
+    /// Duration of an episode window in minutes. From 1 to 1440 — one day.
     pub window_minutes: u32,
 }
 
@@ -264,10 +264,12 @@ impl Config {
             });
         }
 
-        if self.episode.window_minutes < 1 {
+        // Capped at one day: entries render clock times without dates, and a day is the longest
+        // window in which one clock time cannot stand for two moments.
+        if !(1..=1440).contains(&self.episode.window_minutes) {
             return Err(ConfigError::Invalid {
                 field: "episode.window_minutes",
-                reason: "must be at least 1 minute".to_owned(),
+                reason: "must be between 1 and 1440 minutes (one day)".to_owned(),
             });
         }
 
@@ -613,10 +615,11 @@ mod tests {
             .expect("the smallest value every bound allows should be accepted");
 
         config.capture.webp_quality = 100;
+        config.episode.window_minutes = 1440;
 
         config
             .validate()
-            .expect("the highest encoding quality should be accepted");
+            .expect("the highest value each bound allows should be accepted");
     }
 
     #[test]
@@ -633,6 +636,23 @@ mod tests {
                 })
             ),
             "a zero episode window should be rejected"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_a_window_longer_than_a_day() {
+        let mut config = Config::default();
+        config.episode.window_minutes = 1441;
+
+        assert!(
+            matches!(
+                config.validate(),
+                Err(ConfigError::Invalid {
+                    field: "episode.window_minutes",
+                    ..
+                })
+            ),
+            "a window longer than a day should be rejected"
         );
     }
 
