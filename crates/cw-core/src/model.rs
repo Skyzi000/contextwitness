@@ -135,8 +135,16 @@ mod tests {
     #[test]
     fn payload_json_matches_golden_fixture() {
         let payload = fully_populated_screen_payload();
-        let json = serde_json::to_string(&payload).expect("screen payload should serialize");
-        let golden = r#"{"monitor_id":"monitor-1","width":1920,"height":1080,"image_path":"screens/observation.png","ocr_status":"succeeded","ocr_error":"non-fatal OCR warning","ocr_text":"テスト","ocr_langs":["ja-JP","en-US"],"foreground_process":"notepad.exe","foreground_window_title":"メモ帳"}"#;
+        // Spelled through `to_payload_json`, the conversion every stored row goes through: the
+        // struct's own Serialize orders keys as declared, which the database never sees —
+        // serde_json's maps sort their keys.
+        let json = serde_json::to_string(
+            &SourcePayload::Screen(payload)
+                .to_payload_json()
+                .expect("screen payload should serialize"),
+        )
+        .expect("payload JSON should spell as a string");
+        let golden = r#"{"foreground_process":"notepad.exe","foreground_window_title":"メモ帳","height":1080,"image_path":"screens/observation.png","monitor_id":"monitor-1","ocr_error":"non-fatal OCR warning","ocr_langs":["ja-JP","en-US"],"ocr_status":"succeeded","ocr_text":"テスト","width":1920}"#;
 
         assert_eq!(json, golden);
         assert!(
