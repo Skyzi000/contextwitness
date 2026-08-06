@@ -3,8 +3,11 @@
 
 pub mod control;
 pub mod db;
+pub mod episodes;
 pub mod images;
 pub mod observations;
+pub mod outbox;
+pub mod retention;
 mod timestamp;
 
 use std::path::PathBuf;
