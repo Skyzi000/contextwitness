@@ -157,7 +157,7 @@ pub fn max_logical_pixels(width: u32, height: u32, dpi_scale: f32) -> f64 {
 /// Whether `config.change_area_logical_pixels` can ever be exceeded on a monitor of this size.
 ///
 /// `frame_changed` compares with `>`, so a threshold at or above the monitor's logical area is
-/// never satisfied and no pixel difference on that monitor is ever captured again after its first
+/// never satisfied and no pixel difference on that monitor is ever stored again after its first
 /// frame — silently, with no error anywhere. What still gets through is a change of dimensions or
 /// DPI scale, which `frame_changed` answers before it compares any pixels. `Config::validate`
 /// cannot check this because no monitor is known when the config is read, so it has to be asked
@@ -285,8 +285,8 @@ mod tests {
     fn a_threshold_at_the_monitor_area_can_never_fire() {
         assert_eq!(max_logical_pixels(1920, 1080, 1.0), 2_073_600.0);
 
-        // A threshold in this range does not merely reduce captures; it stops them completely and
-        // silently.
+        // A threshold in this range does not merely reduce what gets stored; past the first frame
+        // nothing but a dimension or DPI change is ever stored again — silently, with no error.
         let config = |change_area_logical_pixels| CaptureConfig {
             change_area_logical_pixels,
             ..CaptureConfig::default()
