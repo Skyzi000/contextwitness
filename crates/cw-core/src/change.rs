@@ -439,8 +439,8 @@ mod tests {
     #[test]
     fn a_caret_is_ignored_in_each_measured_configuration() {
         // Measured logical maxima: 149, 171, 225, 450, 400. 3840x2160 at 100% is the tightest
-        // configuration in the supported range — 450 against a 600 default — and the only realistic
-        // one where a caret can measure exactly 0, because at that sample granularity one character
+        // configuration measured — 450 against a 600 default — and the only realistic one where
+        // a caret can measure exactly 0, because at that sample granularity one character
         // can split across four samples with none of them crossing the per-pixel threshold.
         // Bounds are the measured range over every glyph offset within one full sampling-phase
         // period — `width / gcd(width, 256)` by `height / gcd(height, 144)` source pixels, which
@@ -481,7 +481,7 @@ mod tests {
 
     #[test]
     fn the_worst_phase_on_4k_unscaled_still_separates_a_caret_from_typing() {
-        // 3840x2160 at 100% has the least room of any supported configuration, and its sample
+        // 3840x2160 at 100% has the least room of any measured configuration, and its sample
         // period is exactly 15x15, so all 225 phases were enumerated offline. These two offsets are
         // the true extremes: a caret peaks at 450 logical pixels and ten characters bottom out at
         // 1125, which is the 450 < 600 < 1125 separation the default rests on. The tables above draw
