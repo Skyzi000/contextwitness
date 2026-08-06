@@ -744,7 +744,6 @@ mod tests {
             .expect("the test user should have a local data directory")
             .join("ContextWitness");
 
-        assert!(resolved.ends_with("ContextWitness"));
         assert_eq!(resolved, expected);
         Ok(())
     }
