@@ -50,7 +50,9 @@ pub enum StoreError {
         /// Journal mode the database is actually in.
         actual: String,
     },
-    /// Applying a database migration failed.
+    /// The migration transaction failed: taking its write lock, reading or writing the markers
+    /// it decides on, applying a script, or committing. A database already at the current schema
+    /// version still takes that lock, so this can report contention with no script having run.
     #[error("failed to migrate database {path}: {source}")]
     Migrate {
         /// Database file path.
