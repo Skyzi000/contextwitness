@@ -32,9 +32,11 @@ fn main() {
         paths.database().display()
     );
 
+    // The capture sessions are persistent, so the engine outlives the tick that reads from it.
+    let mut capture = cw_capture::CaptureEngine::new();
     let mut previous: HashMap<String, Thumbnail> = HashMap::new();
     loop {
-        if let Err(error) = tick(&mut conn, &paths, &config, &mut previous) {
+        if let Err(error) = tick(&mut capture, &mut conn, &paths, &config, &mut previous) {
             eprintln!("tick failed: {error}");
         }
         std::thread::sleep(std::time::Duration::from_secs(config.capture.interval_secs));
@@ -42,6 +44,7 @@ fn main() {
 }
 
 fn tick(
+    capture: &mut cw_capture::CaptureEngine,
     conn: &mut rusqlite::Connection,
     paths: &DataPaths,
     config: &Config,
@@ -72,7 +75,7 @@ fn tick(
     }
 
     let mut changed = Vec::new();
-    for frame in cw_capture::capture_all() {
+    for frame in capture.capture_all() {
         let rgba = bgra_to_rgba(&frame.bgra);
         let thumbnail = Thumbnail::from_rgba(&rgba, frame.width, frame.height, frame.dpi_scale)?;
         if frame_changed(previous.get(&frame.monitor_id), &thumbnail, &config.capture) {

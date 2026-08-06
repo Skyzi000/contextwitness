@@ -1,22 +1,23 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 //! Screen capture functionality for ContextWitness.
 
+mod dxgi;
+
+use std::collections::HashMap;
+
 use windows::Win32::Foundation::{CloseHandle, LPARAM, RECT};
 use windows::Win32::Graphics::Gdi::{
-    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CAPTUREBLT, CreateCompatibleBitmap,
-    CreateCompatibleDC, DIB_RGB_COLORS, DeleteDC, DeleteObject, EnumDisplayMonitors, GetDC,
-    GetDIBits, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW, ROP_CODE, ReleaseDC,
-    SRCCOPY, SelectObject,
+    EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
 };
 use windows::Win32::System::Threading::{
     OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
 use windows::Win32::UI::HiDpi::{
-    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForMonitor, MDT_EFFECTIVE_DPI,
-    SetProcessDpiAwarenessContext,
+    AreDpiAwarenessContextsEqual, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForMonitor,
+    GetThreadDpiAwarenessContext, MDT_EFFECTIVE_DPI, SetProcessDpiAwarenessContext,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId,
+    GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId, MONITORINFOF_PRIMARY,
 };
 use windows::core::BOOL;
 
@@ -27,6 +28,127 @@ pub struct Frame {
     pub height: u32,
     pub dpi_scale: f32,
     pub bgra: Vec<u8>,
+}
+
+/// One attached monitor. `width`/`height` are physical pixels and `dpi_scale` is what turns them
+/// into logical ones; the capture layer only measures, `cw-core` decides.
+#[derive(Clone)]
+pub struct MonitorInfo {
+    pub id: String,
+    pub width: u32,
+    pub height: u32,
+    pub dpi_scale: f32,
+    pub is_primary: bool,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum CaptureError {
+    /// Re-enumerating monitors or rebuilding the session can clear it; the tick is skipped.
+    #[error("{0}")]
+    Recoverable(#[from] Recoverable),
+    /// Retrying cannot clear it.
+    #[error("{0}")]
+    Fatal(String),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum Recoverable {
+    #[error("duplication access lost")]
+    AccessLost,
+    #[error("graphics device error: {0}")]
+    DeviceLost(String),
+    #[error("monitor is no longer attached")]
+    MonitorGone,
+    #[error("no desktop update to capture")]
+    NoNewFrame,
+    #[error("unsupported pixel format: {0}")]
+    UnsupportedFormat(String),
+}
+
+/// The capture boundary. Pull type: `capture` returns that monitor's latest frame, which is what a
+/// tick-driven snapshot collector wants. Persistent sessions are implementation state and stay off
+/// this surface, so the backend under it can be replaced without the daemon noticing.
+pub trait Capturer {
+    fn monitors(&mut self) -> Result<Vec<MonitorInfo>, CaptureError>;
+    fn capture(&mut self, monitor_id: &str) -> Result<Frame, CaptureError>;
+}
+
+/// Holds the capture sessions across ticks.
+pub struct CaptureEngine {
+    backend: Box<dyn Capturer>,
+    reported: HashMap<String, String>,
+}
+
+impl CaptureEngine {
+    pub fn new() -> Self {
+        // Without PER_MONITOR_AWARE_V2 Windows virtualizes both the DPI we read and the resolution
+        // the duplication hands us, with no error anywhere: a 2560x1440 screen arrives as
+        // 2048x1152 and the OCR gets the blur.
+        let aware = unsafe {
+            AreDpiAwarenessContextsEqual(
+                GetThreadDpiAwarenessContext(),
+                DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+            )
+        };
+        if !aware.as_bool() {
+            eprintln!(
+                "warning: process is not PER_MONITOR_AWARE_V2, so capture resolution and dpi scale are virtualized"
+            );
+        }
+        Self {
+            backend: Box::new(dxgi::DxgiCapturer::new()),
+            reported: HashMap::new(),
+        }
+    }
+
+    pub fn monitors(&mut self) -> Result<Vec<MonitorInfo>, CaptureError> {
+        self.backend.monitors()
+    }
+
+    /// Capture every monitor. A monitor that fails to capture is skipped, this tick only.
+    pub fn capture_all(&mut self) -> Vec<Frame> {
+        let monitors = match self.backend.monitors() {
+            Ok(monitors) => monitors,
+            Err(error) => {
+                self.report("monitor enumeration", &error.to_string());
+                return Vec::new();
+            }
+        };
+
+        let mut frames = Vec::new();
+        for monitor in monitors {
+            match self.backend.capture(&monitor.id) {
+                Ok(frame) => {
+                    self.reported.remove(&monitor.id);
+                    frames.push(frame);
+                }
+                // An idle screen produces no update at all, which is the answer, not a failure.
+                Err(CaptureError::Recoverable(Recoverable::NoNewFrame)) => {}
+                Err(error) => self.report(&monitor.id, &error.to_string()),
+            }
+        }
+        frames
+    }
+
+    /// The same failure repeating every tick is one line of news, not one line per tick.
+    fn report(&mut self, monitor_id: &str, message: &str) {
+        if self
+            .reported
+            .get(monitor_id)
+            .is_some_and(|last| last == message)
+        {
+            return;
+        }
+        eprintln!("capture failed for {monitor_id}: {message}");
+        self.reported
+            .insert(monitor_id.to_owned(), message.to_owned());
+    }
+}
+
+impl Default for CaptureEngine {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[derive(Default, Clone)]
@@ -41,18 +163,21 @@ pub fn make_dpi_aware() {
     }
 }
 
-/// Capture every monitor. A monitor that fails to capture is skipped.
-pub fn capture_all() -> Vec<Frame> {
-    let mut monitors: Vec<HMONITOR> = Vec::new();
+/// Every attached monitor, paired with the handle the backend needs to open a session on it.
+fn enumerate_monitors() -> Vec<(HMONITOR, MonitorInfo)> {
+    let mut handles: Vec<HMONITOR> = Vec::new();
     unsafe {
         let _ = EnumDisplayMonitors(
             None,
             None,
             Some(collect_monitor),
-            LPARAM(&raw mut monitors as isize),
+            LPARAM(&raw mut handles as isize),
         );
     }
-    monitors.into_iter().filter_map(capture_monitor).collect()
+    handles
+        .into_iter()
+        .filter_map(|handle| monitor_info(handle).map(|info| (handle, info)))
+        .collect()
 }
 
 unsafe extern "system" fn collect_monitor(
@@ -66,7 +191,7 @@ unsafe extern "system" fn collect_monitor(
     BOOL(1)
 }
 
-fn capture_monitor(monitor: HMONITOR) -> Option<Frame> {
+fn monitor_info(monitor: HMONITOR) -> Option<MonitorInfo> {
     unsafe {
         let mut info = MONITORINFOEXW::default();
         info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
@@ -80,69 +205,16 @@ fn capture_monitor(monitor: HMONITOR) -> Option<Frame> {
             return None;
         }
         let device = String::from_utf16_lossy(&info.szDevice);
-        let monitor_id = device.trim_end_matches('\0').to_string();
 
         let (mut dpi_x, mut dpi_y) = (96u32, 96u32);
         let _ = GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y);
-        let dpi_scale = dpi_x as f32 / 96.0;
 
-        let screen = GetDC(None);
-        if screen.is_invalid() {
-            return None;
-        }
-        let memory = CreateCompatibleDC(Some(screen));
-        let bitmap = CreateCompatibleBitmap(screen, width as i32, height as i32);
-        let previous = SelectObject(memory, bitmap.into());
-        let blt = BitBlt(
-            memory,
-            0,
-            0,
-            width as i32,
-            height as i32,
-            Some(screen),
-            rect.left,
-            rect.top,
-            ROP_CODE(SRCCOPY.0 | CAPTUREBLT.0),
-        );
-        let mut bgra = vec![0u8; width as usize * height as usize * 4];
-        let mut bmi = BITMAPINFO {
-            bmiHeader: BITMAPINFOHEADER {
-                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                biWidth: width as i32,
-                biHeight: -(height as i32),
-                biPlanes: 1,
-                biBitCount: 32,
-                biCompression: BI_RGB.0,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let lines = GetDIBits(
-            memory,
-            bitmap,
-            0,
-            height,
-            Some(bgra.as_mut_ptr().cast()),
-            &mut bmi,
-            DIB_RGB_COLORS,
-        );
-        SelectObject(memory, previous);
-        let _ = DeleteObject(bitmap.into());
-        let _ = DeleteDC(memory);
-        ReleaseDC(None, screen);
-        if blt.is_err() || lines == 0 {
-            return None;
-        }
-        // GDI leaves alpha at 0; downstream consumers treat the frame as opaque.
-        for pixel in bgra.chunks_exact_mut(4) {
-            pixel[3] = 255;
-        }
-        Some(Frame {
-            monitor_id,
+        Some(MonitorInfo {
+            id: device.trim_end_matches('\0').to_string(),
             width,
             height,
-            dpi_scale,
-            bgra,
+            dpi_scale: dpi_x as f32 / 96.0,
+            is_primary: info.monitorInfo.dwFlags & MONITORINFOF_PRIMARY != 0,
         })
     }
 }

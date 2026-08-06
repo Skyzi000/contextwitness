@@ -6,4 +6,6 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+thiserror = { workspace = true }
 windows = { workspace = true }
+windows-capture = { workspace = true }
