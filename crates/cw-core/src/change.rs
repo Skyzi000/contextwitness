@@ -21,6 +21,14 @@ pub enum ImageBufferError {
         /// Actual number of supplied bytes.
         actual: usize,
     },
+    /// The dimensions call for more RGBA bytes than this target can address.
+    #[error("{width}x{height} calls for more RGBA bytes than this target can address")]
+    OversizedImage {
+        /// Supplied image width.
+        width: u32,
+        /// Supplied image height.
+        height: u32,
+    },
     /// At least one supplied image dimension is zero.
     #[error("image dimensions must be non-zero")]
     EmptyImage,
@@ -169,10 +177,10 @@ fn rgba_image(rgba: &[u8], width: u32, height: u32) -> Result<image::RgbaImage, 
         return Err(ImageBufferError::EmptyImage);
     }
 
-    let expected = usize::try_from(width)
-        .expect("u32 image width must fit usize on supported targets")
-        * usize::try_from(height).expect("u32 image height must fit usize on supported targets")
-        * 4;
+    // Counted in u128 first: `width * height * 4` can pass 2^64, and a wrapped count that
+    // happened to match the buffer would carry garbage dimensions past the check below.
+    let expected = usize::try_from(u128::from(width) * u128::from(height) * 4)
+        .map_err(|_| ImageBufferError::OversizedImage { width, height })?;
     if rgba.len() != expected {
         return Err(ImageBufferError::SizeMismatch {
             width,
@@ -681,6 +689,19 @@ mod tests {
                 Err(ImageBufferError::EmptyImage)
             ),
             "zero height must return EmptyImage"
+        );
+    }
+
+    #[test]
+    fn dimensions_wider_than_the_address_space_are_refused() {
+        // 2^31 * 2^31 * 4 is exactly 2^64 — one past what a byte count can spell — and wrapped
+        // to zero it matched this empty buffer, carrying the pair past the size check into the
+        // panic behind it.
+        let error = Thumbnail::from_rgba(&[], 1 << 31, 1 << 31, 1.0)
+            .expect_err("dimensions past the address space must be refused, not panic");
+        assert!(
+            matches!(error, ImageBufferError::OversizedImage { .. }),
+            "{error:?}"
         );
     }
 }
