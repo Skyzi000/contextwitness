@@ -317,6 +317,15 @@ mod tests {
             2.0,
             &config(921_600)
         ));
+
+        // The bound is `frame_changed`'s own strict `>`, pinned through the real comparison so
+        // the helper's promise and the comparison it speaks for cannot drift apart.
+        let before = Thumbnail::from_rgba(&solid(WIDTH, HEIGHT, 200), WIDTH, HEIGHT, 1.0)
+            .expect("the fixed test image should build");
+        let after = Thumbnail::from_rgba(&solid(WIDTH, HEIGHT, 0), WIDTH, HEIGHT, 1.0)
+            .expect("the fixed test image should build");
+        assert!(!frame_changed(Some(&before), &after, &config(3_686_400)));
+        assert!(frame_changed(Some(&before), &after, &config(3_686_399)));
     }
 
     #[test]
