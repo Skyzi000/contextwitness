@@ -2,8 +2,13 @@
 //! Screen capture functionality for ContextWitness.
 
 mod dxgi;
+mod failover;
+mod wgc;
 
 use std::collections::HashMap;
+use std::time::Instant;
+
+use failover::{Backend, Failover, Outcome};
 
 use windows::Win32::Foundation::{CloseHandle, LPARAM, RECT};
 use windows::Win32::Graphics::Gdi::{
@@ -73,9 +78,12 @@ pub trait Capturer {
     fn capture(&mut self, monitor_id: &str) -> Result<Frame, CaptureError>;
 }
 
-/// Holds the capture sessions across ticks.
+/// Holds the capture sessions across ticks, and per monitor the choice of which backend owns them.
 pub struct CaptureEngine {
-    backend: Box<dyn Capturer>,
+    dxgi: dxgi::DxgiCapturer,
+    /// Costs nothing until a monitor fails over: sessions inside it are opened on first use.
+    wgc: wgc::WgcCapturer,
+    failover: HashMap<String, Failover>,
     reported: HashMap<String, String>,
 }
 
@@ -91,33 +99,66 @@ impl CaptureEngine {
             )
         };
         if !aware.as_bool() {
-            eprintln!(
-                "warning: process is not PER_MONITOR_AWARE_V2, so capture resolution and dpi scale are virtualized"
+            tracing::warn!(
+                "process is not PER_MONITOR_AWARE_V2, so capture resolution and dpi scale are virtualized"
             );
         }
         Self {
-            backend: Box::new(dxgi::DxgiCapturer::new()),
+            dxgi: dxgi::DxgiCapturer::new(),
+            wgc: wgc::WgcCapturer::new(),
+            failover: HashMap::new(),
             reported: HashMap::new(),
         }
     }
 
     pub fn monitors(&mut self) -> Result<Vec<MonitorInfo>, CaptureError> {
-        self.backend.monitors()
+        self.dxgi.monitors()
     }
 
-    /// Capture every monitor. A monitor that fails to capture is skipped, this tick only.
+    /// Capture every monitor, each with the backend its own failover state points at. A monitor
+    /// that fails to capture is skipped, this tick only.
     pub fn capture_all(&mut self) -> Vec<Frame> {
-        let monitors = match self.backend.monitors() {
+        let monitors = match self.dxgi.monitors() {
             Ok(monitors) => monitors,
             Err(error) => {
                 self.report("monitor enumeration", &error.to_string());
                 return Vec::new();
             }
         };
+        // A detached monitor takes its failover state with it, so one that comes back is tried on
+        // the primary again rather than inheriting the run of failures that lost it.
+        self.failover
+            .retain(|id, _| monitors.iter().any(|monitor| &monitor.id == id));
 
         let mut frames = Vec::new();
         for monitor in monitors {
-            match self.backend.capture(&monitor.id) {
+            let now = Instant::now();
+            let state = self.failover.entry(monitor.id.clone()).or_default();
+            let target = state.target(now);
+            let mut result = match target {
+                Backend::Primary => self.dxgi.capture(&monitor.id),
+                Backend::Fallback => self.wgc.capture(&monitor.id),
+            };
+            let switched = state.record(target, outcome(&result), now);
+            // A primary attempt that failed and left the monitor on the fallback must not cost the
+            // tick its frame: that is where the probe, and the failover itself, gets to be cheap.
+            if target == Backend::Primary && state.target(now) == Backend::Fallback {
+                result = self.wgc.capture(&monitor.id);
+                state.record(Backend::Fallback, outcome(&result), now);
+            }
+
+            if let Some(backend) = switched {
+                let name = match backend {
+                    Backend::Primary => "dxgi",
+                    Backend::Fallback => "wgc",
+                };
+                tracing::info!("capture backend for {} switched to {name}", monitor.id);
+                if backend == Backend::Primary {
+                    self.wgc.release(&monitor.id);
+                }
+            }
+
+            match result {
                 Ok(frame) => {
                     self.reported.remove(&monitor.id);
                     frames.push(frame);
@@ -139,9 +180,18 @@ impl CaptureEngine {
         {
             return;
         }
-        eprintln!("capture failed for {monitor_id}: {message}");
+        tracing::warn!("capture failed for {monitor_id}: {message}");
         self.reported
             .insert(monitor_id.to_owned(), message.to_owned());
+    }
+}
+
+/// What a capture attempt says about its backend. An idle screen is an answer: only a live session
+/// can report that there was nothing to capture.
+fn outcome(result: &Result<Frame, CaptureError>) -> Outcome {
+    match result {
+        Ok(_) | Err(CaptureError::Recoverable(Recoverable::NoNewFrame)) => Outcome::Answered,
+        Err(_) => Outcome::Failed,
     }
 }
 

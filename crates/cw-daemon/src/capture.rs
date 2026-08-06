@@ -80,6 +80,14 @@ fn tick(
         }
     }
 
+    // An unplugged monitor would otherwise keep its thumbnail for the life of the process. Retained
+    // against the monitors that exist, not the ones `capture_all` answered with: that call omits
+    // any monitor with no new frame, and dropping those would throw away the baseline that
+    // sub-threshold changes accumulate against. An enumeration that fails leaves the map alone.
+    if let Ok(monitors) = capture.monitors() {
+        previous.retain(|id, _| monitors.iter().any(|monitor| &monitor.id == id));
+    }
+
     for stored in pass(capture, conn, paths, config, previous)? {
         info!(
             monitor = %stored.monitor_id,

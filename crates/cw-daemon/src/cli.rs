@@ -7,10 +7,11 @@ use clap::{Parser, Subcommand};
 use cw_core::config::{Config, DataPaths, default_config_path};
 use cw_store::control::{HealthKey, Pause};
 use tracing::{error, info, warn};
-use windows::Win32::Foundation::HANDLE;
+use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, HANDLE};
 use windows::Win32::System::Console::{
     CONSOLE_MODE, ENABLE_ECHO_INPUT, GetConsoleMode, GetStdHandle, STD_INPUT_HANDLE, SetConsoleMode,
 };
+use windows::Win32::System::Threading::CreateMutexW;
 
 /// How long startup keeps asking for the monitor list before giving up. Enumeration fails while a
 /// session is still coming up, and the reachability check below cannot be skipped, so this waits
@@ -23,6 +24,20 @@ const DATA_DIR_KEY: &str = "data_dir";
 
 /// Width the status screen's labels are padded to, so its values line up in one column.
 const STATUS_LABEL: usize = 14;
+
+/// The name `run` claims for as long as it runs. `Local\` is the session namespace on purpose: one
+/// collector per interactive session is the line worth drawing. A daemon in another session writes
+/// to that user's own data directory, and with WAL under it a second one is wasteful rather than
+/// corrupting.
+const INSTANCE_MUTEX: &str = "Local\\ContextWitness";
+
+/// What the process ends with when a panic takes it down: the code Rust's own runtime uses, so
+/// nothing downstream has to learn a second number for the same event.
+const PANIC_EXIT: i32 = 101;
+
+/// How long the panic hook waits before the exit. The file writer drains on its own thread and its
+/// guard is not reachable from a hook, so the line just logged is still queued at that point.
+const PANIC_FLUSH: std::time::Duration = std::time::Duration::from_millis(200);
 
 type Failure = Box<dyn std::error::Error>;
 
@@ -91,6 +106,9 @@ pub fn main() {
 
 /// The daemon: everything this program does on its own, until the process ends.
 fn daemon() -> ! {
+    // Before the engine, the log file and the database: a refused second daemon must not have
+    // touched any of them.
+    claim_single_instance();
     cw_capture::make_dpi_aware();
     cw_ocr::init_runtime();
 
@@ -105,6 +123,7 @@ fn daemon() -> ! {
     let paths = DataPaths::new(data_dir);
     // Held until the process ends: dropping it flushes the file writer.
     let logging = logging::init(&paths);
+    install_panic_hook();
     if created {
         info!(path = %config_path.display(), "wrote the default config");
     }
@@ -166,6 +185,47 @@ fn daemon() -> ! {
         "capturing"
     );
     capture::run(capture, conn, paths, config)
+}
+
+/// Refuse to be the second daemon in this session. The handle is never closed: the OS drops it
+/// however the process dies, which is why the claim is a mutex and not a lock file — there is no
+/// stale lock to recognize and clean up after a crash.
+fn claim_single_instance() {
+    let name = windows::core::HSTRING::from(INSTANCE_MUTEX);
+    // Held for the life of the process, and dropping this binding does nothing: the claim ends
+    // with the process.
+    let _held = unsafe { CreateMutexW(None, false, &name) };
+    // A call that failed for any other reason leaves the daemon unguarded rather than refusing to
+    // start: it says nothing about whether another one is up.
+    if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+        eprintln!("contextwitness is already running in this session.");
+        std::process::exit(1);
+    }
+}
+
+/// A panicking worker takes the whole process with it (plan Task 25). Left to itself that thread
+/// dies alone and leaves a daemon that still holds its tray icon and captures nothing; falling over
+/// is visible, and autostart brings it back at the next logon.
+fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let payload = info.payload();
+        let message = payload
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("panicked");
+        let thread = std::thread::current();
+        error!(
+            thread = thread.name().unwrap_or("unnamed"),
+            location = info
+                .location()
+                .map(std::panic::Location::to_string)
+                .unwrap_or_default(),
+            "{message}"
+        );
+        std::thread::sleep(PANIC_FLUSH);
+        std::process::exit(PANIC_EXIT);
+    }));
 }
 
 /// Abort rather than warn when a monitor's change threshold cannot be reached (plan Task 13): the

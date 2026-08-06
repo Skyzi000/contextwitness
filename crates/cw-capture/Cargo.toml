@@ -7,5 +7,6 @@ repository.workspace = true
 
 [dependencies]
 thiserror = { workspace = true }
+tracing = { workspace = true }
 windows = { workspace = true }
 windows-capture = { workspace = true }
