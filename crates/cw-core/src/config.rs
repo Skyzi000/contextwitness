@@ -271,8 +271,9 @@ impl Config {
 
     /// Create `path` (and any missing parent directories) containing [`DEFAULT_CONFIG_TOML`]
     /// when it does not exist yet. Returns `true` when this call created the file, `false` when
-    /// one was already present — including when another process created it first, since
-    /// publishing is what tests for it. Never overwrites an existing file.
+    /// the name was already taken — by the config another process published first (publishing is
+    /// what tests for it), or by whatever else stands at the name; [`Config::load_from_path`] is
+    /// what tells those apart. Never overwrites an existing file.
     ///
     /// The content is written to a temporary file and renamed onto `path` only if that name is
     /// still free, so the config never exists in a half-written or empty state that another
