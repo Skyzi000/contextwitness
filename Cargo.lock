@@ -111,6 +111,7 @@ dependencies = [
  "cw-ocr",
  "cw-store",
  "rusqlite",
+ "ulid",
 ]
 
 [[package]]

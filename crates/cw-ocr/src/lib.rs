@@ -2,10 +2,12 @@
 //! Optical character recognition functionality for ContextWitness.
 
 use cw_core::model::OcrStatus;
+use windows::Globalization::Language;
 use windows::Graphics::Imaging::{BitmapPixelFormat, SoftwareBitmap};
 use windows::Media::Ocr::OcrEngine;
 use windows::Security::Cryptography::CryptographicBuffer;
 use windows::Win32::System::WinRT::{RO_INIT_MULTITHREADED, RoInitialize};
+use windows::core::HSTRING;
 
 pub struct OcrOutcome {
     pub status: OcrStatus,
@@ -14,17 +16,19 @@ pub struct OcrOutcome {
     pub langs: Vec<String>,
 }
 
-/// Initialize the Windows Runtime on the calling thread. Call once before `recognize`.
+/// Initialize the Windows Runtime on the calling thread. Idempotent; `recognize` calls it itself.
 pub fn init_runtime() {
     unsafe {
         let _ = RoInitialize(RO_INIT_MULTITHREADED);
     }
 }
 
-/// Recognize text in a tightly packed BGRA8 frame. Never panics; failures come back as
-/// `OcrStatus::Failed` with the error spelled out.
-pub fn recognize(bgra: &[u8], width: u32, height: u32) -> OcrOutcome {
-    match recognize_inner(bgra, width, height) {
+/// Recognize text in a tightly packed BGRA8 frame using the first of `languages` that has an
+/// engine. Never panics; failures come back as `OcrStatus::Failed` with the error spelled out.
+pub fn recognize(bgra: &[u8], width: u32, height: u32, languages: &[String]) -> OcrOutcome {
+    // RoInitialize is per-thread, so worker threads reach the runtime through here.
+    init_runtime();
+    match recognize_inner(bgra, width, height, languages) {
         Ok(outcome) => outcome,
         Err(error) => OcrOutcome {
             status: OcrStatus::Failed,
@@ -35,11 +39,13 @@ pub fn recognize(bgra: &[u8], width: u32, height: u32) -> OcrOutcome {
     }
 }
 
-fn recognize_inner(bgra: &[u8], width: u32, height: u32) -> Result<OcrOutcome, String> {
-    // ponytail: uses the user's profile languages, ignoring [ocr].languages; wire the config
-    // through TryCreateFromLanguage when profile languages turn out not to cover the screen.
-    let engine = OcrEngine::TryCreateFromUserProfileLanguages()
-        .map_err(|error| format!("no OCR engine for the user profile languages: {error}"))?;
+fn recognize_inner(
+    bgra: &[u8],
+    width: u32,
+    height: u32,
+    languages: &[String],
+) -> Result<OcrOutcome, String> {
+    let engine = engine_for(languages)?;
     let langs = engine
         .RecognizerLanguage()
         .and_then(|language| language.LanguageTag())
@@ -96,6 +102,20 @@ fn recognize_inner(bgra: &[u8], width: u32, height: u32) -> Result<OcrOutcome, S
             langs,
         })
     }
+}
+
+/// First configured language that Windows actually ships an OCR engine for, falling back to the
+/// user's profile languages when the config names none that are installed.
+fn engine_for(languages: &[String]) -> Result<OcrEngine, String> {
+    for tag in languages {
+        if let Ok(engine) = Language::CreateLanguage(&HSTRING::from(tag.as_str()))
+            .and_then(|language| OcrEngine::TryCreateFromLanguage(&language))
+        {
+            return Ok(engine);
+        }
+    }
+    OcrEngine::TryCreateFromUserProfileLanguages()
+        .map_err(|error| format!("no OCR engine for the user profile languages: {error}"))
 }
 
 fn shrink(bgra: &[u8], width: u32, height: u32, max: u32) -> Result<(Vec<u8>, u32, u32), String> {

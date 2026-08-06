@@ -23,7 +23,7 @@ const SELECT_IMAGE_PATHS: &str = "SELECT observation_id, relative_path, created_
 /// same file two ways, the constraint would let both exist and each would be invisible to the
 /// other's lookup. Joining it onto a root with `Path::join` handles the separator when a real
 /// path is needed.
-fn relative_path(id: ulid::Ulid, at: chrono::DateTime<chrono::Utc>) -> String {
+pub fn relative_path(id: ulid::Ulid, at: chrono::DateTime<chrono::Utc>) -> String {
     format!(
         "{:04}/{:02}/{:02}/{id}.webp",
         at.year(),

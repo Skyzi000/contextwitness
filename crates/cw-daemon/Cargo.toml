@@ -16,3 +16,4 @@ cw-ocr = { workspace = true }
 cw-store = { workspace = true }
 chrono = { workspace = true }
 rusqlite = { workspace = true }
+ulid = { workspace = true }

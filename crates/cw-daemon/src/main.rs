@@ -5,7 +5,9 @@ use std::collections::HashMap;
 
 use cw_core::change::{Thumbnail, frame_changed};
 use cw_core::config::{Config, DataPaths, default_config_path};
-use cw_core::model::{Observation, ScreenPayload};
+use cw_core::model::{Observation, ScreenPayload, SourcePayload};
+use cw_core::privacy::CaptureDecision;
+use cw_store::control::{ControlEvent, EventKind};
 
 fn main() {
     cw_capture::make_dpi_aware();
@@ -46,31 +48,65 @@ fn tick(
     previous: &mut HashMap<String, Thumbnail>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let foreground = cw_capture::foreground();
-    if let Some(process) = &foreground.process
-        && config
-            .privacy
-            .process_blacklist
-            .iter()
-            .any(|blocked| blocked.eq_ignore_ascii_case(process))
-    {
+    let skip_detail = match cw_core::privacy::decide_capture(
+        foreground.process.as_deref(),
+        &config.privacy.process_blacklist,
+    ) {
+        CaptureDecision::Capture => None,
+        // The process is the whole detail: a window title would put into the audit trail the very
+        // thing the blacklist exists to keep out.
+        CaptureDecision::SkipBlacklisted { process } => Some(process),
+        CaptureDecision::SkipUnknownForeground => Some("unknown foreground process".to_owned()),
+    };
+    if let Some(detail) = skip_detail {
+        cw_store::control::record_event(
+            conn,
+            &ControlEvent {
+                id: ulid::Ulid::new(),
+                kind: EventKind::BlacklistSkip,
+                at: chrono::Utc::now(),
+                detail: Some(detail),
+            },
+        )?;
         return Ok(());
     }
 
+    let mut changed = Vec::new();
     for frame in cw_capture::capture_all() {
         let rgba = bgra_to_rgba(&frame.bgra);
         let thumbnail = Thumbnail::from_rgba(&rgba, frame.width, frame.height, frame.dpi_scale)?;
-        if !frame_changed(previous.get(&frame.monitor_id), &thumbnail, &config.capture) {
-            continue;
+        if frame_changed(previous.get(&frame.monitor_id), &thumbnail, &config.capture) {
+            changed.push((frame, thumbnail));
         }
+    }
 
+    // One thread per changed monitor: OCR costs seconds per frame, and run in sequence it is the
+    // whole tick. `recognize` initializes the Windows Runtime on whichever thread calls it.
+    let outcomes: Vec<_> = std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for (frame, _) in &changed {
+            handles.push(scope.spawn(move || {
+                cw_ocr::recognize(
+                    &frame.bgra,
+                    frame.width,
+                    frame.height,
+                    &config.ocr.languages,
+                )
+            }));
+        }
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("recognize does not panic"))
+            .collect()
+    });
+
+    for ((frame, thumbnail), ocr) in changed.into_iter().zip(outcomes) {
         let now = chrono::Utc::now();
-        let ocr = cw_ocr::recognize(&frame.bgra, frame.width, frame.height);
         let text_chars = ocr.text.as_deref().map_or(0, |text| text.chars().count());
         let payload = ScreenPayload {
             monitor_id: frame.monitor_id.clone(),
             width: frame.width,
             height: frame.height,
-            // The images table is the truth about which file this observation's frame is in.
             image_path: None,
             ocr_status: ocr.status.clone(),
             ocr_error: ocr.error,
@@ -79,7 +115,12 @@ fn tick(
             foreground_process: foreground.process.clone(),
             foreground_window_title: foreground.title.clone(),
         };
-        let observation = Observation::new_screen(payload, now);
+        let mut observation = Observation::new_screen(payload, now);
+        // This id and instant are the ones `images::save` gets below, which is what makes the
+        // path recorded here the path it writes.
+        if let SourcePayload::Screen(payload) = &mut observation.payload {
+            payload.image_path = Some(cw_store::images::relative_path(observation.id, now));
+        }
         cw_store::observations::insert(conn, &observation)?;
         let rgb = bgra_to_rgb(&frame.bgra);
         let stored = cw_store::images::save(
