@@ -611,6 +611,29 @@ Monitor DISPLAY2 (1920x1080):
         assert_eq!(episode.metadata.entry_count, "2");
         assert!(episode.content.contains("earlier"));
         assert!(episode.content.contains("later"));
+
+        // The same promise where the text is hidden: NoText renders nothing, so these two read
+        // identically, and only the compared `ocr_text` keeps them apart.
+        let hidden = vec![
+            observation(
+                3,
+                "2026-07-24T16:00:01Z",
+                screen_payload("DISPLAY1", OcrStatus::NoText, Some("earlier")),
+            ),
+            observation(
+                4,
+                "2026-07-24T16:00:02Z",
+                screen_payload("DISPLAY1", OcrStatus::NoText, Some("later")),
+            ),
+        ];
+        let episode = build_episode(
+            timestamp("2026-07-24T16:00:00Z"),
+            5,
+            FixedOffset::east_opt(0).expect("UTC offset should be valid"),
+            &hidden,
+        )
+        .expect("the hidden-text observations should build an episode");
+        assert_eq!(episode.metadata.entry_count, "2");
     }
 
     #[test]
