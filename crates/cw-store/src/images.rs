@@ -2351,7 +2351,9 @@ mod tests {
             other => panic!("expected ImageIo with AlreadyExists, got {other:?}"),
         }
 
-        // No row is what tells this transaction apart from three autocommitted statements.
+        // No row is what tells the transaction apart from an autocommitted INSERT: the row write
+        // is its only statement and had already run when the publish was refused, so only the
+        // rollback leaves this count at zero.
         let count: i64 = conn
             .query_row(
                 "SELECT count(*) FROM images WHERE observation_id = ?1",
