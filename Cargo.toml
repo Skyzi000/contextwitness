@@ -17,6 +17,9 @@ repository = "https://github.com/Skyzi000/contextwitness"
 
 [workspace.dependencies]
 cw-core = { path = "crates/cw-core" }
+cw-capture = { path = "crates/cw-capture" }
+cw-ocr = { path = "crates/cw-ocr" }
+cw-store = { path = "crates/cw-store" }
 image = { version = "0.25", default-features = false }
 webp = "0.3"
 serde = { version = "1", features = ["derive"] }
@@ -27,6 +30,20 @@ chrono = { version = "0.4", features = ["serde"] }
 ulid = { version = "1", features = ["serde"] }
 toml = "0.9"
 dirs = "6"
-windows = { version = "0.62", features = ["Win32_Globalization", "Win32_Storage_FileSystem"] }
+windows = { version = "0.62", features = [
+    "Win32_Globalization",
+    "Win32_Storage_FileSystem",
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_HiDpi",
+    "Win32_System_Threading",
+    "Win32_System_WinRT",
+    "Media_Ocr",
+    "Graphics_Imaging",
+    "Storage_Streams",
+    "Security_Cryptography",
+    "Globalization",
+] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 tempfile = "3"

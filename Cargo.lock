@@ -82,6 +82,9 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 [[package]]
 name = "cw-capture"
 version = "0.1.0"
+dependencies = [
+ "windows",
+]
 
 [[package]]
 name = "cw-core"
@@ -101,10 +104,23 @@ dependencies = [
 [[package]]
 name = "cw-daemon"
 version = "0.1.0"
+dependencies = [
+ "chrono",
+ "cw-capture",
+ "cw-core",
+ "cw-ocr",
+ "cw-store",
+ "rusqlite",
+]
 
 [[package]]
 name = "cw-ocr"
 version = "0.1.0"
+dependencies = [
+ "cw-core",
+ "image",
+ "windows",
+]
 
 [[package]]
 name = "cw-sink-hindsight"

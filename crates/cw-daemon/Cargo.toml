@@ -10,3 +10,9 @@ name = "contextwitness"
 path = "src/main.rs"
 
 [dependencies]
+cw-core = { workspace = true }
+cw-capture = { workspace = true }
+cw-ocr = { workspace = true }
+cw-store = { workspace = true }
+chrono = { workspace = true }
+rusqlite = { workspace = true }
