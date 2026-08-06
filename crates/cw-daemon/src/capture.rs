@@ -16,6 +16,7 @@ const HEALTH_TICK_INTERVAL: std::time::Duration = std::time::Duration::from_secs
 /// Run the capture loop on this thread until the process ends.
 pub fn run(
     mut capture: cw_capture::CaptureEngine,
+    ocr: &dyn cw_ocr::OcrEngine,
     mut conn: rusqlite::Connection,
     paths: DataPaths,
     config: Config,
@@ -29,6 +30,7 @@ pub fn run(
         let started = std::time::Instant::now();
         if let Err(error) = tick(
             &mut capture,
+            ocr,
             &mut conn,
             &paths,
             &config,
@@ -61,6 +63,7 @@ pub(crate) struct Stored {
 
 fn tick(
     capture: &mut cw_capture::CaptureEngine,
+    ocr: &dyn cw_ocr::OcrEngine,
     conn: &mut rusqlite::Connection,
     paths: &DataPaths,
     config: &Config,
@@ -88,7 +91,7 @@ fn tick(
         previous.retain(|id, _| monitors.iter().any(|monitor| &monitor.id == id));
     }
 
-    for stored in pass(capture, conn, paths, config, previous)? {
+    for stored in pass(capture, ocr, conn, paths, config, previous)? {
         info!(
             monitor = %stored.monitor_id,
             width = stored.width,
@@ -108,6 +111,7 @@ fn tick(
 /// that, and `capture-once` is a user asking for this pass in particular.
 pub(crate) fn pass(
     capture: &mut cw_capture::CaptureEngine,
+    ocr: &dyn cw_ocr::OcrEngine,
     conn: &mut rusqlite::Connection,
     paths: &DataPaths,
     config: &Config,
@@ -155,7 +159,7 @@ pub(crate) fn pass(
         let mut handles = Vec::new();
         for (frame, _) in &changed {
             handles.push(scope.spawn(move || {
-                cw_ocr::recognize(
+                ocr.recognize(
                     &frame.bgra,
                     frame.width,
                     frame.height,
@@ -172,7 +176,9 @@ pub(crate) fn pass(
     let mut stored_at = None;
     let mut stored_frames = Vec::new();
     for ((frame, thumbnail), ocr) in changed.into_iter().zip(outcomes) {
-        let now = chrono::Utc::now();
+        // The backend's stamp, not now: OCR just spent seconds, and an observation dated after it
+        // lands whole seconds late — far enough to put a frame in the wrong five-minute window.
+        let captured_at = frame.captured_at;
         let text_chars = ocr.text.as_deref().map_or(0, |text| text.chars().count());
         let payload = ScreenPayload {
             monitor_id: frame.monitor_id.clone(),
@@ -186,11 +192,16 @@ pub(crate) fn pass(
             foreground_process: foreground.process.clone(),
             foreground_window_title: foreground.title.clone(),
         };
-        let mut observation = Observation::new_screen(payload, now);
+        let mut observation = Observation::new_screen(payload, captured_at);
         // This id and instant are the ones `images::save` gets below, which is what makes the
-        // path recorded here the path it writes.
+        // path recorded here the path it writes. The `images/` prefix is the payload's spelling
+        // only: delivered paths are data_dir-relative (design §4.2), while the images table keys
+        // on the path relative to the images root.
         if let SourcePayload::Screen(payload) = &mut observation.payload {
-            payload.image_path = Some(cw_store::images::relative_path(observation.id, now));
+            payload.image_path = Some(format!(
+                "images/{}",
+                cw_store::images::relative_path(observation.id, captured_at)
+            ));
         }
         cw_store::observations::insert(conn, &observation)?;
         let rgb = bgra_to_rgb(&frame.bgra);
@@ -202,10 +213,10 @@ pub(crate) fn pass(
             frame.width,
             frame.height,
             f32::from(config.capture.webp_quality),
-            now,
+            captured_at,
         )?;
         previous.insert(frame.monitor_id.clone(), thumbnail);
-        stored_at = Some(now);
+        stored_at = Some(captured_at);
         stored_frames.push(Stored {
             monitor_id: frame.monitor_id,
             width: frame.width,

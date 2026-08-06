@@ -151,6 +151,7 @@ impl Session {
                 height,
                 dpi_scale,
                 bgra,
+                captured_at: chrono::Utc::now(),
             });
         }
 

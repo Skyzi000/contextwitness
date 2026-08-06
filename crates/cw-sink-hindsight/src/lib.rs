@@ -36,15 +36,23 @@ impl Credentials {
             .ok_or(CredentialsError::NoHome)?
             .join(".hindsight")
             .join("contextwitness.json");
-        let file = match std::fs::read_to_string(&path) {
-            Ok(text) => Some(serde_json::from_str::<Value>(&text).map_err(|source| {
-                CredentialsError::Parse {
-                    path: path.clone(),
-                    source,
-                }
-            })?),
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => None,
-            Err(source) => return Err(CredentialsError::Io { path, source }),
+        let env_url = from_env("CONTEXTWITNESS_HINDSIGHT_URL");
+        let env_token = from_env("CONTEXTWITNESS_HINDSIGHT_TOKEN");
+        // The environment overrides the file, so when it answers both keys the file is not even
+        // read: an unreadable or unparsable file must not defeat the override.
+        let file = if env_url.is_some() && env_token.is_some() {
+            None
+        } else {
+            match std::fs::read_to_string(&path) {
+                Ok(text) => Some(serde_json::from_str::<Value>(&text).map_err(|source| {
+                    CredentialsError::Parse {
+                        path: path.clone(),
+                        source,
+                    }
+                })?),
+                Err(source) if source.kind() == std::io::ErrorKind::NotFound => None,
+                Err(source) => return Err(CredentialsError::Io { path, source }),
+            }
         };
         let from_file = |key: &str| {
             file.as_ref()
@@ -53,10 +61,8 @@ impl Credentials {
                 .map(str::to_owned)
                 .filter(|value| !value.trim().is_empty())
         };
-        let api_url =
-            from_env("CONTEXTWITNESS_HINDSIGHT_URL").or_else(|| from_file("hindsightApiUrl"));
-        let token =
-            from_env("CONTEXTWITNESS_HINDSIGHT_TOKEN").or_else(|| from_file("hindsightApiToken"));
+        let api_url = env_url.or_else(|| from_file("hindsightApiUrl"));
+        let token = env_token.or_else(|| from_file("hindsightApiToken"));
         match (api_url, token) {
             (Some(api_url), Some(token)) => Ok(Some(Self { api_url, token })),
             (None, None) => Ok(None),

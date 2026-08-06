@@ -42,6 +42,10 @@ pub fn run(mut conn: rusqlite::Connection, config: cw_core::config::Config) {
     let mut bank_ready = false;
 
     loop {
+        // A full batch *delivered* means a backlog is draining and the next pass should run now.
+        // Deliveries, not attempts: a pass of nothing but failures must fall into the idle wait,
+        // or a server answering with a short Retry-After would be re-asked in a hot loop with no
+        // backoff at all.
         match deliver_batch(&mut conn, &client, &config, &mut bank_ready) {
             Ok(BATCH..) => continue,
             Ok(_) => {}
@@ -51,7 +55,7 @@ pub fn run(mut conn: rusqlite::Connection, config: cw_core::config::Config) {
     }
 }
 
-/// One pass over what is due, answering how many entries were attempted.
+/// One pass over what is due, answering how many entries were delivered.
 fn deliver_batch(
     conn: &mut rusqlite::Connection,
     client: &HindsightClient,
@@ -72,13 +76,12 @@ fn deliver_batch(
         *bank_ready = true;
     }
 
-    let mut attempted = 0;
+    let mut delivered = 0;
     for entry in due {
         if !outbox::mark_delivering(conn, entry.episode_id)? {
             // Somebody else has it, or it is no longer due.
             continue;
         }
-        attempted += 1;
         let now = chrono::Utc::now();
         // The stored snapshot is the wire form; this only checks that it is JSON, because splicing
         // text that is not into the request body would corrupt every item in it.
@@ -103,6 +106,7 @@ fn deliver_batch(
             Ok(()) => {
                 outbox::mark_delivered(conn, entry.episode_id)?;
                 cw_store::control::set_health(conn, HealthKey::LastDelivery, now)?;
+                delivered += 1;
                 debug!(document = %entry.document_id, "delivered episode");
             }
             Err(error) => {
@@ -129,5 +133,5 @@ fn deliver_batch(
         }
     }
 
-    Ok(attempted)
+    Ok(delivered)
 }

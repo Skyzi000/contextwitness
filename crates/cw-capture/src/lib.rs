@@ -33,6 +33,10 @@ pub struct Frame {
     pub height: u32,
     pub dpi_scale: f32,
     pub bgra: Vec<u8>,
+    /// When the pixels were read off the screen — not when a consumer got around to them. OCR
+    /// takes seconds per frame and the fallback's mailbox holds a frame until the next tick, so
+    /// timestamps taken downstream would drift by that much.
+    pub captured_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// One attached monitor. `width`/`height` are physical pixels and `dpi_scale` is what turns them
@@ -85,6 +89,9 @@ pub struct CaptureEngine {
     wgc: wgc::WgcCapturer,
     failover: HashMap<String, Failover>,
     reported: HashMap<String, String>,
+    /// Diagnostics only (`capture-once --wgc`): the fallback path otherwise runs solely when the
+    /// primary has genuinely failed, which is not a condition a smoke test can order up.
+    force_fallback: bool,
 }
 
 impl CaptureEngine {
@@ -108,7 +115,13 @@ impl CaptureEngine {
             wgc: wgc::WgcCapturer::new(),
             failover: HashMap::new(),
             reported: HashMap::new(),
+            force_fallback: false,
         }
+    }
+
+    /// Route every capture through the fallback backend, permanently. Diagnostics only.
+    pub fn force_fallback(&mut self) {
+        self.force_fallback = true;
     }
 
     pub fn monitors(&mut self) -> Result<Vec<MonitorInfo>, CaptureError> {
@@ -134,27 +147,36 @@ impl CaptureEngine {
         for monitor in monitors {
             let now = Instant::now();
             let state = self.failover.entry(monitor.id.clone()).or_default();
-            let target = state.target(now);
+            let target = if self.force_fallback {
+                Backend::Fallback
+            } else {
+                state.target(now)
+            };
             let mut result = match target {
                 Backend::Primary => self.dxgi.capture(&monitor.id),
                 Backend::Fallback => self.wgc.capture(&monitor.id),
             };
-            let switched = state.record(target, outcome(&result), now);
-            // A primary attempt that failed and left the monitor on the fallback must not cost the
-            // tick its frame: that is where the probe, and the failover itself, gets to be cheap.
-            if target == Backend::Primary && state.target(now) == Backend::Fallback {
-                result = self.wgc.capture(&monitor.id);
-                state.record(Backend::Fallback, outcome(&result), now);
-            }
+            // A forced backend is not evidence about the primary's health, so the failover state
+            // machine sits the tick out.
+            if !self.force_fallback {
+                let switched = state.record(target, outcome(&result), now);
+                // A primary attempt that failed and left the monitor on the fallback must not cost
+                // the tick its frame: that is where the probe, and the failover itself, gets to be
+                // cheap.
+                if target == Backend::Primary && state.target(now) == Backend::Fallback {
+                    result = self.wgc.capture(&monitor.id);
+                    state.record(Backend::Fallback, outcome(&result), now);
+                }
 
-            if let Some(backend) = switched {
-                let name = match backend {
-                    Backend::Primary => "dxgi",
-                    Backend::Fallback => "wgc",
-                };
-                tracing::info!("capture backend for {} switched to {name}", monitor.id);
-                if backend == Backend::Primary {
-                    self.wgc.release(&monitor.id);
+                if let Some(backend) = switched {
+                    let name = match backend {
+                        Backend::Primary => "dxgi",
+                        Backend::Fallback => "wgc",
+                    };
+                    tracing::info!("capture backend for {} switched to {name}", monitor.id);
+                    if backend == Backend::Primary {
+                        self.wgc.release(&monitor.id);
+                    }
                 }
             }
 
@@ -207,9 +229,19 @@ pub struct Foreground {
     pub title: Option<String>,
 }
 
-pub fn make_dpi_aware() {
+/// Ask for PER_MONITOR_AWARE_V2 and answer whether the process actually has it. The setter's own
+/// result is not the answer: it fails with ERROR_ACCESS_DENIED when awareness was already set (a
+/// manifest, an AppCompat shim), and that state may still be the right one. Without V2, Windows
+/// virtualizes both the capture resolution and every DPI read, silently (design §3.2) — the caller
+/// decides whether to keep going on a `false`.
+pub fn make_dpi_aware() -> bool {
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        AreDpiAwarenessContextsEqual(
+            GetThreadDpiAwarenessContext(),
+            DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+        )
+        .as_bool()
     }
 }
 

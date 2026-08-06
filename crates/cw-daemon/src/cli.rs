@@ -76,7 +76,12 @@ enum Command {
         action: AutostartAction,
     },
     /// Capture, read and store one frame per monitor, then exit.
-    CaptureOnce,
+    CaptureOnce {
+        /// Capture through the fallback backend (Windows Graphics Capture) instead of the
+        /// primary, to check that the failover path works on this machine.
+        #[arg(long)]
+        wgc: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -95,7 +100,7 @@ pub fn main() {
         Command::Resume => resume(),
         Command::Setup => setup(),
         Command::Autostart { action } => set_autostart(&action),
-        Command::CaptureOnce => capture_once(),
+        Command::CaptureOnce { wgc } => capture_once(wgc),
     };
 
     if let Err(error) = outcome {
@@ -109,7 +114,9 @@ fn daemon() -> ! {
     // Before the engine, the log file and the database: a refused second daemon must not have
     // touched any of them.
     claim_single_instance();
-    cw_capture::make_dpi_aware();
+    // Asked for here, before any thread exists; judged below, once there is a log file to put the
+    // reason in.
+    let dpi_aware = cw_capture::make_dpi_aware();
     cw_ocr::init_runtime();
 
     let config_path = default_config_path().expect("resolving the config path failed");
@@ -126,6 +133,17 @@ fn daemon() -> ! {
     install_panic_hook();
     if created {
         info!(path = %config_path.display(), "wrote the default config");
+    }
+
+    // Without PER_MONITOR_AWARE_V2 every capture arrives at a virtualized resolution and every
+    // DPI reads 96, silently — the change threshold then measures the wrong pixels. The design
+    // (§3.2) takes a visible refusal over a daemon that degrades without saying so.
+    if !dpi_aware {
+        error!(
+            "the process could not become PER_MONITOR_AWARE_V2, and capture would be silently degraded"
+        );
+        drop(logging);
+        std::process::exit(1);
     }
 
     // The capture sessions are persistent, so the engine outlives the tick that reads from it.
@@ -184,7 +202,8 @@ fn daemon() -> ! {
         database = %paths.database().display(),
         "capturing"
     );
-    capture::run(capture, conn, paths, config)
+    let ocr = cw_ocr::WindowsOcr;
+    capture::run(capture, &ocr, conn, paths, config)
 }
 
 /// Refuse to be the second daemon in this session. The handle is never closed: the OS drops it
@@ -443,16 +462,51 @@ fn set_autostart(action: &AutostartAction) -> Result<(), Failure> {
 
 /// One capture pass and nothing else: no workers, no tray, no file log. What it stores it stores
 /// exactly as a tick would, so this is also how one checks that capture works at all.
-fn capture_once() -> Result<(), Failure> {
-    cw_capture::make_dpi_aware();
+fn capture_once(wgc: bool) -> Result<(), Failure> {
+    // The same refusal as the daemon's: a diagnostic that measures a virtualized screen would
+    // report the wrong resolution as if capture worked.
+    if !cw_capture::make_dpi_aware() {
+        return Err(Failure::from(
+            "the process could not become PER_MONITOR_AWARE_V2, so capture would be silently degraded",
+        ));
+    }
     cw_ocr::init_runtime();
 
     let (config, paths, mut conn) = open_store()?;
+    let ocr = cw_ocr::WindowsOcr;
     let mut capture = cw_capture::CaptureEngine::new();
+    if wgc {
+        capture.force_fallback();
+    }
     // Empty, so every monitor counts as changed: a single pass has nothing to compare against, and
     // asking for one means asking for what is on screen now.
     let mut previous = std::collections::HashMap::new();
-    let stored = capture::pass(&mut capture, &mut conn, &paths, &config, &mut previous)?;
+    let mut stored = capture::pass(
+        &mut capture,
+        &ocr,
+        &mut conn,
+        &paths,
+        &config,
+        &mut previous,
+    )?;
+    // WGC sessions deliver their first frame from a callback thread, so the first pass can find
+    // the mailboxes still empty. The sessions persist across passes; ask again briefly.
+    if wgc {
+        for _ in 0..6 {
+            if !stored.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            stored.extend(capture::pass(
+                &mut capture,
+                &ocr,
+                &mut conn,
+                &paths,
+                &config,
+                &mut previous,
+            )?);
+        }
+    }
 
     if stored.is_empty() {
         println!(

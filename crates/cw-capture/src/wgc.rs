@@ -96,6 +96,9 @@ struct Shot {
     width: u32,
     height: u32,
     bgra: Vec<u8>,
+    /// Stamped in the callback: the mailbox holds a frame until the next tick reads it, and that
+    /// wait is not part of when the screen looked like this.
+    captured_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// A live capture thread plus the mailbox it writes into.
@@ -162,6 +165,7 @@ impl Session {
                     height: shot.height,
                     dpi_scale,
                     bgra: shot.bgra,
+                    captured_at: shot.captured_at,
                 })
             }
             // A session that has never spoken is broken; one that has is looking at a still screen.
@@ -229,6 +233,7 @@ impl GraphicsCaptureApiHandler for Sink {
             width,
             height,
             bgra,
+            captured_at: chrono::Utc::now(),
         });
         Ok(())
     }
