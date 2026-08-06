@@ -92,8 +92,7 @@ impl Thumbnail {
     }
 
     /// Estimated number of LOGICAL pixels that changed — source pixels divided by the square of the
-    /// display scale, so the same edit scores the same on a 1080p screen at 100% and a 4K screen at
-    /// 200%.
+    /// display scale, so a higher pixel density does not inflate the score by itself.
     pub fn changed_logical_pixels(&self, other: &Thumbnail, pixel_threshold: u8) -> f64 {
         self.changed_source_pixels(other, pixel_threshold) / (self.dpi_scale as f64).powi(2)
     }

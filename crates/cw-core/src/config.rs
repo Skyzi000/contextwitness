@@ -12,8 +12,8 @@ interval_secs = 2
 # A pixel counts as changed when its grayscale value moves by more than this (0-254).
 change_pixel_threshold = 8
 # Store and OCR a frame once more than this many logical pixels changed.
-# Logical means at 100% display scaling, so the same edit behaves the same on a 1080p screen
-# and on a 4K screen at 200%. The default is roughly ten characters of text.
+# Logical means at 100% display scaling, so a higher display scale does not inflate the
+# measurement by itself. The default is roughly ten characters of text.
 change_area_logical_pixels = 600
 # WebP encoder quality (0-100).
 webp_quality = 75
