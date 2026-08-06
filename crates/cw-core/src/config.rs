@@ -210,7 +210,7 @@ pub enum ConfigError {
         /// TOML path of the invalid field.
         field: &'static str,
         /// Explanation of the accepted values.
-        reason: String,
+        reason: &'static str,
     },
     /// A per-user directory could not be resolved.
     #[error("could not resolve {what} directory for this user")]
@@ -231,22 +231,21 @@ impl Config {
         if self.capture.change_pixel_threshold == 255 {
             return Err(ConfigError::Invalid {
                 field: "capture.change_pixel_threshold",
-                reason: "must be 254 or less; two pixels can never differ by more than 255"
-                    .to_owned(),
+                reason: "must be 254 or less; two pixels can never differ by more than 255",
             });
         }
 
         if self.capture.interval_secs < 1 {
             return Err(ConfigError::Invalid {
                 field: "capture.interval_secs",
-                reason: "must be at least 1 second".to_owned(),
+                reason: "must be at least 1 second",
             });
         }
 
         if self.capture.webp_quality > 100 {
             return Err(ConfigError::Invalid {
                 field: "capture.webp_quality",
-                reason: "must be between 0 and 100".to_owned(),
+                reason: "must be between 0 and 100",
             });
         }
 
@@ -255,14 +254,14 @@ impl Config {
         if !(1..=1440).contains(&self.episode.window_minutes) {
             return Err(ConfigError::Invalid {
                 field: "episode.window_minutes",
-                reason: "must be between 1 and 1440 minutes (one day)".to_owned(),
+                reason: "must be between 1 and 1440 minutes (one day)",
             });
         }
 
         if self.hindsight.bank_id.trim().is_empty() {
             return Err(ConfigError::Invalid {
                 field: "hindsight.bank_id",
-                reason: "must not be empty".to_owned(),
+                reason: "must not be empty",
             });
         }
 
