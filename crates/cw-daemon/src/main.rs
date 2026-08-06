@@ -1,13 +1,20 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 //! The ContextWitness daemon entry point.
 
-use std::collections::HashMap;
+mod capture;
+mod delivery;
+mod episodes;
+mod logging;
+mod maintenance;
 
-use cw_core::change::{Thumbnail, frame_changed};
 use cw_core::config::{Config, DataPaths, default_config_path};
-use cw_core::model::{Observation, ScreenPayload, SourcePayload};
-use cw_core::privacy::CaptureDecision;
-use cw_store::control::{ControlEvent, EventKind};
+use tracing::{error, info, warn};
+
+/// How long startup keeps asking for the monitor list before giving up. Enumeration fails while a
+/// session is still coming up, and the reachability check below cannot be skipped, so this waits
+/// for an answer instead of starting without one.
+const MONITOR_ATTEMPTS: u32 = 5;
+const MONITOR_RETRY: std::time::Duration = std::time::Duration::from_secs(2);
 
 fn main() {
     cw_capture::make_dpi_aware();
@@ -16,145 +23,151 @@ fn main() {
     let config_path = default_config_path().expect("resolving the config path failed");
     let created =
         Config::write_default_if_missing(&config_path).expect("writing the default config failed");
-    if created {
-        println!("wrote default config to {}", config_path.display());
-    }
     let config = Config::load_from_path(&config_path).expect("loading the config failed");
     let data_dir = config
         .storage
         .resolve_data_dir()
         .expect("resolving the data directory failed");
     let paths = DataPaths::new(data_dir);
-    let mut conn = cw_store::db::open(&paths.database()).expect("opening the database failed");
-    println!(
-        "capturing every {}s into {}",
-        config.capture.interval_secs,
-        paths.database().display()
-    );
+    // Held until the process ends: dropping it flushes the file writer.
+    let logging = logging::init(&paths);
+    if created {
+        info!(path = %config_path.display(), "wrote the default config");
+    }
 
     // The capture sessions are persistent, so the engine outlives the tick that reads from it.
     let mut capture = cw_capture::CaptureEngine::new();
-    let mut previous: HashMap<String, Thumbnail> = HashMap::new();
-    loop {
-        if let Err(error) = tick(&mut capture, &mut conn, &paths, &config, &mut previous) {
-            eprintln!("tick failed: {error}");
-        }
-        std::thread::sleep(std::time::Duration::from_secs(config.capture.interval_secs));
+    if let Err(message) = check_thresholds(&mut capture, &config, &config_path) {
+        error!("{message}");
+        // Before the exit, which runs no destructor: without this the reason above never reaches
+        // the log file.
+        drop(logging);
+        std::process::exit(1);
     }
-}
 
-fn tick(
-    capture: &mut cw_capture::CaptureEngine,
-    conn: &mut rusqlite::Connection,
-    paths: &DataPaths,
-    config: &Config,
-    previous: &mut HashMap<String, Thumbnail>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let foreground = cw_capture::foreground();
-    let skip_detail = match cw_core::privacy::decide_capture(
-        foreground.process.as_deref(),
-        &config.privacy.process_blacklist,
+    let mut conn = cw_store::db::open(&paths.database()).expect("opening the database failed");
+    maintenance::sweep_orphans(&conn, &paths);
+    match cw_store::outbox::requeue_delivering(&conn) {
+        Ok(0) => {}
+        // An attempt whose outcome nobody recorded: delivery is at-least-once, so it goes round
+        // again under the same document id.
+        Ok(requeued) => info!(requeued, "requeued deliveries left in flight"),
+        Err(error) => error!("requeueing in-flight deliveries failed: {error}"),
+    }
+    let mut cursor: episodes::Cursor = None;
+    match episodes::close_due(
+        &mut conn,
+        &mut cursor,
+        config.episode.window_minutes,
+        chrono::Utc::now(),
     ) {
-        CaptureDecision::Capture => None,
-        // The process is the whole detail: a window title would put into the audit trail the very
-        // thing the blacklist exists to keep out.
-        CaptureDecision::SkipBlacklisted { process } => Some(process),
-        CaptureDecision::SkipUnknownForeground => Some("unknown foreground process".to_owned()),
-    };
-    if let Some(detail) = skip_detail {
-        cw_store::control::record_event(
-            conn,
-            &ControlEvent {
-                id: ulid::Ulid::new(),
-                kind: EventKind::BlacklistSkip,
-                at: chrono::Utc::now(),
-                detail: Some(detail),
-            },
-        )?;
-        return Ok(());
+        Ok(0) => {}
+        Ok(registered) => info!(registered, "registered windows that closed while stopped"),
+        Err(error) => error!("the startup episode rescan failed: {error}"),
     }
 
-    let mut changed = Vec::new();
-    for frame in capture.capture_all() {
-        let rgba = bgra_to_rgba(&frame.bgra);
-        let thumbnail = Thumbnail::from_rgba(&rgba, frame.width, frame.height, frame.dpi_scale)?;
-        if frame_changed(previous.get(&frame.monitor_id), &thumbnail, &config.capture) {
-            changed.push((frame, thumbnail));
-        }
-    }
-
-    // One thread per changed monitor: OCR costs seconds per frame, and run in sequence it is the
-    // whole tick. `recognize` initializes the Windows Runtime on whichever thread calls it.
-    let outcomes: Vec<_> = std::thread::scope(|scope| {
-        let mut handles = Vec::new();
-        for (frame, _) in &changed {
-            handles.push(scope.spawn(move || {
-                cw_ocr::recognize(
-                    &frame.bgra,
-                    frame.width,
-                    frame.height,
-                    &config.ocr.languages,
-                )
-            }));
-        }
-        handles
-            .into_iter()
-            .map(|handle| handle.join().expect("recognize does not panic"))
-            .collect()
+    // One connection per subsystem (design §7); each carries the same WAL and busy-timeout
+    // contract because every one of them comes from `db::open`.
+    spawn("delivery", {
+        let conn = open_for("delivery", &paths);
+        let config = config.clone();
+        move || delivery::run(conn, config)
+    });
+    spawn("episodes", {
+        let conn = open_for("episodes", &paths);
+        let config = config.clone();
+        move || episodes::run(conn, config, cursor)
+    });
+    spawn("maintenance", {
+        let conn = open_for("maintenance", &paths);
+        let config = config.clone();
+        let paths = DataPaths::new(paths.root.clone());
+        move || maintenance::run(conn, paths, config)
     });
 
-    for ((frame, thumbnail), ocr) in changed.into_iter().zip(outcomes) {
-        let now = chrono::Utc::now();
-        let text_chars = ocr.text.as_deref().map_or(0, |text| text.chars().count());
-        let payload = ScreenPayload {
-            monitor_id: frame.monitor_id.clone(),
-            width: frame.width,
-            height: frame.height,
-            image_path: None,
-            ocr_status: ocr.status.clone(),
-            ocr_error: ocr.error,
-            ocr_text: ocr.text,
-            ocr_langs: ocr.langs,
-            foreground_process: foreground.process.clone(),
-            foreground_window_title: foreground.title.clone(),
-        };
-        let mut observation = Observation::new_screen(payload, now);
-        // This id and instant are the ones `images::save` gets below, which is what makes the
-        // path recorded here the path it writes.
-        if let SourcePayload::Screen(payload) = &mut observation.payload {
-            payload.image_path = Some(cw_store::images::relative_path(observation.id, now));
+    info!(
+        interval_secs = config.capture.interval_secs,
+        database = %paths.database().display(),
+        "capturing"
+    );
+    capture::run(capture, conn, paths, config);
+}
+
+/// Abort rather than warn when a monitor's change threshold cannot be reached (plan Task 13): the
+/// comparison in `frame_changed` is strict, so such a monitor stores nothing after its first frame,
+/// with no error anywhere — a silence the user cannot tell from working.
+fn check_thresholds(
+    capture: &mut cw_capture::CaptureEngine,
+    config: &Config,
+    config_path: &std::path::Path,
+) -> Result<(), String> {
+    let mut last_error = None;
+    for attempt in 1..=MONITOR_ATTEMPTS {
+        match capture.monitors() {
+            Ok(monitors) => {
+                let unreachable: Vec<_> = monitors
+                    .iter()
+                    .filter(|monitor| {
+                        !cw_core::change::change_threshold_is_reachable(
+                            monitor.width,
+                            monitor.height,
+                            monitor.dpi_scale,
+                            &config.capture,
+                        )
+                    })
+                    .map(|monitor| {
+                        format!(
+                            "{} ({}x{} at {}x scale) tops out at {:.0} changed logical pixels",
+                            monitor.id,
+                            monitor.width,
+                            monitor.height,
+                            monitor.dpi_scale,
+                            cw_core::change::max_logical_pixels(
+                                monitor.width,
+                                monitor.height,
+                                monitor.dpi_scale
+                            )
+                        )
+                    })
+                    .collect();
+                if unreachable.is_empty() {
+                    return Ok(());
+                }
+                return Err(format!(
+                    "capture.change_area_logical_pixels is {}, which no change on these monitors \
+                     can exceed, so nothing on them would ever be stored: {}. Lower it in {}",
+                    config.capture.change_area_logical_pixels,
+                    unreachable.join("; "),
+                    config_path.display()
+                ));
+            }
+            Err(error) => {
+                warn!(attempt, "listing monitors failed: {error}");
+                last_error = Some(error.to_string());
+                std::thread::sleep(MONITOR_RETRY);
+            }
         }
-        cw_store::observations::insert(conn, &observation)?;
-        let rgb = bgra_to_rgb(&frame.bgra);
-        let stored = cw_store::images::save(
-            conn,
-            &paths.images(),
-            observation.id,
-            &rgb,
-            frame.width,
-            frame.height,
-            f32::from(config.capture.webp_quality),
-            now,
-        )?;
-        previous.insert(frame.monitor_id.clone(), thumbnail);
-        println!(
-            "{} {}x{} ocr {:?} ({} chars) -> {}",
-            frame.monitor_id, frame.width, frame.height, ocr.status, text_chars, stored
-        );
     }
-    Ok(())
+
+    Err(format!(
+        "the monitors could not be listed in {MONITOR_ATTEMPTS} attempts, so the change threshold \
+         could not be checked against them: {}",
+        last_error.unwrap_or_default()
+    ))
 }
 
-fn bgra_to_rgba(bgra: &[u8]) -> Vec<u8> {
-    let mut rgba = bgra.to_vec();
-    for pixel in rgba.chunks_exact_mut(4) {
-        pixel.swap(0, 2);
-    }
-    rgba
+fn open_for(subsystem: &str, paths: &DataPaths) -> rusqlite::Connection {
+    cw_store::db::open(&paths.database()).unwrap_or_else(|error| {
+        panic!("opening the {subsystem} database connection failed: {error}")
+    })
 }
 
-fn bgra_to_rgb(bgra: &[u8]) -> Vec<u8> {
-    bgra.chunks_exact(4)
-        .flat_map(|pixel| [pixel[2], pixel[1], pixel[0]])
-        .collect()
+fn spawn<F>(name: &str, worker: F)
+where
+    F: FnOnce() + Send + 'static,
+{
+    std::thread::Builder::new()
+        .name(name.to_owned())
+        .spawn(worker)
+        .unwrap_or_else(|error| panic!("spawning the {name} thread failed: {error}"));
 }

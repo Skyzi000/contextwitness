@@ -1,7 +1,6 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 //! Hindsight sink functionality for ContextWitness.
 
-use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -9,6 +8,7 @@ use std::time::Duration;
 use chrono::{DateTime, SecondsFormat, Utc};
 use reqwest::StatusCode;
 use reqwest::blocking::{Client, RequestBuilder, Response};
+use serde_json::value::RawValue;
 use serde_json::{Map, Value, json};
 
 /// Steers what Hindsight extracts from the episodes this daemon sends.
@@ -119,8 +119,11 @@ pub struct RetainItem<'a> {
     /// End of the episode window.
     pub timestamp: DateTime<Utc>,
     pub context: &'a str,
-    /// Hindsight rejects non-string metadata values, so this never widens to arbitrary JSON.
-    pub metadata: &'a BTreeMap<String, String>,
+    /// The retain metadata snapshot, still as the JSON text it was stored as, spliced into the
+    /// request verbatim. Parsing and re-serialising it here would rebuild the snapshot, and the
+    /// stored bytes are the wire bytes. Hindsight rejects non-string values, and what the store
+    /// holds already satisfies that.
+    pub metadata: &'a RawValue,
 }
 
 /// Blocking Hindsight 0.8.4 client.

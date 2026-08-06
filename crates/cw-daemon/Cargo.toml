@@ -14,6 +14,11 @@ cw-core = { workspace = true }
 cw-capture = { workspace = true }
 cw-ocr = { workspace = true }
 cw-store = { workspace = true }
+cw-sink-hindsight = { workspace = true }
 chrono = { workspace = true }
 rusqlite = { workspace = true }
 ulid = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }

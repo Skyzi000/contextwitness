@@ -20,12 +20,16 @@ cw-core = { path = "crates/cw-core" }
 cw-capture = { path = "crates/cw-capture" }
 cw-ocr = { path = "crates/cw-ocr" }
 cw-store = { path = "crates/cw-store" }
+cw-sink-hindsight = { path = "crates/cw-sink-hindsight" }
 image = { version = "0.25", default-features = false }
 webp = "0.3"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `raw_value` so a stored metadata snapshot reaches the wire as the bytes it was stored as.
+serde_json = { version = "1", features = ["raw_value"] }
 thiserror = "2"
 tracing = "0.1"
+tracing-subscriber = "0.3"
+tracing-appender = "0.2"
 chrono = { version = "0.4", features = ["serde"] }
 ulid = { version = "1", features = ["serde"] }
 toml = "0.9"
