@@ -342,46 +342,68 @@ impl Config {
     /// looking configured.
     /// Any other IO error -> ConfigError::Read; invalid TOML -> ConfigError::Parse.
     pub fn load_from_path(path: &std::path::Path) -> Result<Config, ConfigError> {
-        let text = match std::fs::read_to_string(path) {
-            Ok(text) => text,
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-                // A name that answers NotFound can still be occupied: a link whose target is
-                // gone reads that way, and treating it as absence would run on defaults forever
-                // — writing the default template is refused by that very name, so nothing
-                // would ever surface it.
-                return match path.symlink_metadata() {
-                    Ok(_) => Err(ConfigError::Read {
+        // Two tries, because publishing is concurrent by design: `write_default_if_missing`
+        // renames a finished config onto this name from any process, so metadata naming
+        // something real where the read just found nothing means the file was published between
+        // the two calls — the second read takes it. Measured: nothing static answers that way
+        // (a directory or junction at the name refuses the read as PermissionDenied, not
+        // NotFound), so the retry only ever chases a publication.
+        for _ in 0..2 {
+            let text = match std::fs::read_to_string(path) {
+                Ok(text) => text,
+                Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                    // A name that answers NotFound can still be occupied: a link whose target
+                    // is gone reads that way, and treating it as absence would run on defaults
+                    // forever — writing the default template is refused by that very name, so
+                    // nothing would ever surface it.
+                    match path.symlink_metadata() {
+                        Ok(meta) if meta.file_type().is_symlink() => {
+                            return Err(ConfigError::Read {
+                                path: path.to_path_buf(),
+                                source: std::io::Error::new(
+                                    std::io::ErrorKind::NotFound,
+                                    "the name is occupied by a link whose target is missing",
+                                ),
+                            });
+                        }
+                        Ok(_) => continue,
+                        Err(meta) if meta.kind() == std::io::ErrorKind::NotFound => {
+                            return Ok(Self::default());
+                        }
+                        // Any other answer is not absence but the ordinary read error the doc
+                        // promises; reading it as absence would hide a denied name behind the
+                        // defaults.
+                        Err(meta) => {
+                            return Err(ConfigError::Read {
+                                path: path.to_path_buf(),
+                                source: meta,
+                            });
+                        }
+                    }
+                }
+                Err(source) => {
+                    return Err(ConfigError::Read {
                         path: path.to_path_buf(),
-                        source: std::io::Error::new(
-                            std::io::ErrorKind::NotFound,
-                            "the name is occupied by a link whose target is missing",
-                        ),
-                    }),
-                    Err(meta) if meta.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-                    // Any other answer is not absence but the ordinary read error the doc
-                    // promises; reading it as absence would hide a denied name behind the
-                    // defaults.
-                    Err(meta) => Err(ConfigError::Read {
-                        path: path.to_path_buf(),
-                        source: meta,
-                    }),
-                };
-            }
-            Err(source) => {
-                return Err(ConfigError::Read {
-                    path: path.to_path_buf(),
-                    source,
-                });
-            }
-        };
+                        source,
+                    });
+                }
+            };
 
-        let config = Self::from_toml_str(&text).map_err(|source| ConfigError::Parse {
+            let config = Self::from_toml_str(&text).map_err(|source| ConfigError::Parse {
+                path: path.to_path_buf(),
+                source,
+            })?;
+            config.validate()?;
+
+            return Ok(config);
+        }
+
+        // Reached only by two flips in a row: a name that keeps changing between a file and
+        // absence mid-read is refused rather than chased further.
+        Err(ConfigError::Read {
             path: path.to_path_buf(),
-            source,
-        })?;
-        config.validate()?;
-
-        Ok(config)
+            source: std::io::Error::other("the name kept flipping between a file and absence"),
+        })
     }
 }
 
