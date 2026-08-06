@@ -4,6 +4,7 @@ use std::io::Write as _;
 
 use crate::{autostart, capture, delivery, episodes, logging, maintenance, tray};
 use clap::{Parser, Subcommand};
+use cw_core::atomic_file::create_temporary_beside;
 use cw_core::config::{Config, DataPaths, default_config_path};
 use cw_store::control::{HealthKey, Pause};
 use tracing::{error, info, warn};
@@ -258,6 +259,15 @@ fn check_thresholds(
     let mut last_error = None;
     for attempt in 1..=MONITOR_ATTEMPTS {
         match capture.monitors() {
+            // An enumeration that lists nothing is not an answer about this machine: it is what a
+            // session still coming up and an RDP reconnect both produce, and every monitor of an
+            // empty list passes every check. Taken as an answer it would let the daemon start
+            // without the check ever having seen the real monitors.
+            Ok(monitors) if monitors.is_empty() => {
+                warn!(attempt, "listing monitors answered with no monitors");
+                last_error = Some("the enumeration listed no monitors".to_owned());
+                std::thread::sleep(MONITOR_RETRY);
+            }
             Ok(monitors) => {
                 let unreachable: Vec<_> = monitors
                     .iter()
@@ -592,10 +602,34 @@ fn setup_data_dir() -> Result<(), Failure> {
     updated.replace_range(line, &format!("{DATA_DIR_KEY} = {}", toml_string(&answer)));
     // Checked before it is written, because the escaping above is the only thing between a Windows
     // path and a config the daemon then refuses to load.
-    Config::from_toml_str(&updated).map_err(|error| {
+    let parsed = Config::from_toml_str(&updated).map_err(|error| {
         format!("the updated config would not parse, so it was not written: {error}")
     })?;
-    std::fs::write(&config_path, updated)?;
+    // Parsing is not the whole of what the daemon demands of this key: a relative path parses and
+    // is then refused at every startup. Refusing it here is the only place the user is still at the
+    // prompt and can answer with another one.
+    parsed
+        .storage
+        .resolve_data_dir()
+        .map_err(|error| format!("{error}; the config was not written"))?;
+
+    // Written beside the config and renamed onto it, never into it: `fs::write` truncates first,
+    // and an interruption between the truncation and the last byte leaves a config that still
+    // parses — as every default — so the daemon would collect into the per-user directory instead
+    // of the one just set, and say nothing. This rename replaces the destination, which is the
+    // point here and is why it goes by name rather than through the no-clobber publish cw-core
+    // uses to create the config in the first place.
+    let (temporary, mut file) = create_temporary_beside(&config_path)?;
+    let written = file
+        .write_all(updated.as_bytes())
+        .and_then(|()| file.sync_all());
+    // Closed before the rename: the handle has nothing left to do, and a scratch file left behind
+    // by a failure would sit beside the config looking like one.
+    drop(file);
+    if let Err(error) = written.and_then(|()| std::fs::rename(&temporary, &config_path)) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error.into());
+    }
     println!("  set {DATA_DIR_KEY} in {}", config_path.display());
 
     Ok(())

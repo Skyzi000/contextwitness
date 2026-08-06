@@ -60,13 +60,16 @@ pub fn close_due(
     };
     let window = TimeDelta::minutes(i64::from(window_minutes));
     let deadline = now - TimeDelta::seconds(GRACE_SECONDS);
-    // The machine's offset now, and only for the rendered body: ids and metadata are UTC, and
-    // cw-core takes the offset as an argument so that nothing in it consults a clock.
-    let offset = *chrono::Local::now().offset();
     let mut registered = 0;
 
     while *start + window <= deadline {
         let end = *start + window;
+        // The offset that stood over this window, not the one standing now: the startup rescan
+        // closes windows from days ago, and in a zone with daylight saving the two are an hour
+        // apart for every window on the other side of the change. Only the rendered body uses it —
+        // ids and metadata are UTC — and cw-core takes it as an argument so that nothing in it
+        // consults a clock.
+        let offset = chrono::TimeZone::offset_from_utc_datetime(&chrono::Local, &start.naive_utc());
         let observations = cw_store::observations::find_in_window(conn, *start, end)?;
         if let Some(episode) =
             cw_core::episode::build_episode(*start, window_minutes, offset, &observations)

@@ -78,6 +78,11 @@ fn tick(
             cw_store::control::Pause::Until(deadline) => chrono::Utc::now() < deadline,
         };
         if paused {
+            // The fallback's callback threads keep writing frames while the pass is not reading;
+            // without this, the first tick after the pause could store a screen from the middle
+            // of it. (A frame from the gap between the last paused tick and the actual lift is
+            // still accepted — the ceiling is one tick interval.)
+            capture.discard_pending();
             debug!("capture is paused");
             return Ok(());
         }
@@ -138,6 +143,9 @@ pub(crate) fn pass(
                 detail: Some(detail),
             },
         )?;
+        // Same contract as the pause: a frame the fallback captured while the gate was closed
+        // must not survive into the first allowed pass.
+        capture.discard_pending();
         // Without the process name: the audit trail is where that belongs, and the log is a file
         // this program keeps screen-derived names out of.
         debug!("tick skipped by the privacy gate");
@@ -205,7 +213,7 @@ pub(crate) fn pass(
         }
         cw_store::observations::insert(conn, &observation)?;
         let rgb = bgra_to_rgb(&frame.bgra);
-        let stored = cw_store::images::save(
+        let stored = match cw_store::images::save(
             conn,
             &paths.images(),
             observation.id,
@@ -214,7 +222,22 @@ pub(crate) fn pass(
             frame.height,
             f32::from(config.capture.webp_quality),
             captured_at,
-        )?;
+        ) {
+            Ok(stored) => stored,
+            Err(error) => {
+                // The observation is already committed and names an image that now will never
+                // exist. The episode fold keeps the first entry of a run, so left in place that
+                // broken spelling is the one a delivered episode would carry — while the retry's
+                // real image goes unreferenced.
+                if let Err(removal) = cw_store::observations::remove(conn, observation.id) {
+                    error!(
+                        observation = %observation.id,
+                        "removing the observation whose image failed to store also failed: {removal}"
+                    );
+                }
+                return Err(error.into());
+            }
+        };
         previous.insert(frame.monitor_id.clone(), thumbnail);
         stored_at = Some(captured_at);
         stored_frames.push(Stored {

@@ -24,6 +24,7 @@ languages = ["ja", "en"]
 
 [storage]
 # Where captures and the database live. Empty means the per-user local data directory.
+# An absolute path: a relative one names a different directory in every process that reads it.
 data_dir = ""
 # Delete stored images older than this many days.
 image_retention_days = 14
@@ -211,6 +212,18 @@ pub enum ConfigError {
         field: &'static str,
         /// Explanation of the accepted values.
         reason: &'static str,
+    },
+    /// A configured path that every process has to read the same way is relative.
+    #[error(
+        "invalid configuration value for {field}: `{value}` is relative, so it would name a \
+         different directory in every process; give an absolute path, or leave it empty for the \
+         per-user default"
+    )]
+    Relative {
+        /// TOML path of the offending field.
+        field: &'static str,
+        /// The configured value, as the user wrote it.
+        value: String,
     },
     /// A per-user directory could not be resolved.
     #[error("could not resolve {what} directory for this user")]
@@ -415,15 +428,30 @@ pub fn default_config_path() -> Result<std::path::PathBuf, ConfigError> {
 }
 
 impl StorageConfig {
-    /// Empty data_dir -> dirs::data_local_dir()/"ContextWitness"; otherwise the configured path as-is.
+    /// Empty data_dir -> dirs::data_local_dir()/"ContextWitness"; otherwise the configured path,
+    /// which has to be absolute.
     pub fn resolve_data_dir(&self) -> Result<std::path::PathBuf, ConfigError> {
         if self.data_dir.is_empty() {
-            dirs::data_local_dir()
+            return dirs::data_local_dir()
                 .ok_or(ConfigError::UnresolvedDir { what: "data" })
-                .map(|path| path.join("ContextWitness"))
-        } else {
-            Ok(std::path::PathBuf::from(&self.data_dir))
+                .map(|path| path.join("ContextWitness"));
         }
+
+        let path = std::path::PathBuf::from(&self.data_dir);
+        // Refused rather than resolved against the current directory, which is not the same one
+        // for everybody: the daemon is started from the Run key and `pause` from a shell, so a
+        // relative data_dir has them open two different databases while both report success.
+        // `is_absolute` is what draws that line, and it draws it in both spellings that look
+        // absolute and are not — the drive-relative `D:foo`, which hangs off that drive's own
+        // current directory, and the root-relative `\foo`, which hangs off the current drive.
+        if !path.is_absolute() {
+            return Err(ConfigError::Relative {
+                field: "storage.data_dir",
+                value: self.data_dir.clone(),
+            });
+        }
+
+        Ok(path)
     }
 }
 
@@ -749,7 +777,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_data_dir_is_used_verbatim() {
+    fn an_absolute_data_dir_is_used_verbatim_and_a_relative_one_is_refused() {
         let storage = StorageConfig {
             data_dir: "D:/somewhere".to_owned(),
             ..StorageConfig::default()
@@ -758,9 +786,39 @@ mod tests {
         assert_eq!(
             storage
                 .resolve_data_dir()
-                .expect("an explicit data directory should resolve"),
+                .expect("an explicit absolute data directory should resolve"),
             std::path::PathBuf::from("D:/somewhere")
         );
+
+        // Every spelling that is resolved against a current directory, including the two that
+        // carry a drive letter or a leading separator and still are not absolute.
+        for relative in ["captures", "./captures", "D:captures", "\\captures"] {
+            let storage = StorageConfig {
+                data_dir: relative.to_owned(),
+                ..StorageConfig::default()
+            };
+            let error = storage
+                .resolve_data_dir()
+                .expect_err("a relative data directory should be refused");
+
+            assert!(
+                matches!(
+                    error,
+                    ConfigError::Relative {
+                        field: "storage.data_dir",
+                        ..
+                    }
+                ),
+                "`{relative}` would name a different directory per process, got {error:?}"
+            );
+            // The message is the only thing the user gets, so the key to edit and the value that
+            // was refused both have to be in it.
+            let message = error.to_string();
+            assert!(
+                message.contains("storage.data_dir") && message.contains(relative),
+                "the refusal should name the key and the value: {message}"
+            );
+        }
     }
 
     #[test]

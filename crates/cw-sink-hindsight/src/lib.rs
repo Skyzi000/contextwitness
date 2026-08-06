@@ -316,9 +316,16 @@ fn check(response: Response, operation: &str) -> Result<Response, DeliveryError>
     // The body stays out of the message: Hindsight echoes rejected input back, and here that input
     // is captured screen text.
     let message = format!("hindsight {operation} failed with HTTP {status}");
+    // 401 and 403 state that the credential is wrong, not that the payload is, so they are
+    // retryable: a token that expires mid-run would otherwise leave every episode attempted during
+    // the outage permanently unsendable, and fixing the credential would not bring them back. They
+    // follow the normal backoff ladder, which caps at 900s, so a token that stays broken costs one
+    // request per 15 minutes. Every other 4xx is a verdict on the request and stays permanent.
     if status.is_server_error()
         || status == StatusCode::REQUEST_TIMEOUT
         || status == StatusCode::TOO_MANY_REQUESTS
+        || status == StatusCode::UNAUTHORIZED
+        || status == StatusCode::FORBIDDEN
     {
         Err(DeliveryError::Retryable {
             message,

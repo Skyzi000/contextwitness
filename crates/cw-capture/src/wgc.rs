@@ -5,8 +5,10 @@ use std::collections::hash_map::Entry;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
+use windows::Win32::Graphics::Direct3D11::{D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE};
 use windows::Win32::Graphics::Gdi::HMONITOR;
 use windows_capture::capture::{CaptureControl, Context, GraphicsCaptureApiHandler};
+use windows_capture::d3d11::StagingTexture;
 use windows_capture::frame::Frame as WgcFrame;
 use windows_capture::graphics_capture_api::{GraphicsCaptureApi, InternalCaptureControl};
 use windows_capture::monitor::Monitor;
@@ -34,6 +36,9 @@ type Control = CaptureControl<Sink, <Sink as GraphicsCaptureApiHandler>::Error>;
 pub(crate) struct WgcCapturer {
     known: Vec<(HMONITOR, MonitorInfo)>,
     sessions: HashMap<String, Session>,
+    /// Shots stamped at or before this are refused. One timestamp covers every session: a session
+    /// opened after the last discard only ever produces shots newer than it.
+    discard_before: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl WgcCapturer {
@@ -41,12 +46,34 @@ impl WgcCapturer {
         Self {
             known: Vec::new(),
             sessions: HashMap::new(),
+            discard_before: None,
         }
     }
 
     /// Drop a monitor's session, which is what the engine does once the primary is back.
     pub(crate) fn release(&mut self, monitor_id: &str) {
         self.sessions.remove(monitor_id);
+    }
+
+    /// Drop sessions for monitors that are gone. `monitors` does this too, but only when something
+    /// actually captures through this backend: were the last fallback monitor detached, nothing
+    /// would call in again and its capture thread, D3D device and mailbox would outlive it by the
+    /// life of the process.
+    pub(crate) fn retain_monitors(&mut self, monitors: &[MonitorInfo]) {
+        self.sessions
+            .retain(|id, _| monitors.iter().any(|monitor| &monitor.id == id));
+    }
+
+    /// Empty every mailbox and refuse everything captured up to now. The callback threads keep
+    /// filling mailboxes while the daemon's privacy gate is closed, so without this the first tick
+    /// after the gate reopens could hand over a screen the gate existed to keep out.
+    pub(crate) fn discard_pending(&mut self) {
+        // Stamped before the mailboxes are emptied so that a frame landing in between is covered by
+        // the watermark rather than slipping past both.
+        self.discard_before = Some(chrono::Utc::now());
+        for session in self.sessions.values() {
+            lock(&session.mailbox).take();
+        }
     }
 }
 
@@ -68,6 +95,7 @@ impl Capturer for WgcCapturer {
         // attempt: an enumeration costs microseconds and a stale dpi scale silently mis-scales
         // everything downstream.
         self.monitors()?;
+        let discard_before = self.discard_before;
         let (handle, dpi_scale) = self
             .known
             .iter()
@@ -80,7 +108,7 @@ impl Capturer for WgcCapturer {
             Entry::Vacant(vacant) => vacant.insert(Session::open(handle)?),
         };
 
-        let captured = session.capture(monitor_id, dpi_scale);
+        let captured = session.capture(monitor_id, dpi_scale, discard_before);
         // Same rule as the duplication: anything but an idle screen ends the session, and the next
         // tick builds a new one.
         if matches!(&captured, Err(error) if !matches!(error, CaptureError::Recoverable(Recoverable::NoNewFrame)))
@@ -144,7 +172,14 @@ impl Session {
         })
     }
 
-    fn capture(&mut self, monitor_id: &str, dpi_scale: f32) -> Result<Frame, CaptureError> {
+    /// Guarantees, with `discard_before`, that no frame captured before the most recent discard is
+    /// ever returned.
+    fn capture(
+        &mut self,
+        monitor_id: &str,
+        dpi_scale: f32,
+        discard_before: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<Frame, CaptureError> {
         // The capture thread ends when the item closes or the handler fails, and that is the only
         // thing a mailbox can be asked about its own liveness.
         if self
@@ -157,6 +192,13 @@ impl Session {
 
         let shot = lock(&self.mailbox).take();
         match shot {
+            // Captured before the last discard: the gate was closed then, so this is the same
+            // answer as an empty mailbox. The session did speak, though, so it is not the silence
+            // the first-frame grace is watching for.
+            Some(shot) if discard_before.is_some_and(|at| shot.captured_at <= at) => {
+                self.delivered = true;
+                Err(Recoverable::NoNewFrame.into())
+            }
             Some(shot) => {
                 self.delivered = true;
                 Ok(Frame {
@@ -216,13 +258,31 @@ impl GraphicsCaptureApiHandler for Sink {
             return Ok(());
         }
 
-        // `buffer` maps a staging texture per call and releases it still mapped; the WGC path of
-        // the crate has no equivalent of the duplication's caller-owned staging texture, so the
-        // ceiling here is how often it is called.
-        let buffer = frame.buffer()?;
-        let (width, height) = (buffer.width(), buffer.height());
-        let mut packed = Vec::new();
-        let mut bgra = buffer.as_nopadding_buffer(&mut packed).to_vec();
+        // Hand-rolled instead of `Frame::buffer`: that one creates its staging texture as a local,
+        // maps it, and hands back a slice into the mapping — then releases the texture, still
+        // mapped, before the caller reads a byte. This owns the texture across the read and unmaps
+        // before dropping it. A new texture per call, not one cached in the sink, because
+        // `start_free_threaded` requires the handler to be `Send` and a D3D texture is not.
+        let (width, height) = (frame.width(), frame.height());
+        let staging = StagingTexture::new(frame.device(), width, height, frame.desc().Format)?;
+        let context = frame.device_context();
+        // 4 bytes per pixel throughout: the session asks the OS for `ColorFormat::Bgra8`, so the
+        // frame pool converts whatever the desktop really is.
+        let row = width as usize * 4;
+        let mut bgra = vec![0u8; row * height as usize];
+        unsafe {
+            context.CopyResource(staging.texture(), frame.as_raw_texture());
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            context.Map(staging.texture(), 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
+            for y in 0..height as usize {
+                std::ptr::copy_nonoverlapping(
+                    mapped.pData.cast::<u8>().add(y * mapped.RowPitch as usize),
+                    bgra.as_mut_ptr().add(y * row),
+                    row,
+                );
+            }
+            context.Unmap(staging.texture(), 0);
+        }
         // WGC hands back the composed alpha; the desktop image is opaque downstream.
         for pixel in bgra.chunks_exact_mut(4) {
             pixel[3] = 255;

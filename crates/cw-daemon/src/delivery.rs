@@ -49,7 +49,18 @@ pub fn run(mut conn: rusqlite::Connection, config: cw_core::config::Config) {
         match deliver_batch(&mut conn, &client, &config, &mut bank_ready) {
             Ok(BATCH..) => continue,
             Ok(_) => {}
-            Err(error) => error!("delivery pass failed: {error}"),
+            Err(error) => {
+                error!("delivery pass failed: {error}");
+                // A pass that dies between the claim and the state write leaves its entry
+                // 'delivering', which `fetch_due` does not see. One worker runs, so any
+                // 'delivering' entry at a pass boundary is by definition abandoned. If the store
+                // is what failed this fails too, and the next pass tries again.
+                match outbox::requeue_delivering(&conn) {
+                    Ok(0) => {}
+                    Ok(count) => info!(count, "requeued entries the failed pass left claimed"),
+                    Err(error) => error!("claimed entries could not be requeued: {error}"),
+                }
+            }
         }
         std::thread::sleep(IDLE);
     }
@@ -82,7 +93,6 @@ fn deliver_batch(
             // Somebody else has it, or it is no longer due.
             continue;
         }
-        let now = chrono::Utc::now();
         // The stored snapshot is the wire form; this only checks that it is JSON, because splicing
         // text that is not into the request body would corrupt every item in it.
         let metadata = match serde_json::value::RawValue::from_string(entry.metadata_json) {
@@ -90,7 +100,13 @@ fn deliver_batch(
             Err(error) => {
                 let message = format!("stored metadata is not valid JSON: {error}");
                 error!(document = %entry.document_id, "{message}");
-                outbox::mark_failed(conn, entry.episode_id, now, Retry::Never, &message)?;
+                outbox::mark_failed(
+                    conn,
+                    entry.episode_id,
+                    chrono::Utc::now(),
+                    Retry::Never,
+                    &message,
+                )?;
                 continue;
             }
         };
@@ -102,7 +118,12 @@ fn deliver_batch(
             metadata: &metadata,
         };
 
-        match client.retain(&config.hindsight.bank_id, &item) {
+        let outcome = client.retain(&config.hindsight.bank_id, &item);
+        // Read after the call, not before it: retain blocks for up to the sink's HTTP timeout, so a
+        // `now` taken beforehand can already be in the past by the time a `Retry-After` or a
+        // backoff step is measured from it.
+        let now = chrono::Utc::now();
+        match outcome {
             Ok(()) => {
                 outbox::mark_delivered(conn, entry.episode_id)?;
                 cw_store::control::set_health(conn, HealthKey::LastDelivery, now)?;

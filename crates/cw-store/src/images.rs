@@ -1952,11 +1952,12 @@ mod tests {
     #[test]
     fn a_relative_root_that_is_not_there_yet_removes_nothing() {
         let (_dir, conn, _root) = database();
-        // `resolve_data_dir` hands back what was configured, so a relative `storage.data_dir` is
-        // something a user can write. Every name on such a path can be absent while the directory
-        // holding it — the one the process is in — is perfectly ordinary and is never among them,
-        // so running out of names says nothing here. This is the other side of the check that
-        // reports an absolute root whose drive is not there.
+        // The config layer refuses a relative `storage.data_dir`, but this function takes a bare
+        // path and promises nothing about where it came from. A relative spelling is the simplest
+        // arrangement in which every name on the path is absent while the directory anchoring it —
+        // the one the process is in — is perfectly ordinary and never among them, so running out
+        // of names says nothing here. This is the other side of the check that reports an absolute
+        // root whose drive is not there.
         let root = std::path::PathBuf::from("cw-store-root-that-was-never-created");
         assert!(!root.exists(), "the test would say nothing if this existed");
 

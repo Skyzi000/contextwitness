@@ -128,6 +128,22 @@ impl CaptureEngine {
         self.dxgi.monitors()
     }
 
+    /// Throw away whatever the fallback is holding, and refuse anything captured up to now.
+    /// Guarantee: no frame captured before the most recent call is ever returned by `capture_all`.
+    ///
+    /// The daemon calls this on every tick its privacy gate blocks — paused, or the foreground
+    /// window blacklisted. The gate only stops the tick from *reading*; the fallback's callback
+    /// threads keep capturing into their mailboxes regardless, so without this the first tick after
+    /// the gate reopens could return a screen the pause or the blacklist existed to keep out. The
+    /// duplication is pull-only and holds nothing between captures, so only the fallback needs it.
+    ///
+    /// Ceiling: a frame captured between the last gated tick and the moment the gate actually
+    /// lifted still gets through — bounded by one tick interval, since a tick cannot see the exact
+    /// instant of the lift.
+    pub fn discard_pending(&mut self) {
+        self.wgc.discard_pending();
+    }
+
     /// Capture every monitor, each with the backend its own failover state points at. A monitor
     /// that fails to capture is skipped, this tick only.
     pub fn capture_all(&mut self) -> Vec<Frame> {
@@ -142,6 +158,9 @@ impl CaptureEngine {
         // the primary again rather than inheriting the run of failures that lost it.
         self.failover
             .retain(|id, _| monitors.iter().any(|monitor| &monitor.id == id));
+        // Same reason, for the resources: the fallback prunes its own sessions only when it is
+        // asked to capture, which never happens again once the last monitor using it is gone.
+        self.wgc.retain_monitors(&monitors);
 
         let mut frames = Vec::new();
         for monitor in monitors {
