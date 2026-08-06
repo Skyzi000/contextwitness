@@ -326,8 +326,7 @@ mod tests {
             ..CaptureConfig::default()
         };
 
-        // Failing closed is right here: a scale we cannot use must surface as a startup error, not
-        // as a monitor that quietly captures nothing.
+        // Failing closed is right here: a scale we cannot use must surface as a startup error.
         for dpi_scale in [0.0, -1.0, f32::NAN] {
             assert_eq!(max_logical_pixels(1920, 1080, dpi_scale), 0.0);
             assert!(!change_threshold_is_reachable(
@@ -655,7 +654,8 @@ mod tests {
     fn a_non_positive_or_nan_display_scale_is_rejected() {
         let frame = solid(1, 1, 200);
 
-        // A NaN scale would silently stop all capture rather than fail.
+        // NaN never equals itself, so `frame_changed`'s scale comparison would answer "changed"
+        // on every tick and store every frame.
         for dpi_scale in [0.0, -1.0, f32::NAN] {
             assert!(
                 matches!(
