@@ -71,7 +71,12 @@ pub fn close_due(
         if let Some(episode) =
             cw_core::episode::build_episode(*start, window_minutes, offset, &observations)
         {
-            match cw_store::episodes::insert_with_outbox(conn, ulid::Ulid::new(), &episode, now)? {
+            match cw_store::episodes::insert_with_outbox(
+                conn,
+                ulid::Ulid::generate(),
+                &episode,
+                now,
+            )? {
                 Registration::Registered(id) => {
                     registered += 1;
                     info!(

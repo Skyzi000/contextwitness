@@ -255,7 +255,7 @@ mod tests {
         let path = dir.path().join("db.sqlite3");
         let conn = db::open(&path).expect("the fresh database should initialize");
 
-        let found = find_by_id(&conn, ulid::Ulid::new())
+        let found = find_by_id(&conn, ulid::Ulid::generate())
             .expect("an absent observation should be a successful lookup");
 
         assert_eq!(found, None);
@@ -276,7 +276,7 @@ mod tests {
             }
         });
         let observation = Observation {
-            id: ulid::Ulid::new(),
+            id: ulid::Ulid::generate(),
             observed_at: at("2026-07-25T12:34:56.123456789Z"),
             duration_ms: Some(2_000),
             schema_version: CURRENT_SCHEMA_VERSION,
@@ -315,7 +315,7 @@ mod tests {
                 serde_json::json!("must not be lost"),
             );
         let observation = Observation {
-            id: ulid::Ulid::new(),
+            id: ulid::Ulid::generate(),
             observed_at: at("2026-07-25T12:34:56Z"),
             duration_ms: None,
             schema_version: CURRENT_SCHEMA_VERSION,
@@ -566,7 +566,7 @@ mod tests {
         let path = dir.path().join("db.sqlite3");
         let conn = db::open(&path).expect("the fresh database should initialize");
         let observation = Observation {
-            id: ulid::Ulid::new(),
+            id: ulid::Ulid::generate(),
             observed_at: at("2026-07-25T12:34:56Z"),
             duration_ms: Some(u64::MAX),
             schema_version: CURRENT_SCHEMA_VERSION,

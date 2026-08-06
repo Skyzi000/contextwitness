@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use cw_core::change::{Thumbnail, frame_changed};
 use cw_core::config::{Config, DataPaths};
-use cw_core::model::{Observation, ScreenPayload, SourcePayload};
+use cw_core::model::{Observation, OcrStatus, ScreenPayload, SourcePayload};
 use cw_core::privacy::CaptureDecision;
 use cw_store::control::{ControlEvent, EventKind, HealthKey};
 use tracing::{debug, error, info};
@@ -46,6 +46,19 @@ pub fn run(
     }
 }
 
+/// One frame a pass stored, as the daemon's log line and `capture-once`'s printed line describe
+/// it. The recognized text is deliberately not here: neither destination is a place screen content
+/// goes, and only its length is reported.
+pub(crate) struct Stored {
+    pub monitor_id: String,
+    pub width: u32,
+    pub height: u32,
+    pub ocr_status: OcrStatus,
+    pub text_chars: usize,
+    /// Where the image landed, relative to the images directory.
+    pub relative_path: String,
+}
+
 fn tick(
     capture: &mut cw_capture::CaptureEngine,
     conn: &mut rusqlite::Connection,
@@ -67,6 +80,31 @@ fn tick(
         }
     }
 
+    for stored in pass(capture, conn, paths, config, previous)? {
+        info!(
+            monitor = %stored.monitor_id,
+            width = stored.width,
+            height = stored.height,
+            ocr = ?stored.ocr_status,
+            chars = stored.text_chars,
+            path = %stored.relative_path,
+            "stored frame"
+        );
+    }
+
+    Ok(())
+}
+
+/// Capture every monitor once: the privacy gate, change detection against `previous`, OCR, and the
+/// observation and image rows for whatever changed. The pause is not consulted here — `tick` owns
+/// that, and `capture-once` is a user asking for this pass in particular.
+pub(crate) fn pass(
+    capture: &mut cw_capture::CaptureEngine,
+    conn: &mut rusqlite::Connection,
+    paths: &DataPaths,
+    config: &Config,
+    previous: &mut HashMap<String, Thumbnail>,
+) -> Result<Vec<Stored>, Box<dyn std::error::Error>> {
     let foreground = cw_capture::foreground();
     let skip_detail = match cw_core::privacy::decide_capture(
         foreground.process.as_deref(),
@@ -82,7 +120,7 @@ fn tick(
         cw_store::control::record_event(
             conn,
             &ControlEvent {
-                id: ulid::Ulid::new(),
+                id: ulid::Ulid::generate(),
                 kind: EventKind::BlacklistSkip,
                 at: chrono::Utc::now(),
                 detail: Some(detail),
@@ -91,7 +129,7 @@ fn tick(
         // Without the process name: the audit trail is where that belongs, and the log is a file
         // this program keeps screen-derived names out of.
         debug!("tick skipped by the privacy gate");
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     let mut changed = Vec::new();
@@ -124,6 +162,7 @@ fn tick(
     });
 
     let mut stored_at = None;
+    let mut stored_frames = Vec::new();
     for ((frame, thumbnail), ocr) in changed.into_iter().zip(outcomes) {
         let now = chrono::Utc::now();
         let text_chars = ocr.text.as_deref().map_or(0, |text| text.chars().count());
@@ -159,15 +198,14 @@ fn tick(
         )?;
         previous.insert(frame.monitor_id.clone(), thumbnail);
         stored_at = Some(now);
-        info!(
-            monitor = %frame.monitor_id,
-            width = frame.width,
-            height = frame.height,
-            ocr = ?ocr.status,
-            chars = text_chars,
-            path = %stored,
-            "stored frame"
-        );
+        stored_frames.push(Stored {
+            monitor_id: frame.monitor_id,
+            width: frame.width,
+            height: frame.height,
+            ocr_status: ocr.status,
+            text_chars,
+            relative_path: stored,
+        });
     }
     // Once per tick rather than once per monitor: all three writes would carry the same tick and
     // `status` reads one value.
@@ -175,7 +213,7 @@ fn tick(
         cw_store::control::set_health(conn, HealthKey::LastCapture, at)?;
     }
 
-    Ok(())
+    Ok(stored_frames)
 }
 
 fn mark_tick(

@@ -845,7 +845,7 @@ mod tests {
     #[test]
     fn save_writes_a_decodable_webp_and_registers_it_in_the_images_table() {
         let (_dir, mut conn, root) = database();
-        let id = ulid::Ulid::new();
+        let id = ulid::Ulid::generate();
         let taken_at = at(2026, 7, 30);
 
         let relative = save_test_image(&mut conn, &root, id, taken_at, 10);
@@ -889,7 +889,7 @@ mod tests {
     #[test]
     fn an_image_whose_commit_fails_stays_for_the_sweep() {
         let (_dir, mut conn, root) = database();
-        let id = ulid::Ulid::new();
+        let id = ulid::Ulid::generate();
         let taken_at = at(2026, 7, 30);
         // No observation is inserted, so this image's row breaks the foreign key `db::open` turns
         // on. SQLite enforces that check as the INSERT arrives unless it is deferred, and then it
@@ -927,7 +927,7 @@ mod tests {
     #[test]
     fn a_save_that_cannot_take_the_write_lock_leaves_no_file_behind() {
         let (dir, mut conn, root) = database();
-        let id = ulid::Ulid::new();
+        let id = ulid::Ulid::generate();
         insert_observation(&conn, id, at(2026, 7, 30));
 
         // Another connection holds the write lock this save needs, and this one is told not to wait
@@ -975,7 +975,7 @@ mod tests {
     #[test]
     fn a_second_save_for_one_observation_is_refused_and_keeps_the_first() {
         let (_dir, mut conn, root) = database();
-        let id = ulid::Ulid::new();
+        let id = ulid::Ulid::generate();
         let taken_at = at(2026, 7, 30);
         let relative = save_test_image(&mut conn, &root, id, taken_at, 30);
         let path = root.join(&relative);
@@ -1012,8 +1012,8 @@ mod tests {
     #[test]
     fn a_path_another_observation_holds_is_not_reported_as_this_one_being_registered() {
         let (_dir, mut conn, root) = database();
-        let first_id = ulid::Ulid::new();
-        let second_id = ulid::Ulid::new();
+        let first_id = ulid::Ulid::generate();
+        let second_id = ulid::Ulid::generate();
         let taken_at = at(2026, 7, 30);
         let relative = save_test_image(&mut conn, &root, first_id, taken_at, 31);
         let destination = root.join(&relative);
@@ -1076,7 +1076,7 @@ mod tests {
     #[test]
     fn a_frame_whose_pixels_do_not_match_its_size_is_refused() {
         let (_dir, mut conn, root) = database();
-        let id = ulid::Ulid::new();
+        let id = ulid::Ulid::generate();
         let taken_at = at(2026, 7, 30);
         insert_observation(&conn, id, taken_at);
         let mut short = pixels(40);
@@ -1111,7 +1111,7 @@ mod tests {
     fn a_frame_larger_than_the_encoder_allows_is_refused_rather_than_panicking() {
         let (_dir, mut conn, root) = database();
         let taken_at = at(2026, 7, 30);
-        let oversized_id = ulid::Ulid::new();
+        let oversized_id = ulid::Ulid::generate();
         let oversized = vec![0; 49_152];
 
         // This length passes the pixel check, so the dimension guard is what refuses it.
@@ -1133,7 +1133,7 @@ mod tests {
         let zero_width_error = save(
             &mut conn,
             &root,
-            ulid::Ulid::new(),
+            ulid::Ulid::generate(),
             &[],
             0,
             1,
@@ -1146,7 +1146,7 @@ mod tests {
         let quality_error = save(
             &mut conn,
             &root,
-            ulid::Ulid::new(),
+            ulid::Ulid::generate(),
             &pixels(41),
             WIDTH,
             HEIGHT,
@@ -1160,8 +1160,8 @@ mod tests {
     #[test]
     fn quality_at_both_ends_of_the_allowed_range_is_accepted() {
         let (_dir, mut conn, root) = database();
-        let zero_id = ulid::Ulid::new();
-        let hundred_id = ulid::Ulid::new();
+        let zero_id = ulid::Ulid::generate();
+        let hundred_id = ulid::Ulid::generate();
         let taken_at = at(2026, 7, 30);
         insert_observation(&conn, zero_id, taken_at);
         insert_observation(&conn, hundred_id, taken_at);
@@ -1220,7 +1220,7 @@ mod tests {
     #[test]
     fn a_frame_at_the_encoders_dimension_limit_is_accepted() {
         let (_dir, mut conn, root) = database();
-        let id = ulid::Ulid::new();
+        let id = ulid::Ulid::generate();
         let taken_at = at(2026, 7, 30);
         insert_observation(&conn, id, taken_at);
         let pixels = vec![0_u8; 49_149];
@@ -1231,7 +1231,7 @@ mod tests {
         save(&mut conn, &root, id, &pixels, 16_383, 1, 75.0, taken_at)
             .expect("a frame at the encoder's dimension limit should be accepted");
 
-        let second_id = ulid::Ulid::new();
+        let second_id = ulid::Ulid::generate();
         insert_observation(&conn, second_id, taken_at);
         // Width and height are separate bounds, so a test of one says nothing about the other.
         save(
@@ -1265,7 +1265,7 @@ mod tests {
         let error = save(
             &mut conn,
             &root,
-            ulid::Ulid::new(),
+            ulid::Ulid::generate(),
             &pixels(42),
             WIDTH,
             HEIGHT,
@@ -1281,7 +1281,7 @@ mod tests {
     #[test]
     fn delete_removes_file_and_images_row() {
         let (_dir, mut conn, root) = database();
-        let id = ulid::Ulid::new();
+        let id = ulid::Ulid::generate();
         let relative = save_test_image(&mut conn, &root, id, at(2026, 7, 30), 50);
         let path = root.join(relative);
         // Every column, not a count: untouched is a claim about the row's contents, and a count
@@ -1318,7 +1318,7 @@ mod tests {
     #[test]
     fn deleting_a_row_whose_file_is_already_gone_still_removes_the_row() {
         let (_dir, mut conn, root) = database();
-        let id = ulid::Ulid::new();
+        let id = ulid::Ulid::generate();
         let relative = save_test_image(&mut conn, &root, id, at(2026, 7, 30), 51);
         std::fs::remove_file(root.join(relative))
             .expect("the saved file should be removable without touching its row");
@@ -1340,7 +1340,7 @@ mod tests {
     #[test]
     fn an_entry_whose_target_is_gone_is_still_removed() {
         let (_dir, mut conn, root) = database();
-        let id = ulid::Ulid::new();
+        let id = ulid::Ulid::generate();
         let relative = save_test_image(&mut conn, &root, id, at(2026, 7, 30), 53);
         let path = root.join(relative);
         let missing_target = path.with_file_name("missing-target.webp");
@@ -1370,7 +1370,7 @@ mod tests {
     #[test]
     fn deleting_a_name_that_is_a_link_takes_the_link_and_not_what_it_points_at() {
         let (_dir, mut conn, root) = database();
-        let id = ulid::Ulid::new();
+        let id = ulid::Ulid::generate();
         let relative = save_test_image(&mut conn, &root, id, at(2026, 7, 30), 80);
         let path = root.join(relative);
         let target = path.with_file_name("pointed-at.webp");
@@ -1395,7 +1395,7 @@ mod tests {
     #[test]
     fn a_name_that_will_not_open_keeps_its_row() {
         let (_dir, mut conn, root) = database();
-        let id = ulid::Ulid::new();
+        let id = ulid::Ulid::generate();
         let relative = save_test_image(&mut conn, &root, id, at(2026, 7, 30), 52);
         let path = root.join(relative);
 
@@ -1430,7 +1430,7 @@ mod tests {
     #[test]
     fn a_row_naming_a_path_this_program_would_not_write_is_refused() {
         let (_dir, mut conn, root) = database();
-        let id = ulid::Ulid::new();
+        let id = ulid::Ulid::generate();
         let taken_at = at(2026, 7, 30);
         insert_observation(&conn, id, taken_at);
         let canonical = super::relative_path(id, taken_at);
@@ -1475,7 +1475,7 @@ mod tests {
     #[test]
     fn a_row_whose_timestamp_is_spelled_any_other_way_is_refused() {
         let (_dir, mut conn, root) = database();
-        let id = ulid::Ulid::new();
+        let id = ulid::Ulid::generate();
         let taken_at = at(2026, 7, 30);
         insert_observation(&conn, id, taken_at);
         let canonical = super::relative_path(id, taken_at);
@@ -1578,7 +1578,7 @@ mod tests {
     #[test]
     fn orphan_files_without_db_row_are_swept_on_startup() {
         let (_dir, mut conn, root) = database();
-        let id = ulid::Ulid::new();
+        let id = ulid::Ulid::generate();
         let relative = save_test_image(&mut conn, &root, id, at(2026, 7, 30), 80);
         let saved = root.join(relative);
         let unregistered = root.join("2026").join("07").join("29").join("orphan.webp");
@@ -1605,7 +1605,7 @@ mod tests {
     #[test]
     fn a_temporary_no_discard_removed_is_swept_and_its_destination_is_not() {
         let (_dir, mut conn, root) = database();
-        let id = ulid::Ulid::new();
+        let id = ulid::Ulid::generate();
         let relative = save_test_image(&mut conn, &root, id, at(2026, 7, 30), 80);
         let saved = root.join(relative);
 
@@ -1628,7 +1628,7 @@ mod tests {
     #[test]
     fn an_orphan_that_became_a_link_to_a_registered_image_is_not_removed() {
         let (_dir, mut conn, root) = database();
-        let id = ulid::Ulid::new();
+        let id = ulid::Ulid::generate();
         let relative = save_test_image(&mut conn, &root, id, at(2026, 7, 30), 82);
         let picture = root.join(&relative);
         let orphan = root.join("2026").join("07").join("30").join("orphan.webp");
@@ -1663,8 +1663,8 @@ mod tests {
     #[test]
     fn an_unrelated_orphan_is_still_swept_when_a_registered_file_is_missing() {
         let (_dir, mut conn, root) = database();
-        let first_id = ulid::Ulid::new();
-        let second_id = ulid::Ulid::new();
+        let first_id = ulid::Ulid::generate();
+        let second_id = ulid::Ulid::generate();
         let first_relative = save_test_image(&mut conn, &root, first_id, at(2026, 7, 30), 83);
         let second_relative = save_test_image(&mut conn, &root, second_id, at(2026, 7, 31), 84);
         std::fs::remove_file(root.join(&first_relative))
@@ -1733,7 +1733,7 @@ mod tests {
     #[test]
     fn a_registered_image_reached_through_a_link_is_not_swept() {
         let (_dir, mut conn, root) = database();
-        let id = ulid::Ulid::new();
+        let id = ulid::Ulid::generate();
         let relative = save_test_image(&mut conn, &root, id, at(2026, 7, 31), 82);
         let path = root.join(relative);
         let moved = path.with_file_name("moved-by-something-else.webp");
@@ -1762,7 +1762,7 @@ mod tests {
     #[test]
     fn an_orphan_is_kept_while_a_registered_name_will_not_say_what_it_reaches() {
         let (_dir, mut conn, root) = database();
-        let id = ulid::Ulid::new();
+        let id = ulid::Ulid::generate();
         let relative = save_test_image(&mut conn, &root, id, at(2026, 7, 30), 85);
         let path = root.join(relative);
         std::fs::remove_file(&path)
@@ -2169,7 +2169,7 @@ mod tests {
     #[test]
     fn a_sweep_whose_orphan_was_already_removed_still_succeeds() {
         let (_dir, mut conn, root) = database();
-        let id = ulid::Ulid::new();
+        let id = ulid::Ulid::generate();
         let relative = save_test_image(&mut conn, &root, id, at(2026, 7, 30), 82);
         let saved = root.join(relative);
         let unregistered = root.join("2026").join("07").join("30").join("orphan.webp");
@@ -2210,9 +2210,9 @@ mod tests {
         let (_dir, mut conn, root) = database();
         // Saved newest-first, so the promised order — the order the pictures were taken — cannot
         // be mistaken for the insertion order an unordered scan would answer with.
-        let later = ulid::Ulid::new();
+        let later = ulid::Ulid::generate();
         let later_relative = save_test_image(&mut conn, &root, later, at(2026, 7, 30), 90);
-        let earlier = ulid::Ulid::new();
+        let earlier = ulid::Ulid::generate();
         let earlier_relative = save_test_image(&mut conn, &root, earlier, at(2026, 7, 29), 93);
         std::fs::remove_file(root.join(&later_relative))
             .expect("the saved file should be removable without touching its row");
@@ -2231,7 +2231,7 @@ mod tests {
     #[test]
     fn a_registered_name_that_is_a_link_to_its_image_is_not_reported() {
         let (dir, mut conn, root) = database();
-        let id = ulid::Ulid::new();
+        let id = ulid::Ulid::generate();
         let relative = save_test_image(&mut conn, &root, id, at(2026, 7, 30), 91);
         let registered = root.join(&relative);
         let moved = dir.path().join("moved.webp");
@@ -2254,7 +2254,7 @@ mod tests {
     #[test]
     fn a_registered_name_held_by_a_directory_is_reported() {
         let (_dir, mut conn, root) = database();
-        let id = ulid::Ulid::new();
+        let id = ulid::Ulid::generate();
         let relative = save_test_image(&mut conn, &root, id, at(2026, 7, 30), 92);
         let registered = root.join(&relative);
         std::fs::remove_file(&registered).expect("the image should be removable");
@@ -2270,7 +2270,7 @@ mod tests {
     #[test]
     fn saving_again_over_a_row_whose_file_is_gone_leaves_the_row_and_no_new_file() {
         let (_dir, mut conn, root) = database();
-        let id = ulid::Ulid::new();
+        let id = ulid::Ulid::generate();
         let taken_at = at(2026, 7, 30);
         let relative = save_test_image(&mut conn, &root, id, taken_at, 91);
         let path = root.join(&relative);
@@ -2319,7 +2319,7 @@ mod tests {
     #[test]
     fn a_failed_rename_leaves_no_temporary_behind() {
         let (_dir, mut conn, root) = database();
-        let id = ulid::Ulid::new();
+        let id = ulid::Ulid::generate();
         let taken_at = at(2026, 7, 30);
         insert_observation(&conn, id, taken_at);
         let destination = root.join(super::relative_path(id, taken_at));

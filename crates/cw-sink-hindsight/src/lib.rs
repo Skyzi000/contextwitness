@@ -67,6 +67,45 @@ impl Credentials {
         }
     }
 
+    /// Write the URL and token that [`load`](Self::load) reads, creating `~/.hindsight` when it is
+    /// missing, and answer the file they landed in. Any other key in that file is kept as it was:
+    /// this owns two of them and cannot know what wrote the rest.
+    ///
+    /// The environment is not touched, so `CONTEXTWITNESS_HINDSIGHT_URL` and
+    /// `CONTEXTWITNESS_HINDSIGHT_TOKEN` still outrank whatever this writes.
+    pub fn save(api_url: &str, token: &str) -> Result<PathBuf, CredentialsError> {
+        let directory = dirs::home_dir()
+            .ok_or(CredentialsError::NoHome)?
+            .join(".hindsight");
+        std::fs::create_dir_all(&directory).map_err(|source| CredentialsError::Io {
+            path: directory.clone(),
+            source,
+        })?;
+        let path = directory.join("contextwitness.json");
+        // Deserialized as a map rather than a `Value`, so a file holding anything but a JSON object
+        // is refused as the parse error it is instead of needing an error of its own.
+        let mut document: Map<String, Value> = match std::fs::read_to_string(&path) {
+            Ok(text) => serde_json::from_str(&text).map_err(|source| CredentialsError::Parse {
+                path: path.clone(),
+                source,
+            })?,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => Map::new(),
+            Err(source) => return Err(CredentialsError::Io { path, source }),
+        };
+        document.insert("hindsightApiUrl".to_owned(), api_url.into());
+        document.insert("hindsightApiToken".to_owned(), token.into());
+
+        // `Value`'s own `Display`, because serializing a map of strings has no failure to report.
+        std::fs::write(&path, format!("{}\n", Value::Object(document))).map_err(|source| {
+            CredentialsError::Io {
+                path: path.clone(),
+                source,
+            }
+        })?;
+
+        Ok(path)
+    }
+
     pub fn api_url(&self) -> &str {
         &self.api_url
     }

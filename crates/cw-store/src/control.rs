@@ -423,7 +423,7 @@ mod tests {
         set_pause(
             &mut conn,
             Pause::Until(deadline),
-            ulid::Ulid::new(),
+            ulid::Ulid::generate(),
             at(2026, 7, 30, 12, 0, 0),
         )
         .expect("the deadline pause should be stored");
@@ -441,7 +441,7 @@ mod tests {
         set_pause(
             &mut conn,
             Pause::Indefinite,
-            ulid::Ulid::new(),
+            ulid::Ulid::generate(),
             at(2026, 7, 30, 12, 0, 0),
         )
         .expect("the endless pause should be stored");
@@ -458,12 +458,12 @@ mod tests {
         set_pause(
             &mut conn,
             Pause::Indefinite,
-            ulid::Ulid::new(),
+            ulid::Ulid::generate(),
             at(2026, 7, 30, 12, 0, 0),
         )
         .expect("the endless pause should be stored");
 
-        resume(&mut conn, ulid::Ulid::new(), at(2026, 7, 30, 12, 1, 0))
+        resume(&mut conn, ulid::Ulid::generate(), at(2026, 7, 30, 12, 1, 0))
             .expect("resuming should succeed");
 
         assert_eq!(
@@ -476,7 +476,7 @@ mod tests {
     fn resuming_something_already_running_is_not_an_error() {
         let (_dir, mut conn) = database();
 
-        resume(&mut conn, ulid::Ulid::new(), at(2026, 7, 30, 12, 0, 0))
+        resume(&mut conn, ulid::Ulid::generate(), at(2026, 7, 30, 12, 0, 0))
             .expect("resuming an unpaused capture should succeed");
 
         assert_eq!(
@@ -544,14 +544,14 @@ mod tests {
         set_pause(
             &mut conn,
             Pause::Until(first_deadline),
-            ulid::Ulid::new(),
+            ulid::Ulid::generate(),
             at(2026, 7, 30, 12, 0, 0),
         )
         .expect("the deadline pause should be stored");
         set_pause(
             &mut conn,
             Pause::Indefinite,
-            ulid::Ulid::new(),
+            ulid::Ulid::generate(),
             at(2026, 7, 30, 12, 1, 0),
         )
         .expect("the endless pause should replace the deadline");
@@ -566,7 +566,7 @@ mod tests {
         set_pause(
             &mut conn,
             Pause::Until(second_deadline),
-            ulid::Ulid::new(),
+            ulid::Ulid::generate(),
             at(2026, 7, 30, 12, 2, 0),
         )
         .expect("the deadline pause should replace the endless pause");
@@ -581,7 +581,7 @@ mod tests {
     #[test]
     fn a_pause_that_cannot_be_recorded_changes_nothing() {
         let (_dir, mut conn) = database();
-        let event_id = ulid::Ulid::new();
+        let event_id = ulid::Ulid::generate();
 
         set_pause(
             &mut conn,
@@ -618,7 +618,7 @@ mod tests {
     #[test]
     fn a_resume_that_cannot_be_recorded_changes_nothing() {
         let (_dir, mut conn) = database();
-        let event_id = ulid::Ulid::new();
+        let event_id = ulid::Ulid::generate();
 
         set_pause(
             &mut conn,
@@ -714,7 +714,7 @@ mod tests {
         set_pause(
             &mut conn,
             Pause::Until(deadline),
-            ulid::Ulid::new(),
+            ulid::Ulid::generate(),
             at(2026, 7, 30, 12, 0, 0),
         )
         .expect("the past deadline should be stored");
@@ -864,7 +864,7 @@ mod tests {
         let (_dir, conn) = database();
         let t = at(2026, 7, 30, 12, 34, 56);
         let event = ControlEvent {
-            id: ulid::Ulid::new(),
+            id: ulid::Ulid::generate(),
             kind: EventKind::BlacklistSkip,
             at: t,
             detail: None,
@@ -945,7 +945,7 @@ mod tests {
     fn the_last_event_the_schema_can_spell_is_inside_a_window_that_finds_it() {
         let (_dir, conn) = database();
         let event = ControlEvent {
-            id: ulid::Ulid::new(),
+            id: ulid::Ulid::generate(),
             kind: EventKind::BlacklistSkip,
             at: at(9999, 12, 31, 23, 59, 59) + TimeDelta::nanoseconds(999_999_999),
             detail: None,
@@ -971,7 +971,7 @@ mod tests {
     #[test]
     fn an_event_kind_this_build_does_not_know_is_refused() {
         let (_dir, conn) = database();
-        let id = ulid::Ulid::new().to_string();
+        let id = ulid::Ulid::generate().to_string();
         let at = at(2026, 7, 30, 12, 0, 0);
 
         // Public functions cannot produce this kind, so write it with plain SQL.

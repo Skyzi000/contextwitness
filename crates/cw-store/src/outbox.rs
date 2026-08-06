@@ -20,6 +20,7 @@ const MARK_FAILED: &str = "UPDATE outbox \
      SET state = 'failed', attempts = ?2, next_attempt_at = ?3, last_error = ?4 \
      WHERE episode_id = ?1";
 const REQUEUE_DELIVERING: &str = "UPDATE outbox SET state = 'pending' WHERE state = 'delivering'";
+const COUNT_BY_STATE: &str = "SELECT state, count(*) FROM outbox GROUP BY state ORDER BY state";
 
 /// An entry whose turn has come, carrying the episode snapshot the delivery worker sends.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -154,6 +155,27 @@ pub fn mark_failed(
 pub fn requeue_delivering(conn: &rusqlite::Connection) -> Result<usize, StoreError> {
     conn.execute(REQUEUE_DELIVERING, [])
         .map_err(|source| StoreError::Sql { source })
+}
+
+/// How many entries sit in each state, in state order, for `contextwitness status`. A state is
+/// reported as its row spells it rather than checked against the four this build writes: the
+/// answer is a report, and a value nobody here writes is the one worth seeing.
+pub fn counts_by_state(conn: &rusqlite::Connection) -> Result<Vec<(String, i64)>, StoreError> {
+    let mut statement = conn
+        .prepare(COUNT_BY_STATE)
+        .map_err(|source| StoreError::Sql { source })?;
+    let mut rows = statement
+        .query([])
+        .map_err(|source| StoreError::Sql { source })?;
+    let mut counts = Vec::new();
+
+    while let Some(row) = rows.next().map_err(|source| StoreError::Sql { source })? {
+        let state = row.get(0).map_err(|source| StoreError::Sql { source })?;
+        let count = row.get(1).map_err(|source| StoreError::Sql { source })?;
+        counts.push((state, count));
+    }
+
+    Ok(counts)
 }
 
 fn from_row(row: &rusqlite::Row<'_>) -> Result<Due, StoreError> {

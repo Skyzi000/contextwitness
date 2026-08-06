@@ -85,7 +85,7 @@ impl Observation {
         observed_at: chrono::DateTime<chrono::Utc>,
     ) -> Observation {
         Self {
-            id: ulid::Ulid::new(),
+            id: ulid::Ulid::generate(),
             observed_at,
             duration_ms: None,
             schema_version: CURRENT_SCHEMA_VERSION,
