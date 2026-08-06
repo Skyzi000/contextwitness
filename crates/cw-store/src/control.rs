@@ -942,7 +942,7 @@ mod tests {
     }
 
     #[test]
-    fn every_event_the_schema_can_store_is_inside_a_window_it_can_search() {
+    fn the_last_event_the_schema_can_spell_is_inside_a_window_that_finds_it() {
         let (_dir, conn) = database();
         let event = ControlEvent {
             id: ulid::Ulid::new(),
