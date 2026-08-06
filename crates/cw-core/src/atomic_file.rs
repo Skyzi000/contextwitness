@@ -495,6 +495,10 @@ mod tests {
             .expect("a name a directory holds should not stop the publish");
 
         assert_ne!(temporary, planted);
+        assert!(
+            planted.is_dir(),
+            "the planted directory should still be there"
+        );
         assert!(temporary.is_file());
 
         drop(file);
