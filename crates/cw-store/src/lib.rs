@@ -50,9 +50,11 @@ pub enum StoreError {
         /// Journal mode the database is actually in.
         actual: String,
     },
-    /// The migration transaction failed: taking its write lock, reading or writing the markers
-    /// it decides on, applying a script, or committing. A database already at the current schema
-    /// version still takes that lock, so this can report contention with no script having run.
+    /// The migration transaction failed: taking its write lock, reading the schema version it
+    /// decides by, writing either marker, applying a script, or committing. The ownership check
+    /// runs inside the same transaction but answers as `Open` or `ForeignDatabase`, never this.
+    /// A database already at the current schema version still takes that lock, so this can
+    /// report contention with no script having run.
     #[error("failed to migrate database {path}: {source}")]
     Migrate {
         /// Database file path.
