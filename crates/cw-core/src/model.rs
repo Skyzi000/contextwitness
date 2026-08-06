@@ -27,7 +27,8 @@ pub struct ScreenPayload {
 #[derive(Debug, Clone, PartialEq)]
 pub enum SourcePayload {
     Screen(ScreenPayload),
-    /// Unknown source rows must round-trip untouched so an old binary never corrupts a newer DB.
+    /// A row whose source this build does not know is kept as it was read, so a window holding
+    /// one still builds its episode instead of failing the whole read.
     Unknown {
         source: String,
         raw: serde_json::Value,
