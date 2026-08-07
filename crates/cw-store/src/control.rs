@@ -16,7 +16,7 @@ pub enum Pause {
 /// A moment `contextwitness status` reports on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HealthKey {
-    /// When the capture loop last ran.
+    /// When the last completed capture pass started.
     LastTick,
     /// When a frame was last stored.
     LastCapture,

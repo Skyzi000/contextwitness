@@ -34,9 +34,8 @@ const DATA_DIR_KEY: &str = "data_dir";
 const STATUS_LABEL: usize = 14;
 
 /// The name `run` claims for as long as it runs. `Local\` is the session namespace on purpose: one
-/// collector per interactive session is the line worth drawing. A daemon in another session writes
-/// to that user's own data directory, and with WAL under it a second one is wasteful rather than
-/// corrupting.
+/// collector per interactive session is the line worth drawing. A daemon in another session is a
+/// second, unarbitrated writer for episode closure; v1 does not arbitrate those writers.
 const INSTANCE_MUTEX: &str = "Local\\ContextWitness";
 
 /// What the process ends with when a panic takes it down: the code Rust's own runtime uses, so
@@ -527,6 +526,9 @@ fn capture_once(wgc: bool) -> Result<(), Failure> {
     // Empty, so every monitor counts as changed: a single pass has nothing to compare against, and
     // asking for one means asking for what is on screen now.
     let mut previous = std::collections::HashMap::new();
+    // One map across the retries below, so a monitor whose save keeps failing is reported once for
+    // the invocation rather than once per retry.
+    let mut save_failed = std::collections::HashMap::new();
     let mut stored = capture::pass(
         &mut capture,
         &ocr,
@@ -534,6 +536,7 @@ fn capture_once(wgc: bool) -> Result<(), Failure> {
         &paths,
         &config,
         &mut previous,
+        &mut save_failed,
         None,
     )?;
     // WGC sessions deliver their first frame from a callback thread, and each monitor's arrives on
@@ -567,13 +570,17 @@ fn capture_once(wgc: bool) -> Result<(), Failure> {
                 &paths,
                 &config,
                 &mut previous,
+                &mut save_failed,
                 (!expected.is_empty()).then_some(&missing),
             )?);
         }
 
         let missing: Vec<&str> = expected
             .iter()
-            .filter(|id| !stored.iter().any(|frame| &frame.monitor_id == *id))
+            .filter(|id| {
+                !stored.iter().any(|frame| &frame.monitor_id == *id)
+                    && !save_failed.contains_key(*id)
+            })
             .map(String::as_str)
             .collect();
         // Printed before the frames, because the frames alone read as a complete answer. Monitor
@@ -590,7 +597,7 @@ fn capture_once(wgc: bool) -> Result<(), Failure> {
         }
     }
 
-    if stored.is_empty() {
+    if stored.is_empty() && save_failed.is_empty() {
         println!(
             "nothing was stored: the privacy gate refused this moment, or no monitor answered."
         );
@@ -605,6 +612,14 @@ fn capture_once(wgc: bool) -> Result<(), Failure> {
             frame.text_chars,
             frame.relative_path
         );
+    }
+    if !save_failed.is_empty() {
+        let mut lines: Vec<String> = save_failed
+            .into_iter()
+            .map(|(monitor_id, message)| format!("{monitor_id}: {message}"))
+            .collect();
+        lines.sort();
+        return Err(format!("saving failed on {}", lines.join("; ")).into());
     }
 
     Ok(())

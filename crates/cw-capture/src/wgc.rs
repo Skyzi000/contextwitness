@@ -17,7 +17,9 @@ use windows_capture::settings::{
     MinimumUpdateIntervalSettings, SecondaryWindowSettings, Settings,
 };
 
-use crate::{CaptureError, Capturer, Frame, MonitorInfo, Recoverable, enumerate_monitors};
+use crate::{
+    CaptureError, Capturer, Frame, MonitorInfo, Recoverable, STALE_SHOT_SECONDS, enumerate_monitors,
+};
 
 /// WGC pushes a frame per screen update, up to the refresh rate, and every one of them costs a
 /// full-screen readback. The tick only ever reads the newest, so the callback drops whatever
@@ -65,9 +67,10 @@ impl WgcCapturer {
             .retain(|id, _| monitors.iter().any(|monitor| &monitor.id == id));
     }
 
-    /// Empty every mailbox and refuse everything captured up to now. The callback threads keep
-    /// filling mailboxes while the daemon's privacy gate is closed, so without this the first tick
-    /// after the gate reopens could hand over a screen the gate existed to keep out.
+    /// Empty every mailbox and refuse every shot whose callback began up to now. The callback
+    /// threads keep filling mailboxes while the daemon's privacy gate is closed, so without this
+    /// the first tick after the gate reopens could hand over a screen the gate existed to keep
+    /// out.
     pub(crate) fn discard_pending(&mut self) {
         // Stamped before the mailboxes are emptied so that a frame landing in between is covered by
         // the watermark rather than slipping past both.
@@ -127,7 +130,7 @@ struct Shot {
     bgra: Vec<u8>,
     /// Stamped in the callback: the mailbox holds a frame until the next tick reads it, and that
     /// wait is not part of when the screen looked like this. This is the timestamp the record
-    /// keeps; nothing decides whether the frame may be handed over.
+    /// keeps.
     captured_at: chrono::DateTime<chrono::Utc>,
     /// The same moment on the monotonic clock, and the only one a discard boundary can be drawn
     /// against: a wall clock steps backwards on correction, so a stamp taken after the boundary can
@@ -178,8 +181,8 @@ impl Session {
         })
     }
 
-    /// Guarantees, with `discard_before`, that no frame captured before the most recent discard is
-    /// ever returned.
+    /// Guarantees, with `discard_before`, that no frame whose callback began before the most
+    /// recent discard is ever returned.
     fn capture(
         &mut self,
         monitor_id: &str,
@@ -303,8 +306,38 @@ impl GraphicsCaptureApiHandler for Sink {
             pixel[3] = 255;
         }
 
-        self.last_readback = Some(Instant::now());
-        *lock(&self.mailbox) = Some(Shot {
+        // Keep the freshness verdict and the post atomic with respect to a pull. A callback frozen
+        // (for example, across a suspend) before it acquires the guard is re-judged at its actual
+        // post time and refused when stale. One frozen inside the guard blocks the next pull until
+        // its shot lands, so that shot is stored by the pass that precedes the next mark. A
+        // not-yet-stored stamp can therefore lie at most `STALE_SHOT_SECONDS` below the mark; it
+        // need not be above it.
+        // `Instant` (QPC) is the basis for elapsed time including standby and hibernate; UTC is an
+        // additional guard for wall-clock advancement. Backward wall-clock corrections are outside
+        // the guarantee.
+        let mut mailbox = lock(&self.mailbox);
+        let now = Instant::now();
+        let now_utc = chrono::Utc::now();
+        let stale_after = Duration::from_secs(STALE_SHOT_SECONDS);
+        let wall_elapsed = if now_utc >= captured_at {
+            now_utc - captured_at
+        } else {
+            chrono::TimeDelta::zero()
+        };
+        let stale = now.duration_since(arrived) > stale_after
+            || wall_elapsed > chrono::TimeDelta::seconds(STALE_SHOT_SECONDS as i64);
+        if stale {
+            drop(mailbox);
+            // The handler error ends this capture thread. The next pull sees `AccessLost` and
+            // removes the session; a later pull opens a fresh session and retries capture.
+            return Err(format!(
+                "stale WGC callback exceeded the {STALE_SHOT_SECONDS}-second post allowance"
+            )
+            .into());
+        }
+
+        self.last_readback = Some(now);
+        *mailbox = Some(Shot {
             width,
             height,
             bgra,
@@ -315,8 +348,8 @@ impl GraphicsCaptureApiHandler for Sink {
     }
 }
 
-/// Nothing but a move happens under this lock, so a poisoned one still holds a usable mailbox and
-/// panicking here would take the capture thread with it.
+/// A poisoned guard still holds a usable mailbox; panicking here would take the capture thread with
+/// it and prevent the tick thread from recovering the value.
 fn lock(mailbox: &Mailbox) -> std::sync::MutexGuard<'_, Option<Shot>> {
     mailbox.lock().unwrap_or_else(PoisonError::into_inner)
 }

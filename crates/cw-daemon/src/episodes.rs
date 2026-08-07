@@ -9,7 +9,10 @@ use tracing::{debug, error, info};
 const SOURCE: &str = "screen";
 /// A window is only built this long after it closed (plan Task 21): the tick that observed its
 /// last instants may still be writing them, and an episode is a snapshot that is not rebuilt.
+/// `close_due` subtracts it from two clocks — the wall clock, and the writer's last tick — since
+/// only the second of them stops when the writer does.
 const GRACE_SECONDS: i64 = 60;
+const _: () = assert!((cw_capture::STALE_SHOT_SECONDS as i64) < GRACE_SECONDS);
 /// How often the closer looks. A window closes every `window_minutes`, so this only decides how
 /// much of the grace period is overshot.
 const POLL: std::time::Duration = std::time::Duration::from_secs(30);
@@ -51,6 +54,15 @@ pub fn close_due(
     window_minutes: u32,
     now: DateTime<Utc>,
 ) -> Result<usize, Box<dyn std::error::Error>> {
+    let Some(last_tick) =
+        cw_store::control::get_health(conn, cw_store::control::HealthKey::LastTick)?
+    else {
+        // No mark has ever been published for this database: it may be a capture-once-seeded
+        // store, or this daemon may not have finished its first pass. There is no bound on what
+        // is still being persisted, so wall-clock grace alone cannot close a window. The first
+        // safe mark arrives when the first pass completes.
+        return Ok(0);
+    };
     if cursor.is_none() {
         *cursor = resume_point(conn, window_minutes)?;
     }
@@ -59,7 +71,14 @@ pub fn close_due(
         return Ok(0);
     };
     let window = TimeDelta::minutes(i64::from(window_minutes));
-    let deadline = now - TimeDelta::seconds(GRACE_SECONDS);
+    // The mark is the start time of the last completed pass, written after the pass. A stamp not
+    // yet stored can lie at most `STALE_SHOT_SECONDS` below the mark: the capture side refuses to
+    // post anything older and restarts the session instead. The compile-time assert beside
+    // `GRACE_SECONDS` keeps that allowance inside this grace. The mark covers this daemon's writer
+    // only; a concurrent `capture-once`, a daemon in another Windows session, and backward
+    // wall-clock corrections are outside its guarantee.
+    let deadline = (now - TimeDelta::seconds(GRACE_SECONDS))
+        .min(last_tick - TimeDelta::seconds(GRACE_SECONDS));
     let mut registered = 0;
 
     while *start + window <= deadline {
@@ -105,12 +124,28 @@ fn resume_point(
     conn: &rusqlite::Connection,
     window_minutes: u32,
 ) -> Result<Cursor, Box<dyn std::error::Error>> {
-    // Taken through `window_start` rather than used as it stands: a `window_minutes` changed since
-    // that episode was written leaves an end that is not a boundary of the current length.
+    // A `window_minutes` changed since that episode was written leaves an end that is not a
+    // boundary of the current length, and `window_start` alone straightens it towards the side
+    // that overlaps what was already registered: the overlapping window would carry those same
+    // observations a second time under a different `document_id`, and the UNIQUE reads the id
+    // only, so nothing objects. Resuming at the far boundary instead leaves the remainder of the
+    // straddled window unregistered, which the reader sees as a gap rather than as two episodes it
+    // has no way to tell apart. An end already on a boundary of the new length costs nothing.
     if let Some(end) = cw_store::episodes::latest_end(conn, SOURCE)? {
-        return Ok(Some(cw_core::episode::window_start(end, window_minutes)));
+        let aligned = cw_core::episode::window_start(end, window_minutes);
+        if aligned < end {
+            let next = aligned + TimeDelta::minutes(i64::from(window_minutes));
+            info!(
+                from = %end,
+                until = %next,
+                "window length changed; this span is never registered rather than registered twice"
+            );
+            return Ok(Some(next));
+        }
+        return Ok(Some(aligned));
     }
 
+    // No episode has ever been registered out of this database, so there is no window to land beside.
     Ok(earliest_observation(conn)?.map(|at| cw_core::episode::window_start(at, window_minutes)))
 }
 

@@ -26,6 +26,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::BOOL;
 
+/// A shot whose callback has dwelt longer than this between stamp and post is refused and the
+/// session is restarted. This must stay under the episode closer's 60-second grace, which
+/// `cw-daemon` pins with a compile-time assert.
+pub const STALE_SHOT_SECONDS: u64 = 30;
+
 /// One captured monitor frame, tightly packed BGRA8, alpha forced to 255.
 pub struct Frame {
     pub monitor_id: String,

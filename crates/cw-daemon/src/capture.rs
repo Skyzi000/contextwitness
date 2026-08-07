@@ -9,8 +9,8 @@ use cw_core::privacy::CaptureDecision;
 use cw_store::control::{ControlEvent, EventKind, HealthKey};
 use tracing::{debug, error, info};
 
-/// `last_tick_at` is written at most this often (design §7): the tick runs every couple of
-/// seconds and the value it writes is only read by `status`.
+/// `last_tick_at` is written at most this often (design §7): a stale mark only ever holds
+/// episode closure back, never moves it ahead.
 const HEALTH_TICK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Run the capture loop on this thread until the process ends.
@@ -26,6 +26,9 @@ pub fn run(
     let mut previous: HashMap<String, Thumbnail> = HashMap::new();
     let mut health_written: Option<std::time::Instant> = None;
     let mut threshold_warned: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Outlives the tick for the same reason `threshold_warned` does: a monitor whose save fails the
+    // same way every tick would otherwise write the same line every couple of seconds forever.
+    let mut save_failed: HashMap<String, String> = HashMap::new();
 
     loop {
         let started = std::time::Instant::now();
@@ -38,6 +41,7 @@ pub fn run(
             &mut previous,
             &mut health_written,
             &mut threshold_warned,
+            &mut save_failed,
         ) {
             // A tick can die before it judged the pause or the privacy gate — `mark_tick` and
             // `get_pause` both talk to the store — and the fallback's callbacks kept writing
@@ -78,8 +82,9 @@ fn tick(
     previous: &mut HashMap<String, Thumbnail>,
     health_written: &mut Option<std::time::Instant>,
     threshold_warned: &mut std::collections::HashSet<String>,
+    save_failed: &mut HashMap<String, String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    mark_tick(conn, health_written)?;
+    let started = chrono::Utc::now();
 
     if let Some(pause) = cw_store::control::get_pause(conn)? {
         let paused = match pause {
@@ -92,6 +97,7 @@ fn tick(
             // of it. (A frame from the gap between the last paused tick and the actual lift is
             // still accepted — the ceiling is one tick interval.)
             capture.discard_pending();
+            mark_tick(conn, health_written, started)?;
             debug!("capture is paused");
             return Ok(());
         }
@@ -108,6 +114,9 @@ fn tick(
         // per monitor: unplugging it clears the entry, so plugging it back in — possibly at a new
         // resolution — is judged afresh.
         threshold_warned.retain(|id| monitors.iter().any(|monitor| &monitor.id == id));
+        // Same reasoning as the two above: an unplugged monitor's last failure must not be held for
+        // the life of the process, and plugging it back in is judged afresh.
+        save_failed.retain(|id, _| monitors.iter().any(|monitor| &monitor.id == id));
         for monitor in &monitors {
             if !cw_core::change::change_threshold_is_reachable(
                 monitor.width,
@@ -134,7 +143,16 @@ fn tick(
         }
     }
 
-    for stored in pass(capture, ocr, conn, paths, config, previous, None)? {
+    for stored in pass(
+        capture,
+        ocr,
+        conn,
+        paths,
+        config,
+        previous,
+        save_failed,
+        None,
+    )? {
         info!(
             monitor = %stored.monitor_id,
             width = stored.width,
@@ -146,6 +164,13 @@ fn tick(
         );
     }
 
+    // When this mark becomes readable, every shot the pass pulled has been stored or refused. A
+    // shot that lands later can stamp at most `STALE_SHOT_SECONDS` below the mark: a callback that
+    // stamped just before `started` may still post within that allowance. The capture side refuses
+    // anything older, so the closer's grace covers what does land. An error return skips the mark,
+    // which stalls the closer — the safe direction.
+    mark_tick(conn, health_written, started)?;
+
     Ok(())
 }
 
@@ -154,6 +179,9 @@ fn tick(
 /// that, and `capture-once` is a user asking for this pass in particular. `only` narrows the pass
 /// to those monitor ids: `capture-once`'s retries ask again about the monitors that have not
 /// answered, and a monitor that already has must not gain a second frame from the same invocation.
+/// `save_failed` holds the last save error reported per monitor, so a failure that repeats is only
+/// news the first time.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn pass(
     capture: &mut cw_capture::CaptureEngine,
     ocr: &dyn cw_ocr::OcrEngine,
@@ -161,6 +189,7 @@ pub(crate) fn pass(
     paths: &DataPaths,
     config: &Config,
     previous: &mut HashMap<String, Thumbnail>,
+    save_failed: &mut HashMap<String, String>,
     only: Option<&std::collections::HashSet<String>>,
 ) -> Result<Vec<Stored>, Box<dyn std::error::Error>> {
     let foreground = cw_capture::foreground();
@@ -263,7 +292,7 @@ pub(crate) fn pass(
         // One transaction for the observation row and the image row: committed apart, a crash
         // between them would permanently leave an observation advertising a path no file will
         // ever answer to — the startup sweep reconciles files and image rows, not observations.
-        let stored = cw_store::images::save_with_observation(
+        let stored = match cw_store::images::save_with_observation(
             conn,
             &paths.images(),
             &observation,
@@ -272,7 +301,30 @@ pub(crate) fn pass(
             frame.height,
             f32::from(config.capture.webp_quality),
             captured_at,
-        )?;
+        ) {
+            Ok(stored) => {
+                // Whatever it was, it is over; the next failure is news again.
+                save_failed.remove(&frame.monitor_id);
+                stored
+            }
+            // Isolated to the one monitor rather than ending the pass: a monitor that fails
+            // deterministically — a frame wider than WebP's 16,383px limit, say — sits at a fixed
+            // place in the enumeration, so ending the pass on it starves every monitor behind it
+            // for as long as it stays plugged in, and collecting them all is the requirement.
+            Err(error) => {
+                let message = error.to_string();
+                // Once per distinct message: a deterministic failure recurs every tick — seconds
+                // apart — and would otherwise fill the log with one repeated line. A different
+                // message, or a success in between, is a new thing to say.
+                if save_failed.get(&frame.monitor_id) != Some(&message) {
+                    error!(monitor = %frame.monitor_id, "failed to store frame: {message}");
+                    save_failed.insert(frame.monitor_id.clone(), message);
+                }
+                // The frame is lost on both backends. Keeping the baseline where it was only keeps
+                // a later desktop update judgeable as a change.
+                continue;
+            }
+        };
         previous.insert(frame.monitor_id.clone(), thumbnail);
         stored_at = Some(captured_at);
         stored_frames.push(Stored {
@@ -296,12 +348,13 @@ pub(crate) fn pass(
 fn mark_tick(
     conn: &rusqlite::Connection,
     health_written: &mut Option<std::time::Instant>,
+    at: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let now = std::time::Instant::now();
     if health_written.is_some_and(|last| now.duration_since(last) < HEALTH_TICK_INTERVAL) {
         return Ok(());
     }
-    cw_store::control::set_health(conn, HealthKey::LastTick, chrono::Utc::now())?;
+    cw_store::control::set_health(conn, HealthKey::LastTick, at)?;
     *health_written = Some(now);
 
     Ok(())
