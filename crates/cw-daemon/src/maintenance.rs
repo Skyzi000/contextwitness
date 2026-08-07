@@ -34,9 +34,11 @@ pub fn run(mut conn: rusqlite::Connection, paths: DataPaths, config: Config) -> 
 }
 
 /// Collect image files a previous run renamed into place but never registered, and report rows
-/// whose file is gone. Startup only: while a tick is saving, an unregistered file is indistinguish-
-/// able from an orphan.
-pub fn sweep_orphans(conn: &rusqlite::Connection, paths: &DataPaths) {
+/// whose file is gone. Still a startup pass, but no longer only by convention: the judgement and
+/// removal inside hold the store's write lock, so a saver in another process — a second session's
+/// daemon, a concurrent `capture-once` — cannot have a file taken between its rename and its
+/// commit.
+pub fn sweep_orphans(conn: &mut rusqlite::Connection, paths: &DataPaths) {
     match cw_store::images::sweep_orphan_files(conn, &paths.images()) {
         Ok(0) => {}
         Ok(removed) => info!(removed, "collected unregistered image files"),

@@ -166,7 +166,23 @@ fn deliver_batch(
                 // The message is the sink's, which keeps the token and the response body — which
                 // would echo screen text back — out of what is stored and logged.
                 let message = error.to_string();
-                let retry = if error.is_retryable() {
+                // A 404 says the bank is gone from under a gate that has already opened, so every
+                // retain answers the same until it is back. The gate shuts so the next pass runs
+                // `ensure_bank`, which creates a missing bank, and a further ensure failure rides
+                // the gate's own ladder — `attempts` is left where it is, so a bank that keeps
+                // disappearing climbs that ladder rather than restarting it. The episode backs off
+                // rather than being condemned, for the reason the sink records for 401 and 403: the
+                // bank's existence is configuration state, repairable while the daemon runs, and an
+                // episode has to outlive the gap to be there when the repair lands.
+                let retry = if error.is_bank_missing() {
+                    bank.ready = false;
+                    bank.not_before = None;
+                    info!(
+                        bank = %config.hindsight.bank_id,
+                        "hindsight bank is missing, so the next pass checks it again"
+                    );
+                    Retry::Backoff
+                } else if error.is_retryable() {
                     error
                         .retry_after()
                         .and_then(|after| TimeDelta::from_std(after).ok())

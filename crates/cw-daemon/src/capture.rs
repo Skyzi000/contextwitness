@@ -39,6 +39,11 @@ pub fn run(
             &mut health_written,
             &mut threshold_warned,
         ) {
+            // A tick can die before it judged the pause or the privacy gate — `mark_tick` and
+            // `get_pause` both talk to the store — and the fallback's callbacks kept writing
+            // frames the whole time. Failing closed costs at most one frame on an errored tick;
+            // failing open shows a screen the gate may have been refusing.
+            capture.discard_pending();
             error!("tick failed: {error}");
         }
         // One tick at a time, and an overrun coalesces into a single immediate rerun rather than a
@@ -129,7 +134,7 @@ fn tick(
         }
     }
 
-    for stored in pass(capture, ocr, conn, paths, config, previous)? {
+    for stored in pass(capture, ocr, conn, paths, config, previous, None)? {
         info!(
             monitor = %stored.monitor_id,
             width = stored.width,
@@ -146,7 +151,9 @@ fn tick(
 
 /// Capture every monitor once: the privacy gate, change detection against `previous`, OCR, and the
 /// observation and image rows for whatever changed. The pause is not consulted here — `tick` owns
-/// that, and `capture-once` is a user asking for this pass in particular.
+/// that, and `capture-once` is a user asking for this pass in particular. `only` narrows the pass
+/// to those monitor ids: `capture-once`'s retries ask again about the monitors that have not
+/// answered, and a monitor that already has must not gain a second frame from the same invocation.
 pub(crate) fn pass(
     capture: &mut cw_capture::CaptureEngine,
     ocr: &dyn cw_ocr::OcrEngine,
@@ -154,6 +161,7 @@ pub(crate) fn pass(
     paths: &DataPaths,
     config: &Config,
     previous: &mut HashMap<String, Thumbnail>,
+    only: Option<&std::collections::HashSet<String>>,
 ) -> Result<Vec<Stored>, Box<dyn std::error::Error>> {
     let foreground = cw_capture::foreground();
     let skip_detail = match cw_core::privacy::decide_capture(
@@ -167,6 +175,11 @@ pub(crate) fn pass(
         CaptureDecision::SkipUnknownForeground => Some("unknown foreground process".to_owned()),
     };
     if let Some(detail) = skip_detail {
+        // Same contract as the pause: a frame the fallback captured while the gate was closed
+        // must not survive into the first allowed pass. Before the audit write, because the
+        // discard cannot fail and the write can — an audit that answers SQLITE_BUSY must not
+        // leave the gated frames waiting for a tick the gate no longer refuses.
+        capture.discard_pending();
         cw_store::control::record_event(
             conn,
             &ControlEvent {
@@ -176,9 +189,6 @@ pub(crate) fn pass(
                 detail: Some(detail),
             },
         )?;
-        // Same contract as the pause: a frame the fallback captured while the gate was closed
-        // must not survive into the first allowed pass.
-        capture.discard_pending();
         // Without the process name: the audit trail is where that belongs, and the log is a file
         // this program keeps screen-derived names out of.
         debug!("tick skipped by the privacy gate");
@@ -187,6 +197,11 @@ pub(crate) fn pass(
 
     let mut changed = Vec::new();
     for frame in capture.capture_all() {
+        // Skipped before change detection, so an unwanted monitor's baseline is not advanced by a
+        // pass that was never going to store it.
+        if only.is_some_and(|wanted| !wanted.contains(&frame.monitor_id)) {
+            continue;
+        }
         let rgba = bgra_to_rgba(&frame.bgra);
         let thumbnail = Thumbnail::from_rgba(&rgba, frame.width, frame.height, frame.dpi_scale)?;
         if frame_changed(previous.get(&frame.monitor_id), &thumbnail, &config.capture) {

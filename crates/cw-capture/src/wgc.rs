@@ -251,6 +251,12 @@ impl GraphicsCaptureApiHandler for Sink {
         frame: &mut WgcFrame,
         _control: InternalCaptureControl,
     ) -> Result<(), Self::Error> {
+        // Stamped before anything else, so the stamp bounds when this frame's pixels are from. A
+        // readback takes real time, and a stamp taken after it would let a `discard_before`
+        // watermark drawn mid-readback fall between the pixels and their stamp — the shot would
+        // then outrank the watermark while showing the gated screen. What remains is the frame
+        // pool's own composition latency, one frame time.
+        let captured_at = chrono::Utc::now();
         if self
             .last_readback
             .is_some_and(|at| at.elapsed() < MIN_READBACK_INTERVAL)
@@ -293,7 +299,7 @@ impl GraphicsCaptureApiHandler for Sink {
             width,
             height,
             bgra,
-            captured_at: chrono::Utc::now(),
+            captured_at,
         });
         Ok(())
     }

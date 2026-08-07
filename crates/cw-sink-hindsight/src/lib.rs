@@ -2,6 +2,7 @@
 //! Hindsight sink functionality for ContextWitness.
 
 use std::fmt;
+use std::io::Write;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -102,12 +103,31 @@ impl Credentials {
         document.insert("hindsightApiToken".to_owned(), token.into());
 
         // `Value`'s own `Display`, because serializing a map of strings has no failure to report.
-        std::fs::write(&path, format!("{}\n", Value::Object(document))).map_err(|source| {
-            CredentialsError::Io {
-                path: path.clone(),
-                source,
-            }
-        })?;
+        let text = format!("{}\n", Value::Object(document));
+
+        // Written beside the file and renamed onto it, never into it: `fs::write` truncates first,
+        // and an interruption between the truncation and the last byte leaves a file that is no
+        // longer JSON — which this function parses before writing, so the next `setup` could not
+        // repair it either, and `load` would refuse it rather than fall back. This rename replaces
+        // the destination, which is the point here and is why it goes by name rather than through
+        // the no-clobber publish cw-core offers.
+        let (temporary, mut file) =
+            cw_core::atomic_file::create_temporary_beside(&path).map_err(|source| {
+                CredentialsError::Io {
+                    path: path.clone(),
+                    source,
+                }
+            })?;
+        let written = file
+            .write_all(text.as_bytes())
+            .and_then(|()| file.sync_all());
+        // Closed before the rename: the handle has nothing left to do, and a scratch file left
+        // behind by a failure would sit beside the credentials looking like them.
+        drop(file);
+        if let Err(source) = written.and_then(|()| std::fs::rename(&temporary, &path)) {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(CredentialsError::Io { path, source });
+        }
 
         Ok(path)
     }
@@ -171,6 +191,32 @@ pub struct RetainItem<'a> {
     pub metadata: &'a RawValue,
 }
 
+/// The retain body, borrowed rather than built as a `Value`: every expression inside `json!` goes
+/// through `serde_json::to_value`, which parses the metadata `RawValue` into a map and re-emits it
+/// — alphabetized, since `Value` maps are `BTreeMap` here — so the snapshot would not arrive as the
+/// bytes it was stored as. Serializing through `serde_json`'s writer, which is what `.json` uses,
+/// writes a `RawValue` out verbatim.
+#[derive(serde::Serialize)]
+struct RetainRequest<'a> {
+    /// Explicit: the caller must be able to read 2xx as processed, not as queued.
+    #[serde(rename = "async")]
+    is_async: bool,
+    items: [RetainItemWire<'a>; 1],
+}
+
+#[derive(serde::Serialize)]
+struct RetainItemWire<'a> {
+    content: &'a str,
+    document_id: &'a str,
+    /// Spelled by `to_rfc3339_opts(SecondsFormat::Secs, true)` at the call site, not by chrono's own
+    /// `Serialize`, which carries subsecond digits the episode window does not have.
+    timestamp: String,
+    context: &'a str,
+    metadata: &'a RawValue,
+    /// Explicit: a retry of the same document_id must replace, never append.
+    update_mode: &'static str,
+}
+
 /// Blocking Hindsight 0.8.4 client.
 pub struct HindsightClient {
     http: Client,
@@ -185,6 +231,7 @@ impl HindsightClient {
             .build()
             .map_err(|error| DeliveryError::Permanent {
                 message: format!("failed to build the HTTP client: {error}"),
+                not_found: false,
             })?;
         Ok(Self {
             http,
@@ -242,20 +289,18 @@ impl HindsightClient {
     /// Delivers one episode. `Ok` means Hindsight answered 2xx, which is delivery.
     pub fn retain(&self, bank_id: &str, item: &RetainItem<'_>) -> Result<(), DeliveryError> {
         let url = format!("{}/v1/default/banks/{bank_id}/memories", self.base_url);
-        let body = json!({
-            // Explicit: the caller must be able to read 2xx as processed, not as queued.
-            "async": false,
-            "items": [{
-                "content": item.content,
-                "document_id": item.document_id,
-                "timestamp": item.timestamp.to_rfc3339_opts(SecondsFormat::Secs, true),
-                "context": item.context,
-                "metadata": item.metadata,
-                // Explicit: a retry of the same document_id must replace, never append.
-                "update_mode": "replace",
+        let request = RetainRequest {
+            is_async: false,
+            items: [RetainItemWire {
+                content: item.content,
+                document_id: item.document_id,
+                timestamp: item.timestamp.to_rfc3339_opts(SecondsFormat::Secs, true),
+                context: item.context,
+                metadata: item.metadata,
+                update_mode: "replace",
             }],
-        });
-        check(self.send(self.http.post(&url).json(&body))?, "retain")?;
+        };
+        check(self.send(self.http.post(&url).json(&request))?, "retain")?;
         Ok(())
     }
 
@@ -284,12 +329,26 @@ pub enum DeliveryError {
         retry_after: Option<Duration>,
     },
     #[error("{message}")]
-    Permanent { message: String },
+    Permanent { message: String, not_found: bool },
 }
 
 impl DeliveryError {
     pub fn is_retryable(&self) -> bool {
         matches!(self, Self::Retryable { .. })
+    }
+
+    /// Whether the answer was 404, which this API gives when the bank is not there — deleted, or
+    /// never created at the URL the credentials now point at. That is configuration state and not a
+    /// verdict on the episode, so the caller runs `ensure_bank` again instead of condemning it.
+    /// Every other permanent failure is about the request that was sent.
+    pub fn is_bank_missing(&self) -> bool {
+        matches!(
+            self,
+            Self::Permanent {
+                not_found: true,
+                ..
+            }
+        )
     }
 
     /// The server's own `Retry-After`, when it sent one.
@@ -332,7 +391,10 @@ fn check(response: Response, operation: &str) -> Result<Response, DeliveryError>
             retry_after: retry_after(&response),
         })
     } else {
-        Err(DeliveryError::Permanent { message })
+        Err(DeliveryError::Permanent {
+            message,
+            not_found: status == StatusCode::NOT_FOUND,
+        })
     }
 }
 

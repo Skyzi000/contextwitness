@@ -383,10 +383,20 @@ pub fn delete(
 /// store puts there, because [`save`] creates real directories — is not entered, and a file
 /// beneath it is out of this walk's reach.
 ///
-/// This is a startup operation and must not run while anything is saving: a file renamed into place
-/// but not yet registered is indistinguishable from an orphan.
+/// The judgement and the removals hold the store's write lock, which is the same lock [`save`]
+/// holds across its rename and its commit, so no pass can catch a save between the two: a file
+/// renamed into place is registered by the time this reads the rows, or the save that renamed it
+/// never committed and it is an orphan. A save running now waits for this pass, or this pass waits
+/// for it. Nothing outside the database is asked to arrange that, which is what a session-local
+/// mutex could never do for a second process sharing the same data directory.
+///
+/// What that costs is the lock's holding time: it is taken for the whole judgement and every
+/// unlink, so a backlog of real orphans holds it until they are gone, and a save that waits past
+/// `busy_timeout` — 5000ms — is answered `SQLITE_BUSY`. That save fails and says so, which is one
+/// capture lost with an error naming why, and it is what this order buys: what it closes is the
+/// same store losing a picture it had registered, silently, to a sweep in another process.
 pub fn sweep_orphan_files(
-    conn: &rusqlite::Connection,
+    conn: &mut rusqlite::Connection,
     root: &std::path::Path,
 ) -> Result<usize, StoreError> {
     // Resolved once, before anything is read, so that the baseline every candidate is compared
@@ -468,10 +478,28 @@ pub fn sweep_orphan_files(
             };
         }
     };
-    let registered = registered_paths(conn)?;
+    // Outside the transaction, and before it, on purpose. The walk is the long part of this pass and
+    // holding the write lock across it would stop every save for as long as the tree takes to read,
+    // while a file listed here before a save even started costs nothing: by the time the rows are
+    // read that file is either registered — and kept — or it belongs to no committed row at all.
     let mut files = Vec::new();
     collect_files(&root, &mut files)?;
-    sweep_collected_files(&root, &registered, &files)
+    // IMMEDIATE takes the write lock at BEGIN rather than at the first write, and this transaction
+    // writes nothing: what it is for is the lock, held from before the rows are read until after the
+    // last removal. `save` renames its file into place while holding the same lock and commits
+    // before releasing it, so the two orders are the only ones there are — this pass sees the row
+    // and keeps the file, or the file was never registered by anything that committed.
+    let transaction = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|source| StoreError::Sql { source })?;
+    let registered = registered_paths(&transaction)?;
+    // Reads no rows itself, so it is called here rather than given the transaction: what it needs
+    // from this scope is that the lock is still held while it judges and removes.
+    let removed = sweep_collected_files(&root, &registered, &files)?;
+    transaction
+        .commit()
+        .map_err(|source| StoreError::Sql { source })?;
+    Ok(removed)
 }
 
 /// `root` must be spelled the way `canonicalize` answers, and `files` must have been listed by
@@ -1521,7 +1549,7 @@ mod tests {
 
         let errors = [
             delete(&mut conn, &root, id).expect_err("delete should refuse the malformed path"),
-            sweep_orphan_files(&conn, &root)
+            sweep_orphan_files(&mut conn, &root)
                 .expect_err("the sweep should refuse the malformed path"),
             orphan_rows(&conn, &root)
                 .expect_err("the orphan report should refuse the malformed path"),
@@ -1566,7 +1594,7 @@ mod tests {
         let errors = [
             delete(&mut conn, &root, id)
                 .expect_err("delete should refuse the non-canonical timestamp"),
-            sweep_orphan_files(&conn, &root)
+            sweep_orphan_files(&mut conn, &root)
                 .expect_err("the sweep should refuse the non-canonical timestamp"),
             orphan_rows(&conn, &root)
                 .expect_err("the orphan report should refuse the non-canonical timestamp"),
@@ -1625,7 +1653,7 @@ mod tests {
         delete(&mut conn, &root, id).expect("the canonical id should have nothing to delete");
 
         let errors = [
-            sweep_orphan_files(&conn, &root)
+            sweep_orphan_files(&mut conn, &root)
                 .expect_err("the sweep should refuse the non-canonical id"),
             orphan_rows(&conn, &root)
                 .expect_err("the orphan report should refuse the non-canonical id"),
@@ -1655,7 +1683,8 @@ mod tests {
         std::fs::write(&unregistered, b"not registered")
             .expect("the hand-placed file should be writable");
 
-        let removed = sweep_orphan_files(&conn, &root).expect("the orphan sweep should succeed");
+        let removed =
+            sweep_orphan_files(&mut conn, &root).expect("the orphan sweep should succeed");
 
         assert_eq!(removed, 1);
         assert!(!unregistered.exists());
@@ -1682,7 +1711,8 @@ mod tests {
         std::fs::write(&leftover, b"a temporary nothing removed")
             .expect("the leftover temporary should be writable");
 
-        let removed = sweep_orphan_files(&conn, &root).expect("the orphan sweep should succeed");
+        let removed =
+            sweep_orphan_files(&mut conn, &root).expect("the orphan sweep should succeed");
 
         assert_eq!(removed, 1);
         assert!(!leftover.exists());
@@ -1744,7 +1774,8 @@ mod tests {
             .expect("the hand-placed file should be writable");
 
         // A row whose file is missing must not make the sweep keep everything.
-        let removed = sweep_orphan_files(&conn, &root).expect("the orphan sweep should succeed");
+        let removed =
+            sweep_orphan_files(&mut conn, &root).expect("the orphan sweep should succeed");
 
         assert_eq!(removed, 1);
         assert!(!left_behind.exists());
@@ -1772,7 +1803,8 @@ mod tests {
         std::fs::rename(root.join(&relative), root.join(&differently_spelled))
             .expect("the saved image should be renameable to another case");
 
-        let removed = sweep_orphan_files(&conn, &root).expect("the orphan sweep should succeed");
+        let removed =
+            sweep_orphan_files(&mut conn, &root).expect("the orphan sweep should succeed");
 
         assert_eq!(removed, 0);
         let names: Vec<_> = std::fs::read_dir(
@@ -1812,7 +1844,8 @@ mod tests {
 
         // A file a registered row reaches only through a link must survive: deleting it would
         // leave the row pointing at a link to nothing.
-        let removed = sweep_orphan_files(&conn, &root).expect("the orphan sweep should succeed");
+        let removed =
+            sweep_orphan_files(&mut conn, &root).expect("the orphan sweep should succeed");
 
         assert_eq!(removed, 0);
         assert!(moved.exists());
@@ -1850,7 +1883,8 @@ mod tests {
 
         // The registered entry exists and answers `FilesystemLoop`, so nothing rules out that the
         // left-behind file is what that row names.
-        let removed = sweep_orphan_files(&conn, &root).expect("the orphan sweep should succeed");
+        let removed =
+            sweep_orphan_files(&mut conn, &root).expect("the orphan sweep should succeed");
 
         assert_eq!(removed, 0);
         assert!(left_behind.is_file());
@@ -1915,20 +1949,21 @@ mod tests {
 
     #[test]
     fn a_sweep_of_a_root_that_is_not_there_yet_removes_nothing() {
-        let (_dir, conn, root) = database();
+        let (_dir, mut conn, root) = database();
 
         // Every startup before the first save finds no image root at all, and that is not a failure
         // to report — it is a directory with nothing in it to sweep.
         assert!(!root.exists());
         assert_eq!(
-            sweep_orphan_files(&conn, &root).expect("a sweep before the first save should succeed"),
+            sweep_orphan_files(&mut conn, &root)
+                .expect("a sweep before the first save should succeed"),
             0
         );
     }
 
     #[test]
     fn a_root_whose_entry_is_there_and_will_not_resolve_is_reported() {
-        let (dir, conn, root) = database();
+        let (dir, mut conn, root) = database();
         let nowhere = dir.path().join("nowhere");
 
         if !junction(&root, &nowhere) {
@@ -1937,7 +1972,7 @@ mod tests {
 
         // `canonicalize` answers `NotFound` here, exactly as it does for a name that was never
         // there — but this name is taken, and every save will fail on it until someone clears it.
-        let result = sweep_orphan_files(&conn, &root);
+        let result = sweep_orphan_files(&mut conn, &root);
 
         assert!(
             matches!(result, Err(StoreError::ImageIo { .. })),
@@ -1947,20 +1982,21 @@ mod tests {
 
     #[test]
     fn a_root_under_a_directory_that_does_not_exist_yet_removes_nothing() {
-        let (dir, conn, _root) = database();
+        let (dir, mut conn, _root) = database();
         let root = dir.path().join("not-yet").join("images");
 
         // A first run whose whole data directory is still to be created. The deepest entry that
         // does exist is the temporary directory, and it is a directory, so nothing here is wrong.
         assert_eq!(
-            sweep_orphan_files(&conn, &root).expect("a sweep before the first save should succeed"),
+            sweep_orphan_files(&mut conn, &root)
+                .expect("a sweep before the first save should succeed"),
             0
         );
     }
 
     #[test]
     fn a_root_whose_parent_leads_nowhere_is_reported() {
-        let (dir, conn, _root) = database();
+        let (dir, mut conn, _root) = database();
         let parent = dir.path().join("data");
         let root = parent.join("images");
 
@@ -1971,7 +2007,7 @@ mod tests {
         // The root's own entry is absent here exactly as it is in the test above, and the two are
         // told apart by what is standing above it: a link whose target is gone, under which
         // `create_dir_all` answers `AlreadyExists` and no image can ever be written.
-        let result = sweep_orphan_files(&conn, &root);
+        let result = sweep_orphan_files(&mut conn, &root);
 
         assert!(
             matches!(result, Err(StoreError::ImageIo { .. })),
@@ -1981,14 +2017,14 @@ mod tests {
 
     #[test]
     fn a_root_the_filesystem_will_not_answer_about_is_reported() {
-        let (dir, conn, _root) = database();
+        let (dir, mut conn, _root) = database();
         // A `storage.data_dir` typed with a character Windows does not take. Both `canonicalize`
         // and `symlink_metadata` answer `InvalidFilename` here while the directory holding it is an
         // ordinary one, so nothing about this name has been shown to be absent — and it needs no
         // special privilege to arrange.
         let root = dir.path().join("im|ages");
 
-        let result = sweep_orphan_files(&conn, &root);
+        let result = sweep_orphan_files(&mut conn, &root);
 
         assert!(
             matches!(result, Err(StoreError::ImageIo { .. })),
@@ -1998,14 +2034,14 @@ mod tests {
 
     #[test]
     fn a_root_that_is_an_ordinary_file_is_reported() {
-        let (_dir, conn, root) = database();
+        let (_dir, mut conn, root) = database();
         std::fs::write(&root, b"not a directory")
             .expect("the file standing in for the image root should be writable");
 
         // The name resolves, so nothing above it is ever asked about and the walk is what fails.
         // Answering `Ok` would report a clean sweep on every startup of a store that can never hold
         // an image.
-        let result = sweep_orphan_files(&conn, &root);
+        let result = sweep_orphan_files(&mut conn, &root);
 
         assert!(
             matches!(result, Err(StoreError::ImageIo { .. })),
@@ -2015,7 +2051,7 @@ mod tests {
 
     #[test]
     fn a_relative_root_that_is_not_there_yet_removes_nothing() {
-        let (_dir, conn, _root) = database();
+        let (_dir, mut conn, _root) = database();
         // The config layer refuses a relative `storage.data_dir`, but this function takes a bare
         // path and promises nothing about where it came from. A relative spelling is the simplest
         // arrangement in which every name on the path is absent while the directory anchoring it —
@@ -2026,14 +2062,15 @@ mod tests {
         assert!(!root.exists(), "the test would say nothing if this existed");
 
         assert_eq!(
-            sweep_orphan_files(&conn, &root).expect("a relative root is simply not created yet"),
+            sweep_orphan_files(&mut conn, &root)
+                .expect("a relative root is simply not created yet"),
             0
         );
     }
 
     #[test]
     fn a_root_anchored_to_a_drive_that_is_not_there_is_reported() {
-        let (_dir, conn, _root) = database();
+        let (_dir, mut conn, _root) = database();
         // Any letter with no volume behind it. Every name on such a path answers `NotFound`, the
         // anchor included, so this is the arrangement in which running out of names is the only
         // signal there is.
@@ -2051,7 +2088,7 @@ mod tests {
             std::path::PathBuf::from(format!("{letter}:\\ContextWitness\\images")),
             std::path::PathBuf::from(format!("{letter}:ContextWitness\\images")),
         ] {
-            let result = sweep_orphan_files(&conn, &root);
+            let result = sweep_orphan_files(&mut conn, &root);
 
             assert!(
                 matches!(result, Err(StoreError::ImageIo { .. })),
@@ -2063,7 +2100,7 @@ mod tests {
 
     #[test]
     fn a_root_that_is_a_directory_no_one_may_open_is_reported() {
-        let (_dir, conn, root) = database();
+        let (_dir, mut conn, root) = database();
         std::fs::create_dir(&root).expect("the image root should be creatable");
         let Ok(user) = std::env::var("USERNAME") else {
             return;
@@ -2098,7 +2135,7 @@ mod tests {
             return;
         }
 
-        let result = sweep_orphan_files(&conn, &root);
+        let result = sweep_orphan_files(&mut conn, &root);
 
         // Nothing is dropped or restored by hand here. The temporary directory has to outlive the
         // connection that holds `db.sqlite3` open and the guard above has to run before either, and
@@ -2113,7 +2150,7 @@ mod tests {
 
     #[test]
     fn a_root_that_will_not_be_listed_is_reported() {
-        let (_dir, conn, root) = database();
+        let (_dir, mut conn, root) = database();
         std::fs::create_dir(&root).expect("the image root should be creatable");
         std::fs::write(root.join("ordinary.webp"), b"an orphan")
             .expect("the file should be writable");
@@ -2142,7 +2179,7 @@ mod tests {
             return;
         }
 
-        let result = sweep_orphan_files(&conn, &root);
+        let result = sweep_orphan_files(&mut conn, &root);
 
         assert!(
             matches!(result, Err(StoreError::ImageIo { .. })),
@@ -2152,7 +2189,7 @@ mod tests {
 
     #[test]
     fn a_directory_that_will_not_be_listed_does_not_stop_the_sweep() {
-        let (_dir, conn, root) = database();
+        let (_dir, mut conn, root) = database();
         let blocked = root.join("blocked");
         std::fs::create_dir_all(&blocked).expect("the image root should be creatable");
         let ordinary = root.join("ordinary.webp");
@@ -2180,8 +2217,8 @@ mod tests {
             return;
         }
 
-        let removed =
-            sweep_orphan_files(&conn, &root).expect("one place that will not open is not the pass");
+        let removed = sweep_orphan_files(&mut conn, &root)
+            .expect("one place that will not open is not the pass");
 
         assert_eq!(removed, 1);
         assert!(
@@ -2196,7 +2233,7 @@ mod tests {
 
     #[test]
     fn an_orphan_that_will_not_go_does_not_stop_the_others() {
-        let (_dir, conn, root) = database();
+        let (_dir, mut conn, root) = database();
         // The refused candidate sits at the root beside one removable file, with another a
         // directory deeper: the walk lists a directory's own files before it opens any directory
         // under it, so the deeper file always comes after the refusal, and a pass that stopped
@@ -2220,7 +2257,7 @@ mod tests {
         // The attribute is left set on purpose and nothing here puts it back:
         // `std::fs::remove_file` clears it and succeeds, so the temporary directory can still take
         // the file away — which is the same difference this test is about.
-        let removed = sweep_orphan_files(&conn, &root);
+        let removed = sweep_orphan_files(&mut conn, &root);
 
         assert_eq!(
             removed.expect("one file that will not go must not fail the pass"),
@@ -2244,7 +2281,7 @@ mod tests {
             .expect("the hand-placed file should be removable before the sweep");
 
         assert_eq!(
-            sweep_orphan_files(&conn, &root).expect("the orphan sweep should still succeed"),
+            sweep_orphan_files(&mut conn, &root).expect("the orphan sweep should still succeed"),
             0
         );
 

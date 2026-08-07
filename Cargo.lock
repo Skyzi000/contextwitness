@@ -483,8 +483,10 @@ name = "cw-sink-hindsight"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "cw-core",
  "dirs",
  "reqwest",
+ "serde",
  "serde_json",
  "thiserror 2.0.19",
 ]

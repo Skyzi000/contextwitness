@@ -172,7 +172,7 @@ fn daemon() -> ! {
     }
 
     let mut conn = cw_store::db::open(&paths.database()).expect("opening the database failed");
-    maintenance::sweep_orphans(&conn, &paths);
+    maintenance::sweep_orphans(&mut conn, &paths);
     match cw_store::outbox::requeue_delivering(&conn) {
         Ok(0) => {}
         // An attempt whose outcome nobody recorded: delivery is at-least-once, so it goes round
@@ -540,6 +540,7 @@ fn capture_once(wgc: bool) -> Result<(), Failure> {
         &paths,
         &config,
         &mut previous,
+        None,
     )?;
     // WGC sessions deliver their first frame from a callback thread, and each monitor's arrives on
     // its own schedule, so the first pass can find some or all of the mailboxes still empty — and
@@ -556,6 +557,15 @@ fn capture_once(wgc: bool) -> Result<(), Failure> {
         let deadline = std::time::Instant::now() + WGC_ANSWER_DEADLINE;
         while !all_answered(&stored, &expected) && std::time::Instant::now() < deadline {
             std::thread::sleep(WGC_ANSWER_RETRY);
+            // Only the monitors still unanswered: one that already stored its frame must not gain
+            // a second from the same invocation while a slow neighbor is waited out — this command
+            // promises one frame per monitor. A failed enumeration leaves no set to subtract from,
+            // so there the filter stays off and the loop keeps the weaker anything-stored contract.
+            let missing: std::collections::HashSet<String> = expected
+                .iter()
+                .filter(|id| !stored.iter().any(|frame| &frame.monitor_id == *id))
+                .cloned()
+                .collect();
             stored.extend(capture::pass(
                 &mut capture,
                 &ocr,
@@ -563,6 +573,7 @@ fn capture_once(wgc: bool) -> Result<(), Failure> {
                 &paths,
                 &config,
                 &mut previous,
+                (!expected.is_empty()).then_some(&missing),
             )?);
         }
 
