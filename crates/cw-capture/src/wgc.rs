@@ -36,9 +36,10 @@ type Control = CaptureControl<Sink, <Sink as GraphicsCaptureApiHandler>::Error>;
 pub(crate) struct WgcCapturer {
     known: Vec<(HMONITOR, MonitorInfo)>,
     sessions: HashMap<String, Session>,
-    /// Shots stamped at or before this are refused. One timestamp covers every session: a session
-    /// opened after the last discard only ever produces shots newer than it.
-    discard_before: Option<chrono::DateTime<chrono::Utc>>,
+    /// Shots stamped at or before this are refused. One stamp covers every session, and a monotonic
+    /// one covers them without qualification: a session opened after the last discard only ever
+    /// produces shots that read newer than it, whatever the wall clock is doing.
+    discard_before: Option<Instant>,
 }
 
 impl WgcCapturer {
@@ -70,7 +71,7 @@ impl WgcCapturer {
     pub(crate) fn discard_pending(&mut self) {
         // Stamped before the mailboxes are emptied so that a frame landing in between is covered by
         // the watermark rather than slipping past both.
-        self.discard_before = Some(chrono::Utc::now());
+        self.discard_before = Some(Instant::now());
         for session in self.sessions.values() {
             lock(&session.mailbox).take();
         }
@@ -125,8 +126,13 @@ struct Shot {
     height: u32,
     bgra: Vec<u8>,
     /// Stamped in the callback: the mailbox holds a frame until the next tick reads it, and that
-    /// wait is not part of when the screen looked like this.
+    /// wait is not part of when the screen looked like this. This is the timestamp the record
+    /// keeps; nothing decides whether the frame may be handed over.
     captured_at: chrono::DateTime<chrono::Utc>,
+    /// The same moment on the monotonic clock, and the only one a discard boundary can be drawn
+    /// against: a wall clock steps backwards on correction, so a stamp taken after the boundary can
+    /// read older than it and hand over the very screen the boundary was drawn to hold back.
+    arrived: Instant,
 }
 
 /// A live capture thread plus the mailbox it writes into.
@@ -178,7 +184,7 @@ impl Session {
         &mut self,
         monitor_id: &str,
         dpi_scale: f32,
-        discard_before: Option<chrono::DateTime<chrono::Utc>>,
+        discard_before: Option<Instant>,
     ) -> Result<Frame, CaptureError> {
         // The capture thread ends when the item closes or the handler fails, and that is the only
         // thing a mailbox can be asked about its own liveness.
@@ -195,7 +201,7 @@ impl Session {
             // Captured before the last discard: the gate was closed then, so this is the same
             // answer as an empty mailbox. The session did speak, though, so it is not the silence
             // the first-frame grace is watching for.
-            Some(shot) if discard_before.is_some_and(|at| shot.captured_at <= at) => {
+            Some(shot) if discard_before.is_some_and(|at| shot.arrived <= at) => {
                 self.delivered = true;
                 Err(Recoverable::NoNewFrame.into())
             }
@@ -254,8 +260,11 @@ impl GraphicsCaptureApiHandler for Sink {
         // Stamped before anything else, so the stamp bounds when this frame's pixels are from. A
         // readback takes real time, and a stamp taken after it would let a `discard_before`
         // watermark drawn mid-readback fall between the pixels and their stamp — the shot would
-        // then outrank the watermark while showing the gated screen. What remains is the frame
-        // pool's own composition latency, one frame time.
+        // then outrank the watermark while showing the gated screen. Being monotonic is what makes
+        // that bound hold at all: on the wall clock a backwards correction lands the same way round
+        // even for a stamp taken first. What remains is the frame pool's own composition latency,
+        // one frame time.
+        let arrived = Instant::now();
         let captured_at = chrono::Utc::now();
         if self
             .last_readback
@@ -300,6 +309,7 @@ impl GraphicsCaptureApiHandler for Sink {
             height,
             bgra,
             captured_at,
+            arrived,
         });
         Ok(())
     }

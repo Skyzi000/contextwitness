@@ -204,8 +204,12 @@ impl CaptureEngine {
                     self.reported.remove(&monitor.id);
                     frames.push(frame);
                 }
-                // An idle screen produces no update at all, which is the answer, not a failure.
-                Err(CaptureError::Recoverable(Recoverable::NoNewFrame)) => {}
+                // An idle screen produces no update at all, which is the answer, not a failure —
+                // and an answer ends the last reported failure, or its next recurrence would be
+                // swallowed as a repeat of news already told.
+                Err(CaptureError::Recoverable(Recoverable::NoNewFrame)) => {
+                    self.reported.remove(&monitor.id);
+                }
                 Err(error) => self.report(&monitor.id, &error.to_string()),
             }
         }

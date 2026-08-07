@@ -173,13 +173,6 @@ fn daemon() -> ! {
 
     let mut conn = cw_store::db::open(&paths.database()).expect("opening the database failed");
     maintenance::sweep_orphans(&mut conn, &paths);
-    match cw_store::outbox::requeue_delivering(&conn) {
-        Ok(0) => {}
-        // An attempt whose outcome nobody recorded: delivery is at-least-once, so it goes round
-        // again under the same document id.
-        Ok(requeued) => info!(requeued, "requeued deliveries left in flight"),
-        Err(error) => error!("requeueing in-flight deliveries failed: {error}"),
-    }
     let mut cursor: episodes::Cursor = None;
     match episodes::close_due(
         &mut conn,
@@ -196,8 +189,9 @@ fn daemon() -> ! {
     // contract because every one of them comes from `db::open`.
     spawn("delivery", {
         let conn = open_for("delivery", &paths);
+        let data_dir = paths.root.clone();
         let config = config.clone();
-        move || delivery::run(conn, config)
+        move || delivery::run(conn, data_dir, config)
     });
     spawn("episodes", {
         let conn = open_for("episodes", &paths);
@@ -703,6 +697,18 @@ fn setup_data_dir() -> Result<(), Failure> {
         .storage
         .resolve_data_dir()
         .map_err(|error| format!("{error}; the config was not written"))?;
+    // The line scan above is lexical, so a `data_dir = ` line inside a multi-line string is one it
+    // can hit — the replacement then lands inside that string, the file still parses, and the real
+    // key keeps its old value. Parsing proved the rewrite is valid TOML; only this proves it landed
+    // on the key.
+    if parsed.storage.data_dir != answer {
+        return Err(format!(
+            "the rewrite did not reach the [storage] data_dir key, so the config was not written; \
+             set it by hand in {}",
+            config_path.display()
+        )
+        .into());
+    }
 
     // Written beside the config and renamed onto it, never into it: `fs::write` truncates first,
     // and an interruption between the truncation and the last byte leaves a config that still

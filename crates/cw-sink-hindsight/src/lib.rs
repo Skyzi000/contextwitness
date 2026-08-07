@@ -45,19 +45,22 @@ impl Credentials {
             None
         } else {
             match std::fs::read_to_string(&path) {
-                Ok(text) => Some(serde_json::from_str::<Value>(&text).map_err(|source| {
-                    CredentialsError::Parse {
+                // Deserialized as a map rather than a `Value`, the line `save` already draws: a root
+                // that is not a JSON object holds neither key, and reading it as an unconfigured
+                // file would stop delivery silently instead of naming the parse error it is.
+                Ok(text) => Some(serde_json::from_str::<Map<String, Value>>(&text).map_err(
+                    |source| CredentialsError::Parse {
                         path: path.clone(),
                         source,
-                    }
-                })?),
+                    },
+                )?),
                 Err(source) if source.kind() == std::io::ErrorKind::NotFound => None,
                 Err(source) => return Err(CredentialsError::Io { path, source }),
             }
         };
         let from_file = |key: &str| {
             file.as_ref()
-                .and_then(|value| value.get(key))
+                .and_then(|map| map.get(key))
                 .and_then(Value::as_str)
                 .map(str::to_owned)
                 .filter(|value| !value.trim().is_empty())

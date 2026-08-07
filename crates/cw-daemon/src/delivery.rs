@@ -5,6 +5,8 @@ use cw_sink_hindsight::{Credentials, HindsightClient, RetainItem};
 use cw_store::control::HealthKey;
 use cw_store::outbox::{self, Retry};
 use tracing::{debug, error, info, warn};
+use windows::Win32::Foundation::{HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT};
+use windows::Win32::System::Threading::{CreateMutexW, INFINITE, WaitForSingleObject};
 
 /// How long the worker waits when nothing is due. Episodes arrive once per window, and a retry
 /// waits at least `outbox::backoff_delay`'s first step, so there is nothing to gain by looking
@@ -25,7 +27,13 @@ struct BankGate {
 
 /// Run the delivery worker on this thread. Returns as soon as it learns that delivery is not
 /// configured: the outbox keeps filling, and a run after `contextwitness setup` picks it up.
-pub fn run(mut conn: rusqlite::Connection, config: cw_core::config::Config) {
+/// Configured, it delivers nothing until it holds the machine-wide claim on `data_dir`, so the
+/// outbox rows of one directory have one deliverer however many daemons reach it.
+pub fn run(
+    mut conn: rusqlite::Connection,
+    data_dir: std::path::PathBuf,
+    config: cw_core::config::Config,
+) {
     let credentials = match Credentials::load() {
         Ok(Some(credentials)) => credentials,
         Ok(None) => {
@@ -48,6 +56,21 @@ pub fn run(mut conn: rusqlite::Connection, config: cw_core::config::Config) {
             return;
         }
     };
+    // Claimed only now: a worker that is about to return because nothing is configured has no rows
+    // to guard, and holding the claim across that return would keep a configured daemon elsewhere
+    // standing by for a worker that never delivers.
+    let _claim = claim_sole_deliverer(&data_dir);
+    // Only the holder of that claim may requeue: a 'delivering' row is owned by whichever worker
+    // claimed it, and `retain` holds one for as long as the sink's HTTP timeout. A second daemon
+    // sweeping those rows back to pending sends the same episode again and writes a delivered one
+    // back as failed.
+    match outbox::requeue_delivering(&conn) {
+        Ok(0) => {}
+        // An attempt whose outcome nobody recorded: delivery is at-least-once, so it goes round
+        // again under the same document id.
+        Ok(requeued) => info!(requeued, "requeued deliveries left in flight"),
+        Err(error) => error!("requeueing in-flight deliveries failed: {error}"),
+    }
     let mut bank = BankGate::default();
 
     loop {
@@ -61,9 +84,10 @@ pub fn run(mut conn: rusqlite::Connection, config: cw_core::config::Config) {
             Err(error) => {
                 error!("delivery pass failed: {error}");
                 // A pass that dies between the claim and the state write leaves its entry
-                // 'delivering', which `fetch_due` does not see. One worker runs, so any
-                // 'delivering' entry at a pass boundary is by definition abandoned. If the store
-                // is what failed this fails too, and the next pass tries again.
+                // 'delivering', which `fetch_due` does not see. The claim held above is what makes
+                // this the only worker on this data directory, so any 'delivering' entry at a pass
+                // boundary is by definition this worker's own and abandoned. If the store is what
+                // failed this fails too, and the next pass tries again.
                 match outbox::requeue_delivering(&conn) {
                     Ok(0) => {}
                     Ok(count) => info!(count, "requeued entries the failed pass left claimed"),
@@ -73,6 +97,72 @@ pub fn run(mut conn: rusqlite::Connection, config: cw_core::config::Config) {
         }
         std::thread::sleep(IDLE);
     }
+}
+
+/// Wait until this process is the one delivering for `data_dir`, and answer with the claim it then
+/// holds. `Global\`, unlike the daemon's own per-session instance claim: two interactive sessions
+/// can be pointed at one data directory, and it is that directory's outbox rows — not the session —
+/// that only one worker may touch.
+///
+/// The handle is never closed: the OS drops it however the process dies, so there is no stale claim
+/// to recognize and clean up after a crash. `HANDLE` closes nothing when the binding goes, which is
+/// what lets the caller simply hold it.
+fn claim_sole_deliverer(data_dir: &std::path::Path) -> Option<HANDLE> {
+    // Canonical and lowercased, so the same directory reached by a different spelling — a relative
+    // parent, a short name, another case — is still the same claim. A path that cannot be resolved
+    // is used as it stands, which every daemon started the same way still spells the same.
+    let path = std::fs::canonicalize(data_dir).unwrap_or_else(|_| data_dir.to_path_buf());
+    // A digest, never the path: `Global\` names are enumerable by every user on the machine, and a
+    // data directory's spelling usually carries the name of the user who owns it.
+    let name = windows::core::HSTRING::from(format!(
+        "Global\\ContextWitness-delivery-{:016x}",
+        fnv1a(&path.to_string_lossy().to_lowercase())
+    ));
+    let handle = match unsafe { CreateMutexW(None, false, &name) } {
+        Ok(handle) => handle,
+        // Unguarded rather than refusing to deliver: a name that could not be created says nothing
+        // about whether another worker is up, and an outbox nobody drains is the worse of the two.
+        Err(error) => {
+            warn!("the delivery claim could not be created, so this worker is unguarded: {error}");
+            return None;
+        }
+    };
+
+    // WAIT_ABANDONED is the previous holder having died while holding it. The claim is taken: the
+    // rows it left mid-flight are exactly what the requeue after this call puts back in order.
+    match unsafe { WaitForSingleObject(handle, 0) } {
+        WAIT_OBJECT_0 | WAIT_ABANDONED => {}
+        WAIT_TIMEOUT => {
+            // Said once, before the blocking wait, so a daemon that looks idle for hours has a line
+            // saying which of the two it is.
+            info!("another contextwitness delivers for this data directory; standing by");
+            match unsafe { WaitForSingleObject(handle, INFINITE) } {
+                WAIT_OBJECT_0 | WAIT_ABANDONED => {}
+                outcome => warn!(
+                    ?outcome,
+                    "waiting for the delivery claim failed, so this worker is unguarded"
+                ),
+            }
+        }
+        outcome => warn!(
+            ?outcome,
+            "the delivery claim could not be taken, so this worker is unguarded"
+        ),
+    }
+
+    Some(handle)
+}
+
+/// FNV-1a over `text`. All this has to do is spread one machine's handful of data directories over
+/// distinct names; nothing reads the digest back.
+fn fnv1a(text: &str) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in text.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+
+    hash
 }
 
 /// One pass over what is due, answering how many entries were delivered.
