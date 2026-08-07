@@ -6,8 +6,6 @@ use cw_core::model::{Observation, SourcePayload};
 const SELECT_BY_ID: &str = "SELECT id, source, observed_at, duration_ms, schema_version, payload \
      FROM observations WHERE id = ?1";
 
-const DELETE_BY_ID: &str = "DELETE FROM observations WHERE id = ?1";
-
 /// Half-open in its contract, inclusive in its SQL: `[start, end)` is exactly `[start, end - 1ns]`
 /// because the instants this schema represents are the nanosecond grid — `to_sql` refuses an
 /// overflowing nanosecond field, so nothing storable lies strictly between the two.
@@ -80,18 +78,6 @@ pub fn insert(conn: &rusqlite::Connection, observation: &Observation) -> Result<
     })?;
 
     Ok(())
-}
-
-/// Remove the observation with this id, answering whether a row went. This exists for the capture
-/// path's compensation: an observation is inserted before its image is stored so the image row can
-/// reference it, and when that storage fails the observation must not survive naming a path that
-/// was never written — the episode fold keeps the first entry of a run, so the broken spelling is
-/// the one a delivered episode would point at.
-pub fn remove(conn: &rusqlite::Connection, id: ulid::Ulid) -> Result<bool, StoreError> {
-    let removed = conn
-        .execute(DELETE_BY_ID, [id.to_string()])
-        .map_err(|source| StoreError::Sql { source })?;
-    Ok(removed > 0)
 }
 
 /// The observation with this id, or `None` when no row spells this id the way this program

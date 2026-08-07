@@ -25,6 +25,7 @@ pub fn run(
     // The capture sessions are persistent, so the engine outlives the tick that reads from it.
     let mut previous: HashMap<String, Thumbnail> = HashMap::new();
     let mut health_written: Option<std::time::Instant> = None;
+    let mut threshold_warned: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     loop {
         let started = std::time::Instant::now();
@@ -36,6 +37,7 @@ pub fn run(
             &config,
             &mut previous,
             &mut health_written,
+            &mut threshold_warned,
         ) {
             error!("tick failed: {error}");
         }
@@ -61,6 +63,7 @@ pub(crate) struct Stored {
     pub relative_path: String,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn tick(
     capture: &mut cw_capture::CaptureEngine,
     ocr: &dyn cw_ocr::OcrEngine,
@@ -69,6 +72,7 @@ fn tick(
     config: &Config,
     previous: &mut HashMap<String, Thumbnail>,
     health_written: &mut Option<std::time::Instant>,
+    threshold_warned: &mut std::collections::HashSet<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     mark_tick(conn, health_written)?;
 
@@ -94,6 +98,35 @@ fn tick(
     // sub-threshold changes accumulate against. An enumeration that fails leaves the map alone.
     if let Ok(monitors) = capture.monitors() {
         previous.retain(|id, _| monitors.iter().any(|monitor| &monitor.id == id));
+        // Startup aborted on this; a monitor plugged in since then gets an error instead, because
+        // ending the daemon here would trade one silent monitor for silence on all of them. Once
+        // per monitor: unplugging it clears the entry, so plugging it back in — possibly at a new
+        // resolution — is judged afresh.
+        threshold_warned.retain(|id| monitors.iter().any(|monitor| &monitor.id == id));
+        for monitor in &monitors {
+            if !cw_core::change::change_threshold_is_reachable(
+                monitor.width,
+                monitor.height,
+                monitor.dpi_scale,
+                &config.capture,
+            ) && threshold_warned.insert(monitor.id.clone())
+            {
+                error!(
+                    monitor = %monitor.id,
+                    "this monitor ({}x{} at {}x scale) tops out at {:.0} changed logical pixels, \
+                     under capture.change_area_logical_pixels: it will store nothing after its \
+                     first frame until the threshold is lowered",
+                    monitor.width,
+                    monitor.height,
+                    monitor.dpi_scale,
+                    cw_core::change::max_logical_pixels(
+                        monitor.width,
+                        monitor.height,
+                        monitor.dpi_scale
+                    )
+                );
+            }
+        }
     }
 
     for stored in pass(capture, ocr, conn, paths, config, previous)? {
@@ -201,8 +234,8 @@ pub(crate) fn pass(
             foreground_window_title: foreground.title.clone(),
         };
         let mut observation = Observation::new_screen(payload, captured_at);
-        // This id and instant are the ones `images::save` gets below, which is what makes the
-        // path recorded here the path it writes. The `images/` prefix is the payload's spelling
+        // This id and instant are the ones `save_with_observation` gets below, which is what makes
+        // the path recorded here the path it writes. The `images/` prefix is the payload's spelling
         // only: delivered paths are data_dir-relative (design §4.2), while the images table keys
         // on the path relative to the images root.
         if let SourcePayload::Screen(payload) = &mut observation.payload {
@@ -211,33 +244,20 @@ pub(crate) fn pass(
                 cw_store::images::relative_path(observation.id, captured_at)
             ));
         }
-        cw_store::observations::insert(conn, &observation)?;
         let rgb = bgra_to_rgb(&frame.bgra);
-        let stored = match cw_store::images::save(
+        // One transaction for the observation row and the image row: committed apart, a crash
+        // between them would permanently leave an observation advertising a path no file will
+        // ever answer to — the startup sweep reconciles files and image rows, not observations.
+        let stored = cw_store::images::save_with_observation(
             conn,
             &paths.images(),
-            observation.id,
+            &observation,
             &rgb,
             frame.width,
             frame.height,
             f32::from(config.capture.webp_quality),
             captured_at,
-        ) {
-            Ok(stored) => stored,
-            Err(error) => {
-                // The observation is already committed and names an image that now will never
-                // exist. The episode fold keeps the first entry of a run, so left in place that
-                // broken spelling is the one a delivered episode would carry — while the retry's
-                // real image goes unreferenced.
-                if let Err(removal) = cw_store::observations::remove(conn, observation.id) {
-                    error!(
-                        observation = %observation.id,
-                        "removing the observation whose image failed to store also failed: {removal}"
-                    );
-                }
-                return Err(error.into());
-            }
-        };
+        )?;
         previous.insert(frame.monitor_id.clone(), thumbnail);
         stored_at = Some(captured_at);
         stored_frames.push(Stored {

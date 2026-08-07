@@ -5,7 +5,7 @@ use std::io::Write as _;
 use crate::{autostart, capture, delivery, episodes, logging, maintenance, tray};
 use clap::{Parser, Subcommand};
 use cw_core::atomic_file::create_temporary_beside;
-use cw_core::config::{Config, DataPaths, default_config_path};
+use cw_core::config::{Config, ConfigError, DataPaths, StorageConfig, default_config_path};
 use cw_store::control::{HealthKey, Pause};
 use tracing::{error, info, warn};
 use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, HANDLE};
@@ -19,6 +19,13 @@ use windows::Win32::System::Threading::CreateMutexW;
 /// for an answer instead of starting without one.
 const MONITOR_ATTEMPTS: u32 = 5;
 const MONITOR_RETRY: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How long `capture-once --wgc` waits for every monitor to answer. Past the fallback's own
+/// five-second first-frame grace, which is what decides whether a silent session is broken or
+/// merely idle: giving up first would report a monitor as missing that the backend had not
+/// finished judging.
+const WGC_ANSWER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(8);
+const WGC_ANSWER_RETRY: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// The key `setup` rewrites, and the only place the data directory is configured.
 const DATA_DIR_KEY: &str = "data_dir";
@@ -120,14 +127,21 @@ fn daemon() -> ! {
     let dpi_aware = cw_capture::make_dpi_aware();
     cw_ocr::init_runtime();
 
-    let config_path = default_config_path().expect("resolving the config path failed");
-    let created =
-        Config::write_default_if_missing(&config_path).expect("writing the default config failed");
-    let config = Config::load_from_path(&config_path).expect("loading the config failed");
-    let data_dir = config
-        .storage
-        .resolve_data_dir()
-        .expect("resolving the data directory failed");
+    // Every step to here runs before there is a log file, and this binary is a windows subsystem
+    // one started from the Run key: a config that cannot be read or names a relative `data_dir`
+    // has no console to complain to, so each failure has to reach a log file rather than end the
+    // logon in silence.
+    let config_path = match default_config_path() {
+        Ok(path) => path,
+        Err(error) => refuse_before_logging(&format!("resolving the config path failed: {error}")),
+    };
+    let (created, config, data_dir) = match load_startup_config(&config_path) {
+        Ok(loaded) => loaded,
+        Err(error) => refuse_before_logging(&format!(
+            "startup failed with {}: {error}",
+            config_path.display()
+        )),
+    };
     let paths = DataPaths::new(data_dir);
     // Held until the process ends: dropping it flushes the file writer.
     let logging = logging::init(&paths);
@@ -221,6 +235,34 @@ fn claim_single_instance() {
         eprintln!("contextwitness is already running in this session.");
         std::process::exit(1);
     }
+}
+
+/// Whether this call wrote the default config, the config itself, and the directory it names.
+/// Fallible as one piece: the daemon has nothing to do with a startup that got halfway, and the
+/// caller has one place to report every way it can end.
+fn load_startup_config(
+    config_path: &std::path::Path,
+) -> Result<(bool, Config, std::path::PathBuf), ConfigError> {
+    let created = Config::write_default_if_missing(config_path)?;
+    let config = Config::load_from_path(config_path)?;
+    let data_dir = config.storage.resolve_data_dir()?;
+
+    Ok((created, config, data_dir))
+}
+
+/// Report a startup that never got a usable config, and end. The log goes under the *default* data
+/// directory, which is the only one still standing: the config that would have named another one
+/// is the thing that failed. A machine where even that has no spelling leaves nowhere to write and
+/// no console to fall back on, so the exit code is all the caller gets.
+fn refuse_before_logging(message: &str) -> ! {
+    let logging = StorageConfig::default()
+        .resolve_data_dir()
+        .ok()
+        .and_then(|root| logging::init(&DataPaths::new(root)));
+    error!("{message}");
+    // Before the exit, which runs no destructor.
+    drop(logging);
+    std::process::exit(1);
 }
 
 /// A panicking worker takes the whole process with it (plan Task 25). Left to itself that thread
@@ -499,14 +541,21 @@ fn capture_once(wgc: bool) -> Result<(), Failure> {
         &config,
         &mut previous,
     )?;
-    // WGC sessions deliver their first frame from a callback thread, so the first pass can find
-    // the mailboxes still empty. The sessions persist across passes; ask again briefly.
+    // WGC sessions deliver their first frame from a callback thread, and each monitor's arrives on
+    // its own schedule, so the first pass can find some or all of the mailboxes still empty — and
+    // one monitor answering says nothing about the rest. The sessions persist across passes; ask
+    // again until every monitor has answered or the deadline is up. The non-WGC path needs none of
+    // this: duplication is synchronous and answers for every monitor in the one pass above.
     if wgc {
-        for _ in 0..6 {
-            if !stored.is_empty() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(500));
+        // An enumeration that fails leaves no set to cover, so the wait falls back to the weaker
+        // question of whether anything at all was stored.
+        let expected: Vec<String> = capture
+            .monitors()
+            .map(|monitors| monitors.into_iter().map(|monitor| monitor.id).collect())
+            .unwrap_or_default();
+        let deadline = std::time::Instant::now() + WGC_ANSWER_DEADLINE;
+        while !all_answered(&stored, &expected) && std::time::Instant::now() < deadline {
+            std::thread::sleep(WGC_ANSWER_RETRY);
             stored.extend(capture::pass(
                 &mut capture,
                 &ocr,
@@ -515,6 +564,24 @@ fn capture_once(wgc: bool) -> Result<(), Failure> {
                 &config,
                 &mut previous,
             )?);
+        }
+
+        let missing: Vec<&str> = expected
+            .iter()
+            .filter(|id| !stored.iter().any(|frame| &frame.monitor_id == *id))
+            .map(String::as_str)
+            .collect();
+        // Printed before the frames, because the frames alone read as a complete answer. Monitor
+        // ids are device names such as `\\.\DISPLAY2`, not screen content, and the lines below
+        // already carry them.
+        if !missing.is_empty() {
+            println!(
+                "{} of {} monitors answered within {}s; nothing from {}",
+                expected.len() - missing.len(),
+                expected.len(),
+                WGC_ANSWER_DEADLINE.as_secs(),
+                missing.join(", ")
+            );
         }
     }
 
@@ -536,6 +603,19 @@ fn capture_once(wgc: bool) -> Result<(), Failure> {
     }
 
     Ok(())
+}
+
+/// Whether every monitor in `expected` has stored a frame. An empty `expected` is the enumeration
+/// having failed rather than a machine with no monitors: nothing names them, so the only question
+/// left is the weaker one this used to ask — whether anything at all arrived.
+fn all_answered(stored: &[capture::Stored], expected: &[String]) -> bool {
+    if expected.is_empty() {
+        return !stored.is_empty();
+    }
+
+    expected
+        .iter()
+        .all(|id| stored.iter().any(|frame| &frame.monitor_id == id))
 }
 
 /// Ask for what this program cannot work out on its own, and write it down. Nothing here talks to

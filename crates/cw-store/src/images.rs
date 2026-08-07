@@ -1,6 +1,6 @@
 //! WebP image files and the database rows that record them.
 
-use crate::{StoreError, timestamp};
+use crate::{StoreError, observations, timestamp};
 use chrono::Datelike;
 use std::collections::HashSet;
 
@@ -38,11 +38,65 @@ pub fn relative_path(id: ulid::Ulid, at: chrono::DateTime<chrono::Utc>) -> Strin
 /// it into place, flushes the rename and commits. A crash before the commit leaves at most a file
 /// [`sweep_orphan_files`] removes from where its walk reaches, once nothing refuses the removal;
 /// a crash after it leaves nothing to clean.
+///
+/// The observation this image belongs to must already be committed, since the image row references
+/// it. A caller that is writing both takes [`save_with_observation`], which commits the two rows
+/// together.
 #[allow(clippy::too_many_arguments)]
 pub fn save(
     conn: &mut rusqlite::Connection,
     root: &std::path::Path,
     id: ulid::Ulid,
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    quality: f32,
+    at: chrono::DateTime<chrono::Utc>,
+) -> Result<String, StoreError> {
+    save_registering(conn, root, id, None, pixels, width, height, quality, at)
+}
+
+/// [`save`], with `observation` inserted into the same transaction as the image row.
+///
+/// The two rows commit together or not at all. Committing the observation first leaves, on a crash
+/// in between, a row whose payload names an image that will never be written: the startup sweep
+/// reconciles unregistered files and registered rows and has nothing to say about that path, so it
+/// stays and every episode carrying that observation carries the dead name with it. A crash before
+/// this commit leaves at most an unregistered file, which is what [`save`] leaves and what
+/// [`sweep_orphan_files`] collects.
+#[allow(clippy::too_many_arguments)]
+pub fn save_with_observation(
+    conn: &mut rusqlite::Connection,
+    root: &std::path::Path,
+    observation: &cw_core::model::Observation,
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    quality: f32,
+    at: chrono::DateTime<chrono::Utc>,
+) -> Result<String, StoreError> {
+    save_registering(
+        conn,
+        root,
+        observation.id,
+        Some(observation),
+        pixels,
+        width,
+        height,
+        quality,
+        at,
+    )
+}
+
+/// `id` is the observation the image is filed under, and is `observation.id` whenever an
+/// observation is given: the file's name is written from it and the image row keys on it, so the
+/// two disagreeing would register the picture against a row that is not the one being committed.
+#[allow(clippy::too_many_arguments)]
+fn save_registering(
+    conn: &mut rusqlite::Connection,
+    root: &std::path::Path,
+    id: ulid::Ulid,
+    observation: Option<&cw_core::model::Observation>,
     pixels: &[u8],
     width: u32,
     height: u32,
@@ -131,6 +185,16 @@ pub fn save(
             return Err(StoreError::Sql { source });
         }
     };
+
+    // Before the image row, because that row references this one. Discarding the temporary and
+    // dropping the transaction is the whole of the undo: neither row is published, and what is left
+    // is the unregistered file every other pre-commit failure below leaves.
+    if let Some(observation) = observation
+        && let Err(error) = observations::insert(&transaction, observation)
+    {
+        discard_written_file(&file);
+        return Err(error);
+    }
 
     if let Err(source) = transaction.execute(
         INSERT_IMAGE,

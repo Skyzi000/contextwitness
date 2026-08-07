@@ -14,6 +14,15 @@ const IDLE: std::time::Duration = std::time::Duration::from_secs(30);
 /// few at a time rather than in one allocation.
 const BATCH: u32 = 4;
 
+/// Whether the bank has been made ready, and when it may be asked again if it has not. Owned by
+/// [`run`], so what one pass learned outlives it.
+#[derive(Default)]
+struct BankGate {
+    ready: bool,
+    attempts: u32,
+    not_before: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 /// Run the delivery worker on this thread. Returns as soon as it learns that delivery is not
 /// configured: the outbox keeps filling, and a run after `contextwitness setup` picks it up.
 pub fn run(mut conn: rusqlite::Connection, config: cw_core::config::Config) {
@@ -39,14 +48,14 @@ pub fn run(mut conn: rusqlite::Connection, config: cw_core::config::Config) {
             return;
         }
     };
-    let mut bank_ready = false;
+    let mut bank = BankGate::default();
 
     loop {
         // A full batch *delivered* means a backlog is draining and the next pass should run now.
         // Deliveries, not attempts: a pass of nothing but failures must fall into the idle wait,
         // or a server answering with a short Retry-After would be re-asked in a hot loop with no
         // backoff at all.
-        match deliver_batch(&mut conn, &client, &config, &mut bank_ready) {
+        match deliver_batch(&mut conn, &client, &config, &mut bank) {
             Ok(BATCH..) => continue,
             Ok(_) => {}
             Err(error) => {
@@ -71,20 +80,43 @@ fn deliver_batch(
     conn: &mut rusqlite::Connection,
     client: &HindsightClient,
     config: &cw_core::config::Config,
-    bank_ready: &mut bool,
+    bank: &mut BankGate,
 ) -> Result<u32, Box<dyn std::error::Error>> {
     let due = outbox::fetch_due(conn, chrono::Utc::now(), BATCH)?;
     if due.is_empty() {
         return Ok(0);
     }
     // Asked for once, and only when there is something to send: a bank that could not be reached
-    // leaves the entries pending for the next pass rather than dropping the worker.
-    if !*bank_ready {
-        if let Err(error) = client.ensure_bank(&config.hindsight.bank_id) {
-            warn!(bank = %config.hindsight.bank_id, "hindsight bank is not ready: {error}");
+    // leaves the entries pending for a later pass rather than dropping the worker, and is asked
+    // again on the same ladder the outbox retries on rather than once every idle wait.
+    if !bank.ready {
+        if bank.not_before.is_some_and(|at| chrono::Utc::now() < at) {
+            // Reading the clock is all this pass costs; nothing goes over the wire until the
+            // backoff has run out.
             return Ok(0);
         }
-        *bank_ready = true;
+        if let Err(error) = client.ensure_bank(&config.hindsight.bank_id) {
+            // Read after the call, for the reason the retain loop below gives.
+            let now = chrono::Utc::now();
+            bank.attempts += 1;
+            // A permanent error backs off exactly like a retryable one instead of ending the
+            // worker: the bank is configuration state, like the credentials, not payload state, so
+            // it can be repaired while the daemon runs — and a retry that keeps coming, however
+            // slowly, is what picks that repair up.
+            let delay = error
+                .retry_after()
+                .and_then(|after| TimeDelta::from_std(after).ok())
+                .unwrap_or_else(|| outbox::backoff_delay(bank.attempts));
+            bank.not_before = now.checked_add_signed(delay);
+            warn!(
+                bank = %config.hindsight.bank_id,
+                attempts = bank.attempts,
+                retry_in_seconds = delay.num_seconds(),
+                "hindsight bank is not ready: {error}"
+            );
+            return Ok(0);
+        }
+        bank.ready = true;
     }
 
     let mut delivered = 0;
