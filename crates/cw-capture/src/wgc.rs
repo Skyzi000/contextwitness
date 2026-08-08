@@ -22,9 +22,7 @@ use crate::{
 };
 
 /// WGC pushes a frame per screen update, up to the refresh rate, and a readback copies the full
-/// screen. The tick only ever reads the newest, so the callback returns before reading back
-/// anything that arrives inside this window; a screen that then goes still stays that much
-/// behind, once.
+/// screen.
 const MIN_READBACK_INTERVAL: Duration = Duration::from_millis(500);
 
 /// How long a fresh session may stay silent before it is called broken instead of idle. After the
@@ -37,10 +35,6 @@ type Control = CaptureControl<Sink, <Sink as GraphicsCaptureApiHandler>::Error>;
 pub(crate) struct WgcCapturer {
     known: Vec<(HMONITOR, MonitorInfo)>,
     sessions: HashMap<String, Session>,
-    /// Shots stamped at or before this are refused. One stamp covers every session, and a monotonic
-    /// one covers them without qualification: a session opened after the last discard only ever
-    /// produces shots that read newer than it, whatever the wall clock is doing.
-    discard_before: Option<Instant>,
 }
 
 impl WgcCapturer {
@@ -48,7 +42,6 @@ impl WgcCapturer {
         Self {
             known: Vec::new(),
             sessions: HashMap::new(),
-            discard_before: None,
         }
     }
 
@@ -66,17 +59,10 @@ impl WgcCapturer {
             .retain(|id, _| monitors.iter().any(|monitor| &monitor.id == id));
     }
 
-    /// Empty every mailbox and refuse every shot whose callback began up to now. The callback
-    /// threads keep filling mailboxes while the daemon's privacy gate is closed, so without this
-    /// the first tick after the gate reopens could hand over a screen the gate existed to keep
-    /// out.
+    /// Drop every session. A frame from a session alive before this call can sit in a mailbox or
+    /// wait in a frame pool arbitrarily long; it can never reach a later capture.
     pub(crate) fn discard_pending(&mut self) {
-        // Stamped before the mailboxes are emptied so that a frame landing in between is covered by
-        // the watermark rather than slipping past both.
-        self.discard_before = Some(Instant::now());
-        for session in self.sessions.values() {
-            lock(&session.mailbox).take();
-        }
+        self.sessions.clear();
     }
 }
 
@@ -95,7 +81,6 @@ impl Capturer for WgcCapturer {
 
     fn capture(&mut self, monitor_id: &str) -> Result<Frame, CaptureError> {
         self.monitors()?;
-        let discard_before = self.discard_before;
         let (handle, dpi_scale) = self
             .known
             .iter()
@@ -108,7 +93,7 @@ impl Capturer for WgcCapturer {
             Entry::Vacant(vacant) => vacant.insert(Session::open(handle)?),
         };
 
-        let captured = session.capture(monitor_id, dpi_scale, discard_before);
+        let captured = session.capture(monitor_id, dpi_scale);
         if matches!(&captured, Err(error) if !matches!(error, CaptureError::Recoverable(Recoverable::NoNewFrame)))
         {
             self.sessions.remove(monitor_id);
@@ -122,14 +107,7 @@ struct Shot {
     width: u32,
     height: u32,
     bgra: Vec<u8>,
-    /// Stamped in the callback: the mailbox holds a frame until the next tick reads it, and that
-    /// wait is not part of when the screen looked like this. This is the timestamp the record
-    /// keeps.
     captured_at: chrono::DateTime<chrono::Utc>,
-    /// The same moment on the monotonic clock, and the only one a discard boundary can be drawn
-    /// against: a wall clock steps backwards on correction, so a stamp taken after the boundary can
-    /// read older than it and hand over the very screen the boundary was drawn to hold back.
-    arrived: Instant,
 }
 
 /// A live capture thread plus the mailbox it writes into.
@@ -173,14 +151,7 @@ impl Session {
         })
     }
 
-    /// Guarantees, with `discard_before`, that no frame whose callback began before the most
-    /// recent discard is ever returned.
-    fn capture(
-        &mut self,
-        monitor_id: &str,
-        dpi_scale: f32,
-        discard_before: Option<Instant>,
-    ) -> Result<Frame, CaptureError> {
+    fn capture(&mut self, monitor_id: &str, dpi_scale: f32) -> Result<Frame, CaptureError> {
         if self
             .control
             .as_ref()
@@ -191,10 +162,6 @@ impl Session {
 
         let shot = lock(&self.mailbox).take();
         match shot {
-            Some(shot) if discard_before.is_some_and(|at| shot.arrived <= at) => {
-                self.delivered = true;
-                Err(Recoverable::NoNewFrame.into())
-            }
             Some(shot) => {
                 self.delivered = true;
                 Ok(Frame {
@@ -310,7 +277,6 @@ impl GraphicsCaptureApiHandler for Sink {
             height,
             bgra,
             captured_at,
-            arrived,
         });
         Ok(())
     }

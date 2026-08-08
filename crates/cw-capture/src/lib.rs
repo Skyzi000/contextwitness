@@ -130,20 +130,10 @@ impl CaptureEngine {
         self.dxgi.monitors()
     }
 
-    /// Throw away whatever the fallback is holding, and refuse every frame whose callback began up
-    /// to now. Guarantee: no frame whose callback began before the most recent call is ever
-    /// returned by `capture_all`; pixels can predate that boundary by however long the frame
-    /// waited in the frame pool before its callback ran.
-    ///
-    /// The daemon calls this on every tick its privacy gate blocks — paused, or the foreground
-    /// window blacklisted. The gate only stops the tick from *reading*; the fallback's callback
-    /// threads keep capturing into their mailboxes regardless, so without this the first tick after
-    /// the gate reopens could return a screen the pause or the blacklist existed to keep out. The
-    /// duplication is pull-only and holds nothing between captures, so only the fallback needs it.
-    ///
-    /// Ceiling: a frame captured between the last gated tick and the moment the gate actually
-    /// lifted still gets through — bounded by one tick interval, since a tick cannot see the exact
-    /// instant of the lift.
+    /// Drop the fallback's capture sessions. The daemon's privacy gate only stops the tick from
+    /// *reading*; the fallback's callback threads keep composing frames regardless, and a frame
+    /// can sit in a mailbox or wait in a frame pool arbitrarily long — a suspend included. After
+    /// this call returns, no frame from a session alive before it can reach a later tick.
     pub fn discard_pending(&mut self) {
         self.wgc.discard_pending();
     }
