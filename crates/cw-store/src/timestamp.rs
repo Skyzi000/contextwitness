@@ -38,9 +38,6 @@ const NANOSECONDS_PER_SECOND: u32 = 1_000_000_000;
 pub(crate) fn to_sql(at: DateTime<Utc>) -> Result<String, crate::StoreError> {
     let spelled = at.to_rfc3339_opts(SecondsFormat::Nanos, true);
     if at.nanosecond() >= NANOSECONDS_PER_SECOND {
-        // The spelling cannot stand for the value here: mid-minute it is text an ordinary stored
-        // instant already owns, so reporting it alone would name a different value than the one
-        // refused. Naming the field it came from is what separates them.
         return Err(crate::StoreError::TimestampOutOfRange {
             at: format!(
                 "{spelled} spelled from a nanosecond field of {}",
@@ -133,19 +130,11 @@ mod tests {
     #[test]
     fn a_spelling_this_schema_does_not_write_is_refused_even_when_it_parses() {
         let spellings = [
-            // This ordinary instant would not sort against the `Z` spellings.
             "2026-07-30T12:00:00.000000000+09:00",
-            // Exactly thirty characters, and nine hours from where its text sorts: a length check
-            // cannot tell this from the spelling this schema writes. It parses to 03:00:00 UTC
-            // while its text sorts after 11:59:59.999999999Z.
             "2026-07-30T12:00:00.0000+09:00",
-            // chrono would drop this tenth digit, but SQLite would keep comparing it.
             "2026-07-30T12:00:00.0000000001Z",
-            // This eight-digit fraction would leave the stored text one character short.
             "2026-07-30T12:00:00.00000000Z",
-            // This offset would carry the UTC instant into year -1.
             "0000-01-01T00:00:00.000000000+00:01",
-            // This form would omit the fractional part entirely.
             "2026-07-30T12:00:00Z",
         ];
 
@@ -154,8 +143,6 @@ mod tests {
             assert!(from_sql(spelling).is_err(), "{spelling} should be refused");
         }
 
-        // This is the case where the re-spelling itself fails. Reporting what came back from
-        // parsing would name a row that does not exist.
         let spelling = "0000-01-01T00:00:00.000000000+00:01";
         let error = from_sql(spelling).expect_err("the non-canonical spelling should be refused");
         let Some(StoreError::TimestampOutOfRange { at }) = error.downcast_ref::<StoreError>()
@@ -176,8 +163,6 @@ mod tests {
 
     #[test]
     fn a_stored_value_that_is_not_a_timestamp_at_all_names_itself() {
-        // Returning the parser's error instead would leave the caller told which row to repair and
-        // never told what is in it. This is the only test that can tell the two apart.
         let error = from_sql("not a timestamp")
             .expect_err("a value that is not a timestamp should be refused");
         let Some(StoreError::TimestampOutOfRange { at }) = error.downcast_ref::<StoreError>()
@@ -230,9 +215,8 @@ mod tests {
 
     #[test]
     fn an_overflowing_nanosecond_would_name_another_instant_and_is_refused() {
-        // This is the smallest value the guard rejects; every other case in this file is
-        // comfortably above it. A guard written `>` instead of `>=` would let exactly this one
-        // through.
+        // The smallest value the guard rejects: written `>` instead of `>=` it would let exactly
+        // this one through.
         let boundary = Utc
             .with_ymd_and_hms(2026, 7, 25, 12, 34, 58)
             .single()
@@ -288,7 +272,6 @@ mod tests {
         assert_eq!(spelled, ordinary_spelling);
         assert_ne!(overflowing, ordinary);
 
-        // The width and collision above are why refusing the overflowing value is not optional.
         let error =
             to_sql(overflowing).expect_err("the timestamp that names another instant should fail");
         let StoreError::TimestampOutOfRange { at } = error else {
@@ -333,9 +316,6 @@ mod tests {
 
         assert!(last_ordinary_spelling < spelled);
         assert!(spelled < next_window_spelling);
-        // These DateTime comparisons are the half-open contract placing the value inside the
-        // earlier window. The two spelling comparisons above are the query losing it at both ends;
-        // together they are why this value must never be stored.
         assert!(leap > last_ordinary);
         assert!(leap < next_window_start);
 

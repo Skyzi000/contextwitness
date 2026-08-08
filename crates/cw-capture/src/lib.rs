@@ -38,9 +38,9 @@ pub struct Frame {
     pub height: u32,
     pub dpi_scale: f32,
     pub bgra: Vec<u8>,
-    /// When the pixels were read off the screen — not when a consumer got around to them. OCR
-    /// takes seconds per frame and the fallback's mailbox holds a frame until the next tick, so
-    /// timestamps taken downstream would drift by that much.
+    /// Stamped inside the backend's own capture path — not when a consumer got around to the
+    /// frame. OCR takes seconds per frame and the fallback's mailbox holds a frame until the next
+    /// tick, so timestamps taken downstream would drift by that much.
     pub captured_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -101,9 +101,6 @@ pub struct CaptureEngine {
 
 impl CaptureEngine {
     pub fn new() -> Self {
-        // Without PER_MONITOR_AWARE_V2 Windows virtualizes both the DPI we read and the resolution
-        // the duplication hands us, with no error anywhere: a 2560x1440 screen arrives as
-        // 2048x1152 and the OCR gets the blur.
         let aware = unsafe {
             AreDpiAwarenessContextsEqual(
                 GetThreadDpiAwarenessContext(),
@@ -133,8 +130,10 @@ impl CaptureEngine {
         self.dxgi.monitors()
     }
 
-    /// Throw away whatever the fallback is holding, and refuse anything captured up to now.
-    /// Guarantee: no frame captured before the most recent call is ever returned by `capture_all`.
+    /// Throw away whatever the fallback is holding, and refuse every frame whose callback began up
+    /// to now. Guarantee: no frame whose callback began before the most recent call is ever
+    /// returned by `capture_all`; pixels can predate that boundary by however long the frame
+    /// waited in the frame pool before its callback ran.
     ///
     /// The daemon calls this on every tick its privacy gate blocks — paused, or the foreground
     /// window blacklisted. The gate only stops the tick from *reading*; the fallback's callback
@@ -159,12 +158,8 @@ impl CaptureEngine {
                 return Vec::new();
             }
         };
-        // A detached monitor takes its failover state with it, so one that comes back is tried on
-        // the primary again rather than inheriting the run of failures that lost it.
         self.failover
             .retain(|id, _| monitors.iter().any(|monitor| &monitor.id == id));
-        // Same reason, for the resources: the fallback prunes its own sessions only when it is
-        // asked to capture, which never happens again once the last monitor using it is gone.
         self.wgc.retain_monitors(&monitors);
 
         let mut frames = Vec::new();
@@ -180,13 +175,8 @@ impl CaptureEngine {
                 Backend::Primary => self.dxgi.capture(&monitor.id),
                 Backend::Fallback => self.wgc.capture(&monitor.id),
             };
-            // A forced backend is not evidence about the primary's health, so the failover state
-            // machine sits the tick out.
             if !self.force_fallback {
                 let switched = state.record(target, outcome(&result), now);
-                // A primary attempt that failed and left the monitor on the fallback must not cost
-                // the tick its frame: that is where the probe, and the failover itself, gets to be
-                // cheap.
                 if target == Backend::Primary && state.target(now) == Backend::Fallback {
                     result = self.wgc.capture(&monitor.id);
                     state.record(Backend::Fallback, outcome(&result), now);
@@ -209,9 +199,6 @@ impl CaptureEngine {
                     self.reported.remove(&monitor.id);
                     frames.push(frame);
                 }
-                // An idle screen produces no update at all, which is the answer, not a failure —
-                // and an answer ends the last reported failure, or its next recurrence would be
-                // swallowed as a repeat of news already told.
                 Err(CaptureError::Recoverable(Recoverable::NoNewFrame)) => {
                     self.reported.remove(&monitor.id);
                 }

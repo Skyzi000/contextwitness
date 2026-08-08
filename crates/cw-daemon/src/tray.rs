@@ -1,5 +1,3 @@
-// The tray icon and its menu (plan Task 23).
-
 use crate::autostart;
 use cw_core::config::DataPaths;
 use cw_store::control::Pause;
@@ -68,8 +66,6 @@ fn run(paths: DataPaths) -> Result<(), Box<dyn std::error::Error>> {
         AUTOSTART,
         "Autostart",
         true,
-        // A registry the tray cannot read leaves the box clear rather than refusing to start: the
-        // pause controls are worth more than the checkbox.
         autostart::is_enabled().unwrap_or_else(|error| {
             error!("the autostart registration could not be read: {error}");
             false
@@ -85,7 +81,6 @@ fn run(paths: DataPaths) -> Result<(), Box<dyn std::error::Error>> {
         &PredefinedMenuItem::separator(),
         &MenuItem::with_id(OPEN_FOLDER, "Open data folder", true, None),
         &autostart_item,
-        // Quit ends the collection, so it does not sit against something reached by a slip.
         &PredefinedMenuItem::separator(),
         &MenuItem::with_id(QUIT, "Quit", true, None),
     ])?;
@@ -108,15 +103,14 @@ fn run(paths: DataPaths) -> Result<(), Box<dyn std::error::Error>> {
         showing_paused: false,
         last_poll: std::time::Instant::now(),
     };
-    // Before the first wait, so a daemon started while a pause is in force comes up gray.
     state.follow_pause();
 
     event_loop.run(move |_event, _target, control_flow| {
         while let Ok(event) = MenuEvent::receiver().try_recv() {
             state.act(&event.id.0);
         }
-        // Nothing here acts on clicks, but the channel behind them is unbounded and every mouse
-        // move across the icon posts to it, so somebody has to empty it.
+        // The click channel is unbounded and every mouse move across the icon posts to it, so
+        // somebody has to empty it.
         while TrayIconEvent::receiver().try_recv().is_ok() {}
 
         if state.last_poll.elapsed() >= POLL {
@@ -145,8 +139,7 @@ impl Tray {
                 self.follow_pause();
             }
             OPEN_FOLDER => {
-                // Not waited on: Explorer hands the window to an already running instance and can
-                // outlive this process, and a tray blocked here would stop answering its menu.
+                // Explorer can outlive this process, and a blocked tray stops answering its menu.
                 if let Err(error) = std::process::Command::new("explorer.exe")
                     .arg(&self.root)
                     .spawn()
@@ -157,11 +150,9 @@ impl Tray {
             AUTOSTART => self.toggle_autostart(),
             QUIT => {
                 info!("quitting on the tray's Quit");
-                // Nothing to unwind: every connection is in WAL, where a write cut off mid-way is
-                // rolled back by whoever opens the database next.
+                // Nothing to unwind: a WAL write cut off mid-way is rolled back on the next open.
                 std::process::exit(0);
             }
-            // Not this build's: the ids above are the whole menu, and the separators send nothing.
             other => error!(id = other, "an unknown tray menu item was activated"),
         }
     }
@@ -203,8 +194,6 @@ impl Tray {
                 return;
             }
         };
-        // A deadline already past is stored as given, so whether it still stops capture is decided
-        // here against one instant, the same way the capture loop decides it.
         let now = chrono::Utc::now();
         let paused = match pause {
             Some(Pause::Indefinite) => true,
@@ -221,7 +210,6 @@ impl Tray {
             self.active_icon.clone()
         };
         match self.tray.set_icon(Some(icon)) {
-            // Only once the swap took: otherwise the next poll tries again.
             Ok(()) => self.showing_paused = paused,
             Err(error) => error!("the tray icon could not be swapped: {error}"),
         }
@@ -235,7 +223,6 @@ fn disc(rgb: [u8; 3]) -> Result<Icon, tray_icon::BadIcon> {
     let mut rgba = Vec::with_capacity((ICON_SIZE * ICON_SIZE * 4) as usize);
     for y in 0..ICON_SIZE {
         for x in 0..ICON_SIZE {
-            // Pixel centres, so the disc is centred on the square rather than a half pixel off it.
             let dx = x as f32 + 0.5 - radius;
             let dy = y as f32 + 0.5 - radius;
             let inside = dx * dx + dy * dy <= radius * radius;

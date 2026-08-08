@@ -1,5 +1,3 @@
-// The capture tick: pause, privacy gate, change detection, OCR, store.
-
 use std::collections::HashMap;
 
 use cw_core::change::{Thumbnail, frame_changed};
@@ -22,12 +20,9 @@ pub fn run(
     config: Config,
 ) -> ! {
     let interval = std::time::Duration::from_secs(config.capture.interval_secs);
-    // The capture sessions are persistent, so the engine outlives the tick that reads from it.
     let mut previous: HashMap<String, Thumbnail> = HashMap::new();
     let mut health_written: Option<std::time::Instant> = None;
     let mut threshold_warned: std::collections::HashSet<String> = std::collections::HashSet::new();
-    // Outlives the tick for the same reason `threshold_warned` does: a monitor whose save fails the
-    // same way every tick would otherwise write the same line every couple of seconds forever.
     let mut save_failed: HashMap<String, String> = HashMap::new();
 
     loop {
@@ -43,16 +38,11 @@ pub fn run(
             &mut threshold_warned,
             &mut save_failed,
         ) {
-            // A tick can die before it judged the pause or the privacy gate — `mark_tick` and
-            // `get_pause` both talk to the store — and the fallback's callbacks kept writing
-            // frames the whole time. Failing closed costs at most one frame on an errored tick;
-            // failing open shows a screen the gate may have been refusing.
+            // Fail closed: the tick may have died before it judged the pause or the privacy gate,
+            // and failing open shows a screen the gate may have been refusing.
             capture.discard_pending();
             error!("tick failed: {error}");
         }
-        // One tick at a time, and an overrun coalesces into a single immediate rerun rather than a
-        // backlog (design §7): this loop is sequential, so the only thing to get right is that a
-        // tick which outran the interval does not then sleep a whole one on top.
         if let Some(remaining) = interval.checked_sub(started.elapsed()) {
             std::thread::sleep(remaining);
         }
@@ -92,10 +82,6 @@ fn tick(
             cw_store::control::Pause::Until(deadline) => chrono::Utc::now() < deadline,
         };
         if paused {
-            // The fallback's callback threads keep writing frames while the pass is not reading;
-            // without this, the first tick after the pause could store a screen from the middle
-            // of it. (A frame from the gap between the last paused tick and the actual lift is
-            // still accepted — the ceiling is one tick interval.)
             capture.discard_pending();
             mark_tick(conn, health_written, started)?;
             debug!("capture is paused");
@@ -103,19 +89,9 @@ fn tick(
         }
     }
 
-    // An unplugged monitor would otherwise keep its thumbnail for the life of the process. Retained
-    // against the monitors that exist, not the ones `capture_all` answered with: that call omits
-    // any monitor with no new frame, and dropping those would throw away the baseline that
-    // sub-threshold changes accumulate against. An enumeration that fails leaves the map alone.
     if let Ok(monitors) = capture.monitors() {
         previous.retain(|id, _| monitors.iter().any(|monitor| &monitor.id == id));
-        // Startup aborted on this; a monitor plugged in since then gets an error instead, because
-        // ending the daemon here would trade one silent monitor for silence on all of them. Once
-        // per monitor: unplugging it clears the entry, so plugging it back in — possibly at a new
-        // resolution — is judged afresh.
         threshold_warned.retain(|id| monitors.iter().any(|monitor| &monitor.id == id));
-        // Same reasoning as the two above: an unplugged monitor's last failure must not be held for
-        // the life of the process, and plugging it back in is judged afresh.
         save_failed.retain(|id, _| monitors.iter().any(|monitor| &monitor.id == id));
         for monitor in &monitors {
             if !cw_core::change::change_threshold_is_reachable(
@@ -164,11 +140,8 @@ fn tick(
         );
     }
 
-    // When this mark becomes readable, every shot the pass pulled has been stored or refused. A
-    // shot that lands later can stamp at most `STALE_SHOT_SECONDS` below the mark: a callback that
-    // stamped just before `started` may still post within that allowance. The capture side refuses
-    // anything older, so the closer's grace covers what does land. An error return skips the mark,
-    // which stalls the closer — the safe direction.
+    // When this mark becomes readable, every shot the pass pulled has been stored or refused. An
+    // error return skips the mark, which stalls the closer — the safe direction.
     mark_tick(conn, health_written, started)?;
 
     Ok(())
@@ -198,16 +171,11 @@ pub(crate) fn pass(
         &config.privacy.process_blacklist,
     ) {
         CaptureDecision::Capture => None,
-        // The process is the whole detail: a window title would put into the audit trail the very
-        // thing the blacklist exists to keep out.
         CaptureDecision::SkipBlacklisted { process } => Some(process),
         CaptureDecision::SkipUnknownForeground => Some("unknown foreground process".to_owned()),
     };
     if let Some(detail) = skip_detail {
-        // Same contract as the pause: a frame the fallback captured while the gate was closed
-        // must not survive into the first allowed pass. Before the audit write, because the
-        // discard cannot fail and the write can — an audit that answers SQLITE_BUSY must not
-        // leave the gated frames waiting for a tick the gate no longer refuses.
+        // Before the audit write: the discard cannot fail and the write can.
         capture.discard_pending();
         cw_store::control::record_event(
             conn,
@@ -218,16 +186,13 @@ pub(crate) fn pass(
                 detail: Some(detail),
             },
         )?;
-        // Without the process name: the audit trail is where that belongs, and the log is a file
-        // this program keeps screen-derived names out of.
+        // Without the process name: the audit trail is where that belongs, not the log.
         debug!("tick skipped by the privacy gate");
         return Ok(Vec::new());
     }
 
     let mut changed = Vec::new();
     for frame in capture.capture_all() {
-        // Skipped before change detection, so an unwanted monitor's baseline is not advanced by a
-        // pass that was never going to store it.
         if only.is_some_and(|wanted| !wanted.contains(&frame.monitor_id)) {
             continue;
         }
@@ -238,8 +203,7 @@ pub(crate) fn pass(
         }
     }
 
-    // One thread per changed monitor: OCR costs seconds per frame, and run in sequence it is the
-    // whole tick. `recognize` initializes the Windows Runtime on whichever thread calls it.
+    // `recognize` initializes the Windows Runtime on whichever thread calls it.
     let outcomes: Vec<_> = std::thread::scope(|scope| {
         let mut handles = Vec::new();
         for (frame, _) in &changed {
@@ -261,8 +225,6 @@ pub(crate) fn pass(
     let mut stored_at = None;
     let mut stored_frames = Vec::new();
     for ((frame, thumbnail), ocr) in changed.into_iter().zip(outcomes) {
-        // The backend's stamp, not now: OCR just spent seconds, and an observation dated after it
-        // lands whole seconds late — far enough to put a frame in the wrong five-minute window.
         let captured_at = frame.captured_at;
         let text_chars = ocr.text.as_deref().map_or(0, |text| text.chars().count());
         let payload = ScreenPayload {
@@ -278,10 +240,8 @@ pub(crate) fn pass(
             foreground_window_title: foreground.title.clone(),
         };
         let mut observation = Observation::new_screen(payload, captured_at);
-        // This id and instant are the ones `save_with_observation` gets below, which is what makes
-        // the path recorded here the path it writes. The `images/` prefix is the payload's spelling
-        // only: delivered paths are data_dir-relative (design §4.2), while the images table keys
-        // on the path relative to the images root.
+        // The `images/` prefix is the payload's spelling only: delivered paths are
+        // data_dir-relative, the images table keys on the path relative to the images root.
         if let SourcePayload::Screen(payload) = &mut observation.payload {
             payload.image_path = Some(format!(
                 "images/{}",
@@ -289,9 +249,6 @@ pub(crate) fn pass(
             ));
         }
         let rgb = bgra_to_rgb(&frame.bgra);
-        // One transaction for the observation row and the image row: committed apart, a crash
-        // between them would permanently leave an observation advertising a path no file will
-        // ever answer to — the startup sweep reconciles files and image rows, not observations.
         let stored = match cw_store::images::save_with_observation(
             conn,
             &paths.images(),
@@ -303,25 +260,17 @@ pub(crate) fn pass(
             captured_at,
         ) {
             Ok(stored) => {
-                // Whatever it was, it is over; the next failure is news again.
                 save_failed.remove(&frame.monitor_id);
                 stored
             }
-            // Isolated to the one monitor rather than ending the pass: a monitor that fails
-            // deterministically — a frame wider than WebP's 16,383px limit, say — sits at a fixed
-            // place in the enumeration, so ending the pass on it starves every monitor behind it
-            // for as long as it stays plugged in, and collecting them all is the requirement.
+            // Isolated to the one monitor rather than ending the pass: a frame wider than WebP's
+            // 16,383px limit would starve every monitor behind it in the enumeration.
             Err(error) => {
                 let message = error.to_string();
-                // Once per distinct message: a deterministic failure recurs every tick — seconds
-                // apart — and would otherwise fill the log with one repeated line. A different
-                // message, or a success in between, is a new thing to say.
                 if save_failed.get(&frame.monitor_id) != Some(&message) {
                     error!(monitor = %frame.monitor_id, "failed to store frame: {message}");
                     save_failed.insert(frame.monitor_id.clone(), message);
                 }
-                // The frame is lost on both backends. Keeping the baseline where it was only keeps
-                // a later desktop update judgeable as a change.
                 continue;
             }
         };
@@ -336,8 +285,6 @@ pub(crate) fn pass(
             relative_path: stored,
         });
     }
-    // Once per tick rather than once per monitor: all three writes would carry the same tick and
-    // `status` reads one value.
     if let Some(at) = stored_at {
         cw_store::control::set_health(conn, HealthKey::LastCapture, at)?;
     }

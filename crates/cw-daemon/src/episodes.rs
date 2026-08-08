@@ -1,5 +1,3 @@
-// Closing windows into episodes: the startup rescan and the periodic closer are one pass.
-
 use chrono::{DateTime, TimeDelta, Utc};
 use cw_store::episodes::Registration;
 use tracing::{debug, error, info};
@@ -57,26 +55,20 @@ pub fn close_due(
     let Some(last_tick) =
         cw_store::control::get_health(conn, cw_store::control::HealthKey::LastTick)?
     else {
-        // No mark has ever been published for this database: it may be a capture-once-seeded
-        // store, or this daemon may not have finished its first pass. There is no bound on what
-        // is still being persisted, so wall-clock grace alone cannot close a window. The first
-        // safe mark arrives when the first pass completes.
+        // No mark has ever been published for this database, so nothing bounds what is still being
+        // persisted and wall-clock grace alone cannot close a window.
         return Ok(0);
     };
     if cursor.is_none() {
         *cursor = resume_point(conn, window_minutes)?;
     }
     let Some(start) = cursor.as_mut() else {
-        // Nothing has ever been observed, so there is no window to close yet.
         return Ok(0);
     };
     let window = TimeDelta::minutes(i64::from(window_minutes));
-    // The mark is the start time of the last completed pass, written after the pass. A stamp not
-    // yet stored can lie at most `STALE_SHOT_SECONDS` below the mark: the capture side refuses to
-    // post anything older and restarts the session instead. The compile-time assert beside
-    // `GRACE_SECONDS` keeps that allowance inside this grace. The mark covers this daemon's writer
-    // only; a concurrent `capture-once`, a daemon in another Windows session, and backward
-    // wall-clock corrections are outside its guarantee.
+    // A stamp not yet stored can lie at most `STALE_SHOT_SECONDS` below the mark. The mark covers
+    // this daemon's writer only: a concurrent `capture-once`, a daemon in another Windows session,
+    // and backward wall-clock corrections are outside it.
     let deadline = (now - TimeDelta::seconds(GRACE_SECONDS))
         .min(last_tick - TimeDelta::seconds(GRACE_SECONDS));
     let mut registered = 0;
@@ -84,10 +76,7 @@ pub fn close_due(
     while *start + window <= deadline {
         let end = *start + window;
         // The offset that stood over this window, not the one standing now: the startup rescan
-        // closes windows from days ago, and in a zone with daylight saving the two are an hour
-        // apart for every window on the other side of the change. Only the rendered body uses it —
-        // ids and metadata are UTC — and cw-core takes it as an argument so that nothing in it
-        // consults a clock.
+        // closes windows from days ago, and daylight saving puts the two an hour apart.
         let offset = chrono::TimeZone::offset_from_utc_datetime(&chrono::Local, &start.naive_utc());
         let observations = cw_store::observations::find_in_window(conn, *start, end)?;
         if let Some(episode) =
@@ -113,7 +102,6 @@ pub fn close_due(
                 }
             }
         }
-        // After the insert, so a window whose registration failed is the one the next pass retries.
         *start = end;
     }
 
@@ -124,13 +112,9 @@ fn resume_point(
     conn: &rusqlite::Connection,
     window_minutes: u32,
 ) -> Result<Cursor, Box<dyn std::error::Error>> {
-    // A `window_minutes` changed since that episode was written leaves an end that is not a
-    // boundary of the current length, and `window_start` alone straightens it towards the side
-    // that overlaps what was already registered: the overlapping window would carry those same
-    // observations a second time under a different `document_id`, and the UNIQUE reads the id
-    // only, so nothing objects. Resuming at the far boundary instead leaves the remainder of the
-    // straddled window unregistered, which the reader sees as a gap rather than as two episodes it
-    // has no way to tell apart. An end already on a boundary of the new length costs nothing.
+    // A `window_minutes` changed since that episode leaves an end off the new boundaries. Resuming
+    // at the far boundary rather than the near one: the overlapping window would carry the same
+    // observations again under a different `document_id`, and the UNIQUE reads the id only.
     if let Some(end) = cw_store::episodes::latest_end(conn, SOURCE)? {
         let aligned = cw_core::episode::window_start(end, window_minutes);
         if aligned < end {
@@ -145,7 +129,6 @@ fn resume_point(
         return Ok(Some(aligned));
     }
 
-    // No episode has ever been registered out of this database, so there is no window to land beside.
     Ok(earliest_observation(conn)?.map(|at| cw_core::episode::window_start(at, window_minutes)))
 }
 
@@ -153,9 +136,7 @@ fn earliest_observation(
     conn: &rusqlite::Connection,
 ) -> Result<Option<DateTime<Utc>>, Box<dyn std::error::Error>> {
     let spelled: Option<String> = conn.query_one(EARLIEST_OBSERVATION, [], |row| row.get(0))?;
-    // cw-store spells every TEXT time column with `to_rfc3339_opts(Nanos, true)` (design §4.3) and
-    // keeps the reader for it private, so this asks RFC 3339 for the value that spelling stands
-    // for. Only the resume point of a database with no episodes at all comes through here.
+    // cw-store spells every TEXT time column as RFC 3339 and keeps its reader private.
     let Some(spelled) = spelled else {
         return Ok(None);
     };

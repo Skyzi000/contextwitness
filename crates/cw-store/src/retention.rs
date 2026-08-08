@@ -1,11 +1,7 @@
-// Image retention: age and size sweeps.
-
 use crate::{StoreError, images, timestamp};
 
-// Both orders are the same one, and it is the order the size sweep deletes in: oldest first, with
-// the id breaking a tie so two images written in the same instant are still visited in a fixed
-// order. `created_at` is compared as text, which is time order only for the spelling
-// `timestamp::to_sql` writes.
+// `created_at` is compared as text, which is time order only for the spelling `timestamp::to_sql`
+// writes.
 const SELECT_EXPIRED: &str = "SELECT observation_id, byte_size FROM images \
      WHERE created_at < ?1 ORDER BY created_at, observation_id";
 const SELECT_OLDEST_FIRST: &str =
@@ -31,9 +27,8 @@ pub fn sweep(
 ) -> Result<Sweep, StoreError> {
     let mut swept = Sweep::default();
 
-    // A cutoff that cannot be spelled is one nothing is older than: `to_sql` refuses years outside
-    // 0000 through 9999 and refuses to write them as well, so a retention long enough to reach past
-    // year 0 selects nothing rather than failing the whole sweep.
+    // A cutoff `to_sql` refuses — a retention long enough to reach past year 0 — selects nothing
+    // rather than failing the whole sweep.
     let cutoff = chrono::TimeDelta::try_days(i64::from(retention_days))
         .and_then(|span| now.checked_sub_signed(span))
         .and_then(|cutoff| timestamp::to_sql(cutoff).ok());
@@ -45,8 +40,6 @@ pub fn sweep(
         }
     }
 
-    // Measured after the age sweep has committed, so the budget is charged for what is left. Rows
-    // the age sweep could not delete are among them, because their files are still on the disk.
     let cap = i64::try_from(max_gib.saturating_mul(BYTES_PER_GIB)).unwrap_or(i64::MAX);
     let mut total: i64 = conn
         .query_one(SELECT_TOTAL_BYTES, [], |row| row.get(0))
@@ -68,7 +61,6 @@ pub fn sweep(
     Ok(swept)
 }
 
-// Answers whether the image went, and records what that cost or freed.
 fn delete_one(
     conn: &mut rusqlite::Connection,
     root: &std::path::Path,
@@ -76,9 +68,9 @@ fn delete_one(
     byte_size: i64,
     swept: &mut Sweep,
 ) -> Result<bool, StoreError> {
-    // `images::delete` looks a row up in the canonical spelling of the id it is given, so a row
-    // holding any other spelling would have it delete nothing and answer `Ok` — counted as freed
-    // while it goes on charging its `byte_size` against a budget it still occupies.
+    // `images::delete` looks a row up in the canonical spelling of the id, so a row holding any
+    // other spelling would delete nothing and answer `Ok` — counted as freed while it still
+    // charges its `byte_size` against the budget.
     let Some(parsed) = ulid::Ulid::from_string(id)
         .ok()
         .filter(|parsed| parsed.to_string() == id)
@@ -92,12 +84,8 @@ fn delete_one(
             swept.freed_bytes += u64::try_from(byte_size).unwrap_or(0);
             Ok(true)
         }
-        // One file the filesystem will not take back — held open, read-only, a removal that failed
-        // partway — must not decide whether every other expired image is deleted, and neither must
-        // one row naming a path this program would not have written. Both leave the row where it
-        // is, so the next sweep asks again. A failure in SQLite is not one of them: the next row
-        // would fail the same way, and a sweep that answers `Ok` with nothing done would say the
-        // disk is being kept under its budget when nothing is being deleted at all.
+        // One file the filesystem will not take back — or one row whose stored path cannot be read
+        // back — must not decide whether every other expired image is deleted.
         Err(StoreError::ImageIo { .. } | StoreError::Encoding { .. }) => {
             swept.skipped += 1;
             Ok(false)

@@ -27,8 +27,6 @@ const TEMPORARY_ATTEMPTS: u32 = 64;
 /// already there, and what is already there may be a link, in which case a truncating open empties
 /// the file at the other end of it, with this program's rights and before the destination's
 /// no-clobber rename can refuse anything. A taken name is therefore a reason to try the next one.
-/// The filesystem is also the only party that can keep two attempts apart, since the other one may
-/// be in another process: two callers both start at zero and exactly one of them gets it.
 pub fn create_temporary_beside(
     destination: &std::path::Path,
 ) -> std::io::Result<(std::path::PathBuf, std::fs::File)> {
@@ -49,8 +47,7 @@ pub fn create_temporary_beside(
             Ok(file) => return Ok((temporary, file)),
             // Not only `AlreadyExists`: on Windows a name held by a directory answers
             // `PermissionDenied`, and so does a deleted name on a filesystem that keeps it until
-            // its last handle closes. Either way this call did not get the name, which is the only
-            // thing it needs to know before trying the next one.
+            // its last handle closes.
             Err(source)
                 if matches!(
                     source.kind(),
@@ -94,17 +91,12 @@ pub fn rename_without_replacing(
         Storage::FileSystem::{FILE_RENAME_INFO, FileRenameInfo, SetFileInformationByHandle},
     };
 
-    // `fs::rename` cannot be used to publish a config: on Windows it is MoveFileExW with
-    // MOVEFILE_REPLACE_EXISTING and silently replaces the destination.
-    // Creating the destination first and filling it afterwards is no better — the name exists
-    // before the content does, so a concurrent `setup` is told the config is ready, writes the
-    // user's settings into the empty shell, and has them replaced a moment later. Renaming by
-    // handle with ReplaceIfExists = FALSE makes the name appear already holding the full template,
-    // and it works on exFAT as well as NTFS. It is not the only call that would refuse a taken
-    // destination: `MoveFileExW` with no flags answers `ERROR_ALREADY_EXISTS` and leaves both files
-    // as they were. What the handle adds is that it
-    // moves the file this call opened, rather than whatever its source name has come to mean by
-    // now.
+    // `fs::rename` cannot publish a config: on Windows it is MoveFileExW with
+    // MOVEFILE_REPLACE_EXISTING and silently replaces the destination. Creating the destination
+    // first and filling it afterwards is no better — the name exists before the content does.
+    // `MoveFileExW` with no flags would refuse a taken destination too; what renaming by handle
+    // adds is that it moves the file this call opened, rather than whatever its source name has
+    // come to mean by now. Works on exFAT as well as NTFS.
     let destination = std::path::absolute(destination)?;
     let destination: Vec<u16> = destination.as_os_str().encode_wide().collect();
     let name_bytes = destination.len() * std::mem::size_of::<u16>();
@@ -126,7 +118,7 @@ pub fn rename_without_replacing(
             (buf.len() * 8) as u32,
         )
     };
-    let already_exists = windows::core::HRESULT::from_win32(ERROR_ALREADY_EXISTS.0); // 0x800700B7
+    let already_exists = windows::core::HRESULT::from_win32(ERROR_ALREADY_EXISTS.0);
 
     match result {
         Ok(()) => Ok(true),
@@ -223,9 +215,6 @@ fn path_from_sized_query(
     use std::os::windows::ffi::OsStringExt;
 
     for _ in 0..FINAL_PATH_ATTEMPTS {
-        // Asked for the room first, and then for the name. Running out of room in between is not a
-        // failure and is not reported as one, so it is asked again rather than given whatever
-        // `GetLastError` was left holding.
         let required = query(&mut []);
         if required == 0 {
             return Err(std::io::Error::last_os_error());
@@ -236,7 +225,6 @@ fn path_from_sized_query(
         if written == 0 {
             return Err(std::io::Error::last_os_error());
         }
-        // Fitting strictly inside is what separates a name from the room a name needs.
         if (written as usize) < buffer.len() {
             return Ok(std::ffi::OsString::from_wide(&buffer[..written as usize]).into());
         }
@@ -316,9 +304,6 @@ mod tests {
         std::io::Write::write_all(&mut file, DEFAULT_CONFIG_TOML.as_bytes())
             .expect("the default config should be writable to the temporary");
 
-        // The public entry point takes a fast path when a config is already present, so target the
-        // helper directly: this is the branch where the config appears after that test, which
-        // cannot be reached through the public entry point deterministically.
         let renamed = rename_without_replacing(&file, &destination)
             .expect("a taken destination should be reported without an error");
         drop(file);
@@ -347,7 +332,6 @@ mod tests {
             "the destination should have been free"
         );
 
-        // Another party moves the published file aside and puts a different one at its name.
         let moved = unique_temp_path("delete-by-handle-moved");
         std::fs::rename(&destination, &moved).expect("the published file should be movable");
         std::fs::write(&destination, b"someone else's").expect("the freed name should be writable");
@@ -370,7 +354,6 @@ mod tests {
 
         let file = open_for_removal(&path).expect("an existing file should be openable to remove");
 
-        // Another party moves it aside and puts a different file at its name.
         let moved = unique_temp_path("open-for-removal-moved");
         std::fs::rename(&path, &moved).expect("the file should be movable");
         std::fs::write(&path, b"someone else's").expect("the freed name should be writable");
@@ -393,9 +376,6 @@ mod tests {
 
         let file = open_for_removal(&path).expect("an existing file should be openable to remove");
 
-        // What this handle gives away. The read and write bits are covered here and nowhere
-        // else. The removal bit is not: renaming a file needs it too, so every test that moves
-        // one out from under its handle fails without it as well.
         std::fs::File::open(&path).expect("a reader sharing what the library shares should get in");
         std::fs::OpenOptions::new()
             .write(true)
@@ -413,7 +393,6 @@ mod tests {
         let path = unique_temp_path("open-for-removal-directory");
         std::fs::create_dir(&path).expect("the directory should be creatable");
 
-        // The refusal is the guarantee; which kind carries it is not, and no caller reads it.
         open_for_removal(&path).expect_err("a directory must not open for removal");
 
         std::fs::remove_dir(&path).expect("the test directory should be removable");
@@ -448,13 +427,11 @@ mod tests {
         let contents = "bytes that were not this program's to empty";
         std::fs::write(&victim, contents).expect("the victim file should be writable");
 
-        // The name a fresh call tries first, planted as another name for a file this program has
-        // no business touching. Opening it to truncate would empty the victim through the link.
         let mut planted = destination.as_os_str().to_os_string();
         planted.push(format!(".tmp-{}-0", std::process::id()));
         let planted = std::path::PathBuf::from(planted);
-        // exFAT and FAT32 have no hard links, and the module supports them for the rename
-        // itself, so a volume that cannot make the planted link is stepped past, not failed.
+        // exFAT and FAT32 have no hard links, so a volume that cannot plant one is stepped past,
+        // not failed.
         let Ok(()) = std::fs::hard_link(&victim, &planted) else {
             std::fs::remove_dir_all(&temp_dir).expect("the test directory should be removable");
             return;
@@ -483,9 +460,6 @@ mod tests {
         std::fs::create_dir(&temp_dir).expect("the unique test directory should be creatable");
         let destination = temp_dir.join("config.toml");
 
-        // A reserving open on a name a directory holds answers
-        // `PermissionDenied`, not `AlreadyExists`, so a loop that steps past only the latter gives
-        // up here while every later name is free.
         let mut planted = destination.as_os_str().to_os_string();
         planted.push(format!(".tmp-{}-0", std::process::id()));
         let planted = std::path::PathBuf::from(planted);
@@ -542,8 +516,6 @@ mod tests {
         let answered = final_path_by_handle(&file).expect("the handle should answer its own name");
         drop(file);
 
-        // The sweep compares this against names taken from a walk over a canonicalized root, so an
-        // answer in any other form would never match one of them and every orphan would be kept.
         assert_eq!(answered, canonical);
 
         std::fs::remove_file(&path).expect("the test file should be removable");
@@ -555,9 +527,6 @@ mod tests {
         let moved = unique_temp_path("final-path-held-under-a-longer-name-than-before");
         std::fs::write(&held, b"held").expect("the file should be creatable");
 
-        // Opened under one name, which is then given to a different file. Anything that resolved
-        // the name after this point would be told about the newcomer while still holding the file
-        // it decided about, which is the confusion the sweep's check has to be immune to.
         let file = open_for_removal(&held).expect("the file should open for removal");
         std::fs::rename(&held, &moved).expect("a file open for removal should still be renamable");
         std::fs::write(&held, b"newcomer").expect("the freed name should take another file");
@@ -597,7 +566,6 @@ mod tests {
 
     #[test]
     fn a_name_that_grows_once_and_then_settles_is_answered() {
-        // The first round measures for `ab` and is asked to hold `abcd`, so it is asked again.
         let answered = path_from_sized_query(query_over(&["ab", "abcd", "abcd", "abcd"]))
             .expect("a name that stops growing should be answered");
 
@@ -606,8 +574,6 @@ mod tests {
 
     #[test]
     fn a_name_that_never_settles_is_refused_rather_than_truncated() {
-        // Every round measures for one name and is asked to hold a longer one. Answering at all
-        // here would mean answering with a name that was cut to fit.
         let error = path_from_sized_query(query_over(&[
             "a", "ab", "abc", "abcd", "abcde", "abcdef", "abcdefg", "abcdefgh",
         ]))
@@ -618,23 +584,17 @@ mod tests {
 
     #[test]
     fn a_query_that_answers_zero_is_a_failure() {
-        // Which failure it is comes from the operating system and is not decided here; that it is
-        // one is.
         path_from_sized_query(|_| 0).expect_err("zero must not be read as a name");
     }
 
     #[test]
     fn a_zero_after_room_was_granted_is_a_failure() {
-        // The first answer promised room for a name; the second withdrew it. Reading that zero
-        // as a length would answer with an empty path.
         path_from_sized_query(|buffer| if buffer.is_empty() { 4 } else { 0 })
             .expect_err("a zero after room was granted must not be read as a name");
     }
 
     #[test]
     fn an_answer_as_long_as_the_buffer_is_given_back_no_name() {
-        // An answer as long as the buffer asks for room the buffer already has, so no query that
-        // follows the convention produces it.
         let error = path_from_sized_query(|buffer| {
             if buffer.is_empty() {
                 4

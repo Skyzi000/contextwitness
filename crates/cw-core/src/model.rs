@@ -136,8 +136,7 @@ mod tests {
     fn payload_json_matches_golden_fixture() {
         let payload = fully_populated_screen_payload();
         // Spelled through `to_payload_json`, the conversion every stored row goes through: the
-        // struct's own Serialize orders keys as declared, which the database never sees —
-        // serde_json's maps sort their keys.
+        // struct's own Serialize orders keys as declared, while serde_json's maps sort them.
         let json = serde_json::to_string(
             &SourcePayload::Screen(payload)
                 .to_payload_json()

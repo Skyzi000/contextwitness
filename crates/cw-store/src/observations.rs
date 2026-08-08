@@ -9,10 +9,7 @@ const SELECT_BY_ID: &str = "SELECT id, source, observed_at, duration_ms, schema_
 /// Half-open in its contract, inclusive in its SQL: `[start, end)` is exactly `[start, end - 1ns]`
 /// because the instants this schema represents are the nanosecond grid — `to_sql` refuses an
 /// overflowing nanosecond field, so nothing storable lies strictly between the two.
-/// `build_episode` takes `[start, end)`, and adjacent
-/// five-minute windows have to tile: with both bounds inclusive an observation landing exactly on a
-/// boundary is delivered in two episodes, whose differing document ids mean nothing downstream
-/// notices. The `id` tiebreak is not decoration — one tick captures several monitors and can stamp
+/// The `id` tiebreak is not decoration — one tick captures several monitors and can stamp
 /// them with the same instant, and SQLite does not promise an order among equal sort keys.
 const SELECT_IN_WINDOW: &str = "SELECT id, source, observed_at, duration_ms, schema_version, payload FROM observations \
      WHERE observed_at >= ?1 AND observed_at <= ?2 ORDER BY observed_at, id";
@@ -38,10 +35,6 @@ pub fn insert(conn: &rusqlite::Connection, observation: &Observation) -> Result<
         id: id.clone(),
         source,
     })?;
-    // The write path must not accept anything `decode` cannot return: `from_parts` resolves the
-    // source column into a variant, so a payload naming a kind this build knows comes back as that
-    // kind rather than as what was handed in. Asking whether the round trip is faithful keeps the
-    // list of known sources in cw-core, where it belongs.
     let stored_as = serde_json::from_str(&payload)
         .map_err(|source| StoreError::Encoding {
             id: id.clone(),
@@ -108,17 +101,12 @@ pub fn find_in_window(
     start: chrono::DateTime<chrono::Utc>,
     end: chrono::DateTime<chrono::Utc>,
 ) -> Result<Vec<Observation>, StoreError> {
-    // An empty or reversed window is empty whatever its bounds spell, and answering it does not
-    // require them to be spellable at all.
     if end <= start {
         return Ok(Vec::new());
     }
 
-    // The window's last instant, which is what the statement compares against; asking for it rather
-    // than for `end` is also what lets a window end where no spelling exists, as year 10000 does.
-    // The guard above leaves `end` later than the earliest instant chrono has, so the subtraction
-    // cannot fail. `checked_sub_signed` rather than `-` because `-` answers that case with a panic
-    // instead of an empty window.
+    // `checked_sub_signed` rather than `-`: `-` answers an underflow with a panic instead of an
+    // empty window.
     let Some(last) = end.checked_sub_signed(chrono::TimeDelta::nanoseconds(1)) else {
         return Ok(Vec::new());
     };
@@ -326,7 +314,6 @@ mod tests {
         };
         let expected_id = observation.id.to_string();
 
-        // Without the check this row reads back as Screen, with `future_field` silently gone.
         let error = insert(&conn, &observation)
             .expect_err("the observation that would change should be refused");
         match error {
@@ -347,8 +334,6 @@ mod tests {
         let start = at("2026-07-25T12:00:00Z");
         let end = at("2026-07-25T12:05:00Z");
         let before = screen_observation_at(start - TimeDelta::nanoseconds(1));
-        // Fixed ids running against the timestamps, so a swap to `ORDER BY id, observed_at` fails
-        // every run.
         let mut at_start = screen_observation_at(start);
         at_start.id = ulid::Ulid::from(9u128);
         let mut before_end = screen_observation_at(end - TimeDelta::nanoseconds(1));
@@ -370,8 +355,6 @@ mod tests {
         let path = dir.path().join("db.sqlite3");
         let conn = db::open(&path).expect("the fresh database should initialize");
         let start = at("2026-07-25T12:00:00Z");
-        // Fixed ids running against the timestamps, so a swap to `ORDER BY id, observed_at` fails
-        // every run.
         let mut oldest = screen_observation_at(start);
         oldest.id = ulid::Ulid::from(9u128);
         let mut middle = screen_observation_at(start + TimeDelta::seconds(1));
@@ -404,8 +387,6 @@ mod tests {
 
         insert(&conn, &higher).expect("the higher-id observation should be stored first");
         insert(&conn, &lower).expect("the lower-id observation should be stored second");
-        // Without `, id` in the ORDER BY these come back in whatever order the query plan produced,
-        // which is the one thing a stable listing has to rule out.
         let found = find_in_window(&conn, observed_at, observed_at + TimeDelta::nanoseconds(1))
             .expect("the tied observations should be readable");
 
@@ -418,8 +399,6 @@ mod tests {
         let path = dir.path().join("db.sqlite3");
         let conn = db::open(&path).expect("the fresh database should initialize");
         let start = at("2026-07-25T12:00:00Z");
-        // Fixed ids running against the timestamps, so a swap to `ORDER BY id, observed_at` fails
-        // every run.
         let mut whole_second = screen_observation_at(start);
         whole_second.id = ulid::Ulid::from(9u128);
         let mut last_fraction = screen_observation_at(at("2026-07-25T12:00:00.999999999Z"));
@@ -427,8 +406,8 @@ mod tests {
 
         insert(&conn, &last_fraction).expect("the fractional observation should be stored");
         insert(&conn, &whole_second).expect("the whole-second observation should be stored");
-        // If zero fractions are dropped, the fractional row sorts below this window's lower bound,
-        // so this query loses a row rather than merely returning the rows out of order.
+        // If zero fractions were dropped, this query would lose the fractional row rather than
+        // merely return the rows out of order.
         let found = find_in_window(&conn, start, at("2026-07-25T12:00:01Z"))
             .expect("the one-second window should be readable");
 
@@ -467,11 +446,9 @@ mod tests {
             .expect("the leap second should be valid");
         let observation = screen_observation_at(observed_at);
 
-        // Without a row to find, an empty result proves nothing about the query.
         let ordinary = screen_observation_at(at("2016-12-31T23:59:59.999999999Z"));
         insert(&conn, &ordinary).expect("the ordinary observation should be stored");
 
-        // The window this test queries is the one that loses the value silently.
         let error = insert(&conn, &observation)
             .expect_err("the timestamp no window query could return should be refused");
         assert!(matches!(error, StoreError::TimestampOutOfRange { .. }));
@@ -507,10 +484,8 @@ mod tests {
             .expect("the unspellable empty window should be readable");
         assert_eq!(unspellable, Vec::new());
 
-        // Reversed *and* unspellable, which is the only combination that needs the guard: with the
-        // start at MAX_UTC, anything reaching `to_sql(start)` answers TimestampOutOfRange where the
-        // contract says empty. Each half alone is covered above and neither half alone would notice
-        // the guard weakening to `end == start`.
+        // Reversed *and* unspellable is the only combination that needs the guard; neither half
+        // alone would notice it weakening to `end == start`.
         let reversed_and_unspellable = find_in_window(&conn, DateTime::<Utc>::MAX_UTC, t)
             .expect("the reversed unspellable window should be readable");
         assert_eq!(reversed_and_unspellable, Vec::new());
@@ -529,7 +504,7 @@ mod tests {
             .expect("year 10000 should be valid");
 
         insert(&conn, &observation).expect("the last spellable observation should be stored");
-        // The exclusive end is year 10000, which has no spelling of its own, so this is what tells
+        // The exclusive end is year 10000, which has no spelling of its own: this is what tells
         // asking `<= end - 1ns` apart from asking against `end` itself.
         let found = find_in_window(&conn, start, end)
             .expect("the last spellable observation should be searchable");
@@ -633,8 +608,6 @@ mod tests {
         observation.id = id;
         let payload = payload_json(&observation).expect("the valid payload should serialize");
 
-        // This lower-cased spelling of a canonical ULID cannot be produced by this program, so
-        // write it with plain SQL; every other column uses its canonical spelling.
         conn.execute(
             "INSERT INTO observations \
              (id, source, observed_at, duration_ms, schema_version, payload) \
@@ -658,8 +631,6 @@ mod tests {
             other => panic!("expected Encoding, got {other:?}"),
         }
 
-        // A row must not be reachable by the window query and invisible to this lookup under the
-        // very id that query reports.
         let found = find_by_id(&conn, id).expect("the canonical observation id lookup should work");
         assert_eq!(found, None);
     }

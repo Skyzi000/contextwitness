@@ -3,8 +3,8 @@
 
 use std::time::{Duration, Instant};
 
-/// Consecutive failed ticks before the fallback takes over. The tick is a couple of seconds, so a
-/// mode change or a lock screen is ridden out rather than switched on.
+/// Consecutive failed ticks before the fallback takes over, so a mode change or a lock screen is
+/// ridden out rather than switched on.
 const FAILOVER_AFTER: u32 = 3;
 /// First primary probe after a failover, doubling per failed probe up to `MAX_PROBE_INTERVAL`.
 const FIRST_PROBE_DELAY: Duration = Duration::from_secs(1);
@@ -64,8 +64,6 @@ impl Failover {
         now: Instant,
     ) -> Option<Backend> {
         let (next, switched) = match (&self.state, used, outcome) {
-            // The fallback's own result decides nothing: it is where a monitor already is, and the
-            // way back is the probe below.
             (_, Backend::Fallback, _) => return None,
             (State::Primary { .. }, Backend::Primary, Outcome::Answered) => {
                 (State::Primary { failures: 0 }, None)
@@ -85,8 +83,6 @@ impl Failover {
                 },
                 None,
             ),
-            // The probe answered, so the primary is back. Both backends drop their own session on
-            // failure, which is what makes a device loss cost one tick and not a wedged session.
             (State::Fallback { .. }, Backend::Primary, Outcome::Answered) => {
                 (State::Primary { failures: 0 }, Some(Backend::Primary))
             }

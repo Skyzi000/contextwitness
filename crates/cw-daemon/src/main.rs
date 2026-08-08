@@ -12,12 +12,8 @@ mod maintenance;
 mod tray;
 
 fn main() {
-    // Built without a console so autostart does not flash one over the logon. A run typed into a
-    // terminal gets its output back by attaching to that terminal's console; attach failure means
-    // there is no parent console — a double-click, or the logon launch itself — and output has
-    // nowhere to go there anyway. Attaching resets every standard handle to the console, which
-    // silently steals `status > file` away from the file, so whatever was inherited as a
-    // redirection is put back afterwards.
+    // Attaching resets every standard handle to the console, silently stealing `status > file`
+    // away from the file, so whatever was inherited as a redirection is put back afterwards.
     use windows::Win32::System::Console::{
         ATTACH_PARENT_PROCESS, AttachConsole, GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE,
         STD_OUTPUT_HANDLE, SetStdHandle,

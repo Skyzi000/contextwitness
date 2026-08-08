@@ -262,8 +262,8 @@ impl Config {
             });
         }
 
-        // Capped at one day: entries render clock times without dates, and a day is the longest
-        // window in which one clock time cannot stand for two moments.
+        // Capped at one day: entries render clock times without dates, so a longer window would let
+        // one clock time stand for two moments.
         if !(1..=1440).contains(&self.episode.window_minutes) {
             return Err(ConfigError::Invalid {
                 field: "episode.window_minutes",
@@ -291,13 +291,9 @@ impl Config {
     /// still free, so the config never exists in a half-written or empty state that another
     /// process could mistake for a finished one.
     pub fn write_default_if_missing(path: &std::path::Path) -> Result<bool, ConfigError> {
-        // A fast path, not the check. Every startup after the first lands here, and the answer is
-        // already on disk — without this the common case creates a temporary, writes the template,
-        // flushes it to disk and deletes it again to learn what one `exists()` already said.
-        // A config that appears after this test is still refused by `rename_without_replacing`
-        // below, so nothing is overwritten either way. Removing this line would not be free,
-        // though: when the config is there and its directory refuses new files, this is what
-        // answers `Ok(false)` rather than reporting a write error for a file that needs nothing.
+        // A fast path, not the check — `rename_without_replacing` below still refuses a taken name.
+        // Not free to remove, though: when the config is there and its directory refuses new files,
+        // this is what answers `Ok(false)` rather than a write error for a file that needs nothing.
         if path.exists() {
             return Ok(false);
         }
@@ -320,9 +316,6 @@ impl Config {
         let write_result = std::io::Write::write_all(&mut file, DEFAULT_CONFIG_TOML.as_bytes())
             .and_then(|()| file.sync_all());
         if let Err(source) = write_result {
-            // Left behind, this looks like a stale config to anyone reading the directory, and it
-            // accumulates on every failed first run. Addressed to the handle, so what is discarded
-            // is the file this call wrote and not whatever the name has come to mean.
             let _ = delete_by_handle(&file);
             drop(file);
             return Err(ConfigError::Write {
@@ -355,20 +348,13 @@ impl Config {
     /// looking configured.
     /// Any other IO error -> ConfigError::Read; invalid TOML -> ConfigError::Parse.
     pub fn load_from_path(path: &std::path::Path) -> Result<Config, ConfigError> {
-        // Two tries, because publishing is concurrent by design: `write_default_if_missing`
-        // renames a finished config onto this name from any process, so metadata naming
-        // something real where the read just found nothing means the file was published between
-        // the two calls — the second read takes it. Measured: nothing static answers that way
-        // (a directory or junction at the name refuses the read as PermissionDenied, not
-        // NotFound), so the retry only ever chases a publication.
+        // Two tries: metadata naming something real where the read just found nothing means the
+        // config was published between the two calls. Measured: nothing static answers that way — a
+        // directory or junction at the name refuses the read as PermissionDenied, not NotFound.
         for _ in 0..2 {
             let text = match std::fs::read_to_string(path) {
                 Ok(text) => text,
                 Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-                    // A name that answers NotFound can still be occupied: a link whose target
-                    // is gone reads that way, and treating it as absence would run on defaults
-                    // forever — writing the default template is refused by that very name, so
-                    // nothing would ever surface it.
                     match path.symlink_metadata() {
                         Ok(meta) if meta.file_type().is_symlink() => {
                             return Err(ConfigError::Read {
@@ -383,9 +369,6 @@ impl Config {
                         Err(meta) if meta.kind() == std::io::ErrorKind::NotFound => {
                             return Ok(Self::default());
                         }
-                        // Any other answer is not absence but the ordinary read error the doc
-                        // promises; reading it as absence would hide a denied name behind the
-                        // defaults.
                         Err(meta) => {
                             return Err(ConfigError::Read {
                                 path: path.to_path_buf(),
@@ -411,8 +394,6 @@ impl Config {
             return Ok(config);
         }
 
-        // Reached only by two flips in a row: a name that keeps changing between a file and
-        // absence mid-read is refused rather than chased further.
         Err(ConfigError::Read {
             path: path.to_path_buf(),
             source: std::io::Error::other("the name kept flipping between a file and absence"),
@@ -438,12 +419,8 @@ impl StorageConfig {
         }
 
         let path = std::path::PathBuf::from(&self.data_dir);
-        // Refused rather than resolved against the current directory, which is not the same one
-        // for everybody: the daemon is started from the Run key and `pause` from a shell, so a
-        // relative data_dir has them open two different databases while both report success.
-        // `is_absolute` is what draws that line, and it draws it in both spellings that look
-        // absolute and are not — the drive-relative `D:foo`, which hangs off that drive's own
-        // current directory, and the root-relative `\foo`, which hangs off the current drive.
+        // `is_absolute` is what draws the line, and it draws it in both spellings that look
+        // absolute and are not — the drive-relative `D:foo` and the root-relative `\foo`.
         if !path.is_absolute() {
             return Err(ConfigError::Relative {
                 field: "storage.data_dir",
@@ -560,8 +537,6 @@ mod tests {
             "user-owned contents",
             "an existing config file must never be overwritten"
         );
-        // Nothing may appear beside the config: no scratch left over from its creation, and
-        // nothing from the second call, which is answered without writing at all.
         let entries: Vec<_> = std::fs::read_dir(
             path.parent()
                 .expect("the test config path should have a parent directory"),
@@ -592,7 +567,6 @@ mod tests {
         let mut config = Config::default();
         config.capture.change_pixel_threshold = 255;
 
-        // The `abs_diff` of two `u8` values can never exceed 255.
         assert!(
             matches!(
                 config.validate(),
@@ -630,9 +604,6 @@ mod tests {
 
     #[test]
     fn validate_accepts_the_smallest_and_largest_values_each_bound_allows() {
-        // Each refusal above says only that one value is out; it cannot tell the intended bound
-        // from one narrowed by a step, and a user is entitled to every value asserted here. The
-        // top of the pixel threshold has its own test above and is not repeated.
         let mut config = Config::default();
         config.capture.interval_secs = 1;
         config.capture.change_pixel_threshold = 0;
@@ -790,8 +761,6 @@ mod tests {
             std::path::PathBuf::from("D:/somewhere")
         );
 
-        // Every spelling that is resolved against a current directory, including the two that
-        // carry a drive letter or a leading separator and still are not absolute.
         for relative in ["captures", "./captures", "D:captures", "\\captures"] {
             let storage = StorageConfig {
                 data_dir: relative.to_owned(),
@@ -811,8 +780,6 @@ mod tests {
                 ),
                 "`{relative}` would name a different directory per process, got {error:?}"
             );
-            // The message is the only thing the user gets, so the key to edit and the value that
-            // was refused both have to be in it.
             let message = error.to_string();
             assert!(
                 message.contains("storage.data_dir") && message.contains(relative),
@@ -868,8 +835,6 @@ mod tests {
         let path = unique_temp_path("empty-config");
         std::fs::write(&path, "").expect("the empty test config should be writable");
 
-        // A config the user has emptied reads the same as no config at all, which is what
-        // `load_from_path` already does for a missing file.
         let config =
             Config::load_from_path(&path).expect("an empty config file should use defaults");
 

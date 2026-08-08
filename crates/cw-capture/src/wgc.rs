@@ -21,9 +21,10 @@ use crate::{
     CaptureError, Capturer, Frame, MonitorInfo, Recoverable, STALE_SHOT_SECONDS, enumerate_monitors,
 };
 
-/// WGC pushes a frame per screen update, up to the refresh rate, and every one of them costs a
-/// full-screen readback. The tick only ever reads the newest, so the callback drops whatever
-/// arrives inside this window; a screen that then goes still stays that much behind, once.
+/// WGC pushes a frame per screen update, up to the refresh rate, and a readback copies the full
+/// screen. The tick only ever reads the newest, so the callback returns before reading back
+/// anything that arrives inside this window; a screen that then goes still stays that much
+/// behind, once.
 const MIN_READBACK_INTERVAL: Duration = Duration::from_millis(500);
 
 /// How long a fresh session may stay silent before it is called broken instead of idle. After the
@@ -33,8 +34,6 @@ const FIRST_FRAME_GRACE: Duration = Duration::from_secs(5);
 type Mailbox = Arc<Mutex<Option<Shot>>>;
 type Control = CaptureControl<Sink, <Sink as GraphicsCaptureApiHandler>::Error>;
 
-/// Sessions are persistent, same as the duplication's: a session per capture is what ruled out the
-/// alternatives in the backend benchmark.
 pub(crate) struct WgcCapturer {
     known: Vec<(HMONITOR, MonitorInfo)>,
     sessions: HashMap<String, Session>,
@@ -53,7 +52,7 @@ impl WgcCapturer {
         }
     }
 
-    /// Drop a monitor's session, which is what the engine does once the primary is back.
+    /// Drop a monitor's session.
     pub(crate) fn release(&mut self, monitor_id: &str) {
         self.sessions.remove(monitor_id);
     }
@@ -95,9 +94,6 @@ impl Capturer for WgcCapturer {
     }
 
     fn capture(&mut self, monitor_id: &str) -> Result<Frame, CaptureError> {
-        // This backend runs only for the monitors the primary lost, so it reads the topology per
-        // attempt: an enumeration costs microseconds and a stale dpi scale silently mis-scales
-        // everything downstream.
         self.monitors()?;
         let discard_before = self.discard_before;
         let (handle, dpi_scale) = self
@@ -113,8 +109,6 @@ impl Capturer for WgcCapturer {
         };
 
         let captured = session.capture(monitor_id, dpi_scale, discard_before);
-        // Same rule as the duplication: anything but an idle screen ends the session, and the next
-        // tick builds a new one.
         if matches!(&captured, Err(error) if !matches!(error, CaptureError::Recoverable(Recoverable::NoNewFrame)))
         {
             self.sessions.remove(monitor_id);
@@ -149,8 +143,7 @@ struct Session {
 impl Session {
     fn open(handle: HMONITOR) -> Result<Self, CaptureError> {
         let mailbox: Mailbox = Arc::new(Mutex::new(None));
-        // Where the OS has no say over its capture border, asking for one costs the whole session,
-        // so the frame carries the border the OS draws instead.
+        // Asking for a borderless capture where the OS does not support it costs the whole session.
         let border = if GraphicsCaptureApi::is_border_settings_supported().unwrap_or(false) {
             DrawBorderSettings::WithoutBorder
         } else {
@@ -158,16 +151,15 @@ impl Session {
         };
         let settings = Settings::new(
             Monitor::from_raw_hmonitor(handle.0),
-            // The duplication never composes the cursor; a fallback that did would change what the
-            // record means depending on which backend answered.
+            // The duplication never composes the cursor; a fallback that did would change what
+            // the record means depending on which backend answered.
             CursorCaptureSettings::WithoutCursor,
             border,
             SecondaryWindowSettings::Default,
-            // Frames are thinned in the callback instead: the session-level interval needs an API
-            // that only the newest Windows builds have, and asking for it there fails the session.
+            // The session-level interval needs an API only the newest Windows builds have and
+            // fails the session on the rest; frames are thinned in the callback instead.
             MinimumUpdateIntervalSettings::Default,
             DirtyRegionSettings::Default,
-            // Same ask as the duplication, so an HDR or 10-bit desktop arrives converted.
             ColorFormat::Bgra8,
             mailbox.clone(),
         );
@@ -189,8 +181,6 @@ impl Session {
         dpi_scale: f32,
         discard_before: Option<Instant>,
     ) -> Result<Frame, CaptureError> {
-        // The capture thread ends when the item closes or the handler fails, and that is the only
-        // thing a mailbox can be asked about its own liveness.
         if self
             .control
             .as_ref()
@@ -201,9 +191,6 @@ impl Session {
 
         let shot = lock(&self.mailbox).take();
         match shot {
-            // Captured before the last discard: the gate was closed then, so this is the same
-            // answer as an empty mailbox. The session did speak, though, so it is not the silence
-            // the first-frame grace is watching for.
             Some(shot) if discard_before.is_some_and(|at| shot.arrived <= at) => {
                 self.delivered = true;
                 Err(Recoverable::NoNewFrame.into())
@@ -219,7 +206,6 @@ impl Session {
                     captured_at: shot.captured_at,
                 })
             }
-            // A session that has never spoken is broken; one that has is looking at a still screen.
             None if !self.delivered && self.opened.elapsed() > FIRST_FRAME_GRACE => {
                 Err(Recoverable::AccessLost.into())
             }
@@ -230,8 +216,7 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
-        // Dropping the control leaves its thread and its D3D device running forever, so the stop
-        // belongs here rather than at each of the places a session is dropped.
+        // Dropping the control leaves its thread and its D3D device running forever.
         if let Some(control) = self.control.take() {
             let _ = control.stop();
         }
@@ -260,13 +245,7 @@ impl GraphicsCaptureApiHandler for Sink {
         frame: &mut WgcFrame,
         _control: InternalCaptureControl,
     ) -> Result<(), Self::Error> {
-        // Stamped before anything else, so the stamp bounds when this frame's pixels are from. A
-        // readback takes real time, and a stamp taken after it would let a `discard_before`
-        // watermark drawn mid-readback fall between the pixels and their stamp — the shot would
-        // then outrank the watermark while showing the gated screen. Being monotonic is what makes
-        // that bound hold at all: on the wall clock a backwards correction lands the same way round
-        // even for a stamp taken first. What remains is the frame pool's own composition latency,
-        // one frame time.
+        // Stamped before anything else, so the wait for the readback is never inside the stamp.
         let arrived = Instant::now();
         let captured_at = chrono::Utc::now();
         if self
@@ -276,16 +255,12 @@ impl GraphicsCaptureApiHandler for Sink {
             return Ok(());
         }
 
-        // Hand-rolled instead of `Frame::buffer`: that one creates its staging texture as a local,
-        // maps it, and hands back a slice into the mapping — then releases the texture, still
-        // mapped, before the caller reads a byte. This owns the texture across the read and unmaps
-        // before dropping it. A new texture per call, not one cached in the sink, because
-        // `start_free_threaded` requires the handler to be `Send` and a D3D texture is not.
+        // Hand-rolled instead of `Frame::buffer`: that one hands back a slice into a mapping it
+        // has already released. A new texture per call because `start_free_threaded` requires the
+        // handler to be `Send` and a D3D texture is not.
         let (width, height) = (frame.width(), frame.height());
         let staging = StagingTexture::new(frame.device(), width, height, frame.desc().Format)?;
         let context = frame.device_context();
-        // 4 bytes per pixel throughout: the session asks the OS for `ColorFormat::Bgra8`, so the
-        // frame pool converts whatever the desktop really is.
         let row = width as usize * 4;
         let mut bgra = vec![0u8; row * height as usize];
         unsafe {
@@ -301,20 +276,13 @@ impl GraphicsCaptureApiHandler for Sink {
             }
             context.Unmap(staging.texture(), 0);
         }
-        // WGC hands back the composed alpha; the desktop image is opaque downstream.
         for pixel in bgra.chunks_exact_mut(4) {
             pixel[3] = 255;
         }
 
-        // Keep the freshness verdict and the post atomic with respect to a pull. A callback frozen
-        // (for example, across a suspend) before it acquires the guard is re-judged at its actual
-        // post time and refused when stale. One frozen inside the guard blocks the next pull until
-        // its shot lands, so that shot is stored by the pass that precedes the next mark. A
-        // not-yet-stored stamp can therefore lie at most `STALE_SHOT_SECONDS` below the mark; it
-        // need not be above it.
+        // Keep the freshness verdict and the post atomic with respect to a pull.
         // `Instant` (QPC) is the basis for elapsed time including standby and hibernate; UTC is an
-        // additional guard for wall-clock advancement. Backward wall-clock corrections are outside
-        // the guarantee.
+        // additional guard. Backward wall-clock corrections are outside the guarantee.
         let mut mailbox = lock(&self.mailbox);
         let now = Instant::now();
         let now_utc = chrono::Utc::now();
@@ -328,8 +296,8 @@ impl GraphicsCaptureApiHandler for Sink {
             || wall_elapsed > chrono::TimeDelta::seconds(STALE_SHOT_SECONDS as i64);
         if stale {
             drop(mailbox);
-            // The handler error ends this capture thread. The next pull sees `AccessLost` and
-            // removes the session; a later pull opens a fresh session and retries capture.
+            // The Err ends the capture thread; once it has ended, a pull sees `AccessLost`, drops
+            // the session, and a later pull opens a fresh one.
             return Err(format!(
                 "stale WGC callback exceeded the {STALE_SHOT_SECONDS}-second post allowance"
             )

@@ -1,5 +1,3 @@
-// Episode rows and their outbox registration.
-
 use crate::{StoreError, timestamp};
 
 const INSERT_EPISODE: &str = "INSERT INTO episodes \
@@ -30,17 +28,14 @@ pub fn insert_with_outbox(
     let start_at = timestamp::to_sql(episode.start_at)?;
     let end_at = timestamp::to_sql(episode.end_at)?;
     let created_at = timestamp::to_sql(created_at)?;
-    // Stored in the shape the wire takes, and delivered out of the column without being built
-    // again: that is what makes a retry, or a delivery after the renderer changed, send the same
-    // bytes under the same document id.
+    // Snapshotted rather than rebuilt at delivery: a retry, or a delivery after the renderer
+    // changed, sends the same bytes under the same document id.
     let metadata_json =
         serde_json::to_string(&episode.metadata).map_err(|source| StoreError::Encoding {
             id: id_text.clone(),
             source: Box::new(source),
         })?;
 
-    // One transaction: an episode row without its outbox row is a window that is recorded and
-    // never delivered, and an outbox row without its episode has nothing to send.
     let transaction = conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(|source| StoreError::Sql { source })?;
@@ -58,11 +53,6 @@ pub fn insert_with_outbox(
             created_at,
         ],
     ) {
-        // A constraint violation aborts the statement and leaves the transaction usable, so whether
-        // this window is already registered can be asked here. It is the rescan's ordinary answer
-        // rather than a failure: a rescan re-derives every window that closed, and the UNIQUE on
-        // `document_id` is what keeps the ones already registered from being delivered twice.
-        // Anything else this insert fails with speaks for itself.
         let already_registered = matches!(
             transaction.query_one(
                 COUNT_BY_DOCUMENT_ID,
@@ -77,8 +67,6 @@ pub fn insert_with_outbox(
         return Err(StoreError::Sql { source });
     }
 
-    // `next_attempt_at` is the instant the row may next be tried, so a fresh one carries the
-    // instant it was written and is due at once; NULL means no attempt is scheduled at all.
     transaction
         .execute(INSERT_OUTBOX, rusqlite::params![id_text, created_at])
         .map_err(|source| StoreError::Sql { source })?;
@@ -96,8 +84,8 @@ pub fn latest_end(
     conn: &rusqlite::Connection,
     source: &str,
 ) -> Result<Option<chrono::DateTime<chrono::Utc>>, StoreError> {
-    // The ORDER BY compares text, and it orders by time only because every row spells its instant
-    // at one width — `timestamp::to_sql`'s promise, not RFC 3339's.
+    // The ORDER BY compares text; it is time order only because every row spells its instant at one
+    // width — `timestamp::to_sql`'s promise, not RFC 3339's.
     let mut statement = conn
         .prepare(SELECT_LATEST)
         .map_err(|source| StoreError::Sql { source })?;

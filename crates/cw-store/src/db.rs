@@ -154,8 +154,8 @@ pub fn open(path: &std::path::Path) -> Result<rusqlite::Connection, StoreError> 
         .parent()
         .filter(|directory| !directory.as_os_str().is_empty())
     {
-        // Connection::open on a missing directory fails with SQLITE_CANTOPEN, which names nothing
-        // the user can act on, and every subsystem would otherwise have to create the directory.
+        // `Connection::open` on a missing directory fails with SQLITE_CANTOPEN, which names
+        // nothing the user can act on.
         std::fs::create_dir_all(directory).map_err(|source| StoreError::Directory {
             path: directory.to_path_buf(),
             source,
@@ -166,10 +166,8 @@ pub fn open(path: &std::path::Path) -> Result<rusqlite::Connection, StoreError> 
         path: path.to_path_buf(),
         source,
     })?;
-    // Held for the whole decision: a refusal below ends with this connection's close, and the
-    // clean close of a WAL database's last connection folds the log into the main file and
-    // deletes it — a change to a file a refusal leaves as found. Put back once the database is
-    // accepted as ours.
+    // A clean close of a WAL database's last connection folds the log into the main file and
+    // deletes it, so the checkpoint is held off until the database is accepted as ours.
     conn.set_db_config(
         rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
         true,
@@ -184,20 +182,10 @@ pub fn open(path: &std::path::Path) -> Result<rusqlite::Connection, StoreError> 
             source,
         })?;
 
-    // One snapshot, not three reads. `ownership` asks three separate questions, and a statement
-    // outside a transaction is its own implicit transaction, so another connection committing its
-    // migration between two of them combines an `application_id` of 0 read before that commit with
-    // a `sqlite_master` read after it — and calls a database this program has just created somebody
-    // else's. Without the transaction that happened on more than half of concurrent first starts.
-    // What makes it safe is not that a late connection waits, since it may find the migration
-    // committed and take its own lock without waiting at all, but that all three of its answers
-    // are answers about the same moment.
-    //
-    // Ownership before the version gate, because whose file this is has to be settled before which
-    // schema it is at. Settling it first keeps this program from asking for a write lock on a
-    // stranger's database, where a write that outlasts the busy timeout would have `migrate` report
-    // SQLITE_BUSY rather than name the owner. Neither is authoritative: `migrate` takes both again
-    // inside its write transaction, on the view its own writes land on.
+    // One snapshot, not three reads: outside a transaction, another connection committing its
+    // migration between two of `ownership`'s questions makes a database this program just created
+    // look like somebody else's. Ownership before the version gate, so no write lock is ever asked
+    // for on a stranger's database.
     {
         let snapshot = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
@@ -217,21 +205,11 @@ pub fn open(path: &std::path::Path) -> Result<rusqlite::Connection, StoreError> 
                 supported: SCHEMA_VERSION,
             });
         }
-        // Nothing was written, so there is nothing to commit and the rollback on drop is the end
-        // of it.
     }
 
-    // Migrate first, switch second. Everything applied above is per-connection; the WAL switch is
-    // written into the database header, where it would outlive a refusal. Ordering it after the
-    // migration means the only change this program orders is reached through the write transaction
-    // that decided the file is ours, and that decision cannot be overtaken: reading ownership and
-    // then switching left a window in which another program could create its own database at this
-    // path between the two, and a permanent journal mode change would already have landed on it by
-    // the time `migrate` refused. One change is not this program's to order at all: a database
-    // left mid-write with a hot rollback journal is recovered by SQLite before its first read
-    // answers, so ownership cannot be read from such a file without restoring it — measured, a
-    // foreign file copied out from under a live write stands at its owner's last commit after
-    // the refusal, its journal gone. What a refusal leaves as found is the file at rest.
+    // Migrate first, switch second: the WAL switch is written into the database header, where it
+    // would outlive a refusal. Switching before `migrate` decides the file is ours leaves a window
+    // for another program to create its own database at this path and take the change.
     migrate(&mut conn, path)?;
     enable_wal(&conn, path)?;
     conn.set_db_config(
@@ -246,11 +224,10 @@ pub fn open(path: &std::path::Path) -> Result<rusqlite::Connection, StoreError> 
 }
 
 fn migrate(conn: &mut rusqlite::Connection, path: &std::path::Path) -> Result<(), StoreError> {
-    // The version is read INSIDE the write transaction. On first start several subsystems open
-    // the database at the same moment, and a version read taken outside would let two of them
-    // both see 0 and both try to create the tables. IMMEDIATE, not deferred: a deferred
-    // transaction begins read-only, and its upgrade to a write returns SQLITE_BUSY at once
-    // instead of waiting out the busy timeout.
+    // The version is read INSIDE the write transaction: a read taken outside would let two
+    // simultaneous first starts both see 0 and both create the tables. IMMEDIATE, not deferred — a
+    // deferred transaction's upgrade to a write returns SQLITE_BUSY instead of waiting out the
+    // busy timeout.
     let transaction = conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(|source| StoreError::Migrate {
@@ -263,8 +240,8 @@ fn migrate(conn: &mut rusqlite::Connection, path: &std::path::Path) -> Result<()
         source,
     })?;
 
-    // The lower bound is not decoration: `current as usize` on a negative number is an index far
-    // past the end of MIGRATIONS — -1 becomes `usize::MAX` — and the slice below panics on it.
+    // The lower bound is not decoration: `current as usize` turns -1 into `usize::MAX`, and the
+    // slice below panics on it.
     if !(0..=SCHEMA_VERSION).contains(&current) {
         return Err(StoreError::UnsupportedSchema {
             path: path.to_path_buf(),
@@ -273,8 +250,6 @@ fn migrate(conn: &mut rusqlite::Connection, path: &std::path::Path) -> Result<()
         });
     }
 
-    // Claiming is not conditional on there being migrations to run: the two are separate facts, and
-    // a file we have decided to take over has to come out of this transaction carrying our name.
     if ownership == Ownership::FreeToClaim {
         transaction
             .pragma_update(None, "application_id", APPLICATION_ID)
@@ -294,10 +269,6 @@ fn migrate(conn: &mut rusqlite::Connection, path: &std::path::Path) -> Result<()
                     source,
                 })?;
         }
-        // Written only when something was applied, so an already-current database leaves this
-        // transaction without writing. That is a statement about this transaction and not about
-        // `open`: a run that committed a migration and stopped before the WAL switch leaves a
-        // database whose next open is schema-current and still changes its journal mode.
         transaction
             .pragma_update(None, "user_version", SCHEMA_VERSION)
             .map_err(|source| StoreError::Migrate {
@@ -344,7 +315,6 @@ mod tests {
         let path = dir.path().join("db.sqlite3");
         let conn = open(&path).expect("the database should open with the SQLite contract");
 
-        // The contract between subsystems that each hold their own connection.
         let journal_mode: String = conn
             .pragma_query_value(None, "journal_mode", |row| row.get(0))
             .expect("the journal mode should be readable");
@@ -359,11 +329,8 @@ mod tests {
         assert_eq!(busy_timeout, 5000);
         assert_eq!(foreign_keys, 1);
 
-        // Only the journal mode persists in the file. The other two live and die with a
-        // connection, so the contract has to come back on a reopen of an existing database, not
-        // only on the open that created it. What this pins is the answer, not who supplies it:
-        // measured on the bundled build, a bare connection already answers both values, so only
-        // a default that drifts away from the contract would make these assertions bite.
+        // Only the journal mode persists in the file, so the contract has to come back on a reopen
+        // of an existing database and not only on the open that created it.
         drop(conn);
         let conn = open(&path).expect("the existing database should reopen with the contract");
         let journal_mode: String = conn
@@ -383,11 +350,9 @@ mod tests {
     #[test]
     fn a_first_start_where_every_subsystem_opens_at_once_succeeds() {
         const CONNECTIONS: usize = 8;
-        // Two races live here and each spacing favours one of them. Starting together, the
-        // connections collide on the WAL conversion. Starting about a millisecond apart, a later
-        // one runs its ownership reads while an earlier one is committing the migration. Which one
-        // a given run hits is not something this test can tell, which is why it uses more than one
-        // spacing; and neither is certain in one run, so a green pass is evidence and not proof.
+        // Each spacing favours a different race: starting together collides on the WAL conversion,
+        // a millisecond apart runs one connection's ownership reads while another commits its
+        // migration. Neither is certain in one run, so a green pass is evidence and not proof.
         const SPACINGS: [std::time::Duration; 4] = [
             std::time::Duration::ZERO,
             std::time::Duration::from_micros(500),
@@ -406,9 +371,6 @@ mod tests {
                     let spacing = *spacing;
                     std::thread::spawn(move || {
                         ready.wait();
-                        // The barrier is where the spacing is measured from; without it the threads
-                        // would start whenever the runtime got round to them and the spacing would mean
-                        // nothing.
                         std::thread::sleep(spacing * index as u32);
                         let conn = open(&path)?;
                         conn.pragma_query_value(None, "journal_mode", |row| row.get::<_, String>(0))
@@ -432,15 +394,8 @@ mod tests {
 
     #[test]
     fn the_wal_switch_outwaits_a_lock_released_within_its_deadline() {
-        // The manufactured counterpart of the test above: that one needs the scheduler to
-        // produce a collision, this one arranges its own. The blocker holds a write
-        // transaction, and against a held write lock the conversion comes back busy at once
-        // instead of waiting out the busy timeout — measured, a switch stripped of its
-        // retries still gets past a read transaction, and fails on the spot against this.
-        // The lock is taken before the switching thread exists and released 300ms after that
-        // thread reports its connection ready, far inside WAL_SWITCH_DEADLINE — so all that
-        // is left outside the arrangement is the step from the report to the first attempt,
-        // and a switch that does not retry passes only if that one step outlasts the hold.
+        // A held write lock, not a read lock: a switch stripped of its retries still gets past a
+        // read transaction and fails on the spot against this one.
         let dir = tempdir().expect("the temporary database directory should be creatable");
         let path = dir.path().join("db.sqlite3");
         let blocker =
@@ -551,9 +506,6 @@ mod tests {
 
     #[test]
     fn a_schema_version_this_build_cannot_migrate_from_is_rejected() {
-        // Above the range means a newer build has already written the file; below it would reach
-        // the migration slice with an index cast from a negative number and panic there.
-        // The database has to be ours for the version to be the thing that refuses it.
         for found in [SCHEMA_VERSION + 1, -1] {
             let dir = tempdir().expect("the temporary database directory should be creatable");
             let path = dir.path().join("db.sqlite3");
@@ -577,7 +529,6 @@ mod tests {
 
     #[test]
     fn an_unsupported_database_is_not_modified() {
-        // The database has to be ours for the version to be the thing that refuses it.
         let dir = tempdir().expect("the temporary database directory should be creatable");
         let path = dir.path().join("db.sqlite3");
         let conn = rusqlite::Connection::open(&path)
@@ -602,10 +553,8 @@ mod tests {
             Ok(_) => panic!("the unsupported schema version was accepted"),
         }
 
-        // Compared as bytes rather than by reading the three values back, because the name is about
-        // the whole file: `open` applies its connection settings before it looks at the version, so
-        // a settings line that turned out to write would change the file while all three of those
-        // read back exactly as they were.
+        // Compared as bytes: `open` applies its connection settings before it looks at the version,
+        // and one that turned out to write would leave every value still reading back unchanged.
         let after = std::fs::read(&path).expect("the refused database should still be readable");
         assert_eq!(
             after, before,
@@ -616,10 +565,7 @@ mod tests {
 
     #[test]
     fn an_unsupported_wal_database_keeps_its_log() {
-        // A newer build's database is in WAL mode — `enable_wal` writes it into the header — and
-        // an interrupted daemon leaves its log beside it, so the realistic refusal closes a WAL
-        // connection. That close would fold the log into the main file and delete it; the fixture
-        // holds the log back the same way `open` does, so there is one for the refusal to leave.
+        // The fixture holds its log back the way `open` does, so the refusal has a log to leave.
         let dir = tempdir().expect("the temporary database directory should be creatable");
         let path = dir.path().join("db.sqlite3");
         let conn = rusqlite::Connection::open(&path)
@@ -662,9 +608,8 @@ mod tests {
 
     #[test]
     fn an_unclaimed_database_with_a_version_marker_is_refused_and_left_alone() {
-        // -1 pins the refusal to "not zero" rather than "positive": past a weakened check, a
-        // negative marker would fall through to the version gate and be refused as an
-        // unsupported schema of ours rather than as a file somebody else is using.
+        // -1 pins the refusal to "not zero" rather than "positive": past a weakened check it would
+        // fall through to the version gate and be refused as an unsupported schema of ours.
         for found in [-1, SCHEMA_VERSION, SCHEMA_VERSION + 1] {
             let dir = tempdir().expect("the temporary database directory should be creatable");
             let path = dir.path().join("db.sqlite3");
@@ -701,8 +646,6 @@ mod tests {
 
     #[test]
     fn a_database_that_cannot_use_wal_is_refused() {
-        // The in-memory case stands in for the filesystem case, which has no seam: both refuse WAL
-        // by returning the mode the database is actually in rather than by failing.
         match open(std::path::Path::new(":memory:")) {
             Err(StoreError::JournalMode { actual, .. }) => assert_eq!(actual, "memory"),
             Err(error) => panic!("expected JournalMode, got {error:?}"),
@@ -719,7 +662,6 @@ mod tests {
             .pragma_query_value(None, "application_id", |row| row.get(0))
             .expect("the application id should be readable");
 
-        // 0x43576974 spells "CWit" in ASCII.
         assert_eq!(application_id, 0x4357_6974);
     }
 
@@ -763,16 +705,11 @@ mod tests {
 
     #[test]
     fn a_foreign_database_with_a_hot_journal_is_recovered_before_refusal() {
-        // The one boundary of "left as found": SQLite plays a hot rollback journal back before
-        // the first read answers, so a file left mid-crash is restored before any refusal can
-        // land — SQLite's own act, the same one the owner's next open would perform. Copying
-        // the database and journal out from under a live write stands in for the crash: the
-        // copies hold no locks, so the copied journal is hot.
         let dir = tempdir().expect("the temporary database directory should be creatable");
         let path = dir.path().join("db.sqlite3");
         let conn = rusqlite::Connection::open(&path)
             .expect("the other application's database should be openable");
-        // A one-page cache spills pages to disk mid-transaction, so the copy taken below holds
+        // A one-page cache spills pages to disk mid-transaction, so the copy below holds
         // uncommitted writes for the journal to take back.
         conn.execute_batch("PRAGMA cache_size = 1; CREATE TABLE notes (body BLOB)")
             .expect("the other application's table should be creatable");
@@ -826,7 +763,6 @@ mod tests {
         drop(conn);
         let before = std::fs::read(&path).expect("the test database should be readable");
 
-        // An empty file someone else has already put their name on is still theirs.
         match open(&path) {
             Err(StoreError::ForeignDatabase { found, .. }) => assert_eq!(found, 1),
             Err(error) => panic!("expected ForeignDatabase, got {error:?}"),

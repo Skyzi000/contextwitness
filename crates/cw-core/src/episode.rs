@@ -89,12 +89,8 @@ pub fn build_episode(
     render_offset: chrono::FixedOffset,
     observations: &[crate::model::Observation],
 ) -> Option<Episode> {
-    // Everything below spells this to the second, `document_id` among them, so a start carrying a
-    // fraction would answer for a window it does not bound and share an id with the rest of its
-    // second. Taken through `timestamp` rather than by truncating the subsecond field, because that
-    // field also carries a leap second as a value at or above one second and truncating leaves it:
-    // measured, `12:34:58` with a nanosecond field of 1_000_000_000 keeps it, spells `12:34:59Z`
-    // exactly as the ordinary instant of that name does, and ends one second earlier than it does.
+    // Taken through `timestamp` rather than by truncating the subsecond field: that field also
+    // carries a leap second, as a value at or above one second, and truncating leaves it in place.
     let window_start = chrono::DateTime::from_timestamp(window_start.timestamp(), 0)
         .expect("a whole second taken from an instant must still be representable");
     let end_at = window_start + chrono::Duration::minutes(i64::from(window_minutes));
@@ -124,15 +120,8 @@ pub fn build_episode(
         },
     );
     entries.dedup_by(|current, previous| {
-        // Fold on the fields below and nothing else. The timestamp is excluded because it is
-        // what a folded entry usually differs in, and collapsing repeated times is the point — two
-        // observations at one instant fold as readily. Text and error are compared whether this
-        // entry's status renders them or not, so two that a reader could not tell apart are kept
-        // apart when a hidden `ocr_text` differs; erring towards keeping is the safer way for this
-        // to be wrong. The other direction is real too: the monitor's size, the image path and the
-        // OCR languages are not compared, so entries differing only in those do fold. The size is
-        // left out because it is written only where the monitor changes, and an entry matching the
-        // last kept one's monitor would not have written it.
+        // The monitor's size, the image path and the OCR languages are deliberately not compared:
+        // the size renders only where the monitor changes, which a folded entry never does.
         let current = current.1;
         let previous = previous.1;
 
@@ -358,9 +347,8 @@ mod tests {
             window_start(timestamp("2026-07-25T01:05:00Z"), 5),
             timestamp("2026-07-25T01:05:00Z")
         );
-        // A clock set wrong can observe before the epoch, and only there do flooring and
-        // truncating toward zero part ways: truncated, 23:57 would get the window start
-        // 00:00:00, which is after the instant.
+        // Only before the epoch do flooring and truncating toward zero part ways: truncated, 23:57
+        // would get the window start 00:00:00, which is after the instant.
         assert_eq!(
             window_start(timestamp("1969-12-31T23:57:00Z"), 5),
             timestamp("1969-12-31T23:55:00Z")
@@ -387,9 +375,6 @@ mod tests {
 
     #[test]
     fn two_observations_at_one_instant_render_in_id_order() {
-        // Only the id rung of the sort decides between these two — one monitor, one instant, two
-        // ids — so this pair is what keeps the rendered order independent of arrival order when
-        // the other keys tie. The titles differ so the fold keeps both entries visible.
         let lower = observation(
             1,
             "2026-07-24T16:00:02Z",
@@ -484,9 +469,8 @@ mod tests {
             .with_nanosecond(1_000_000_000)
             .expect("a second should accept a leap nanosecond");
 
-        // The two are different instants that RFC 3339 spells alike once the fraction is dropped,
-        // which is the spelling `document_id` is built from. Built on `:58` rather than `:59`,
-        // because a leap nanosecond on `:59` spells `:60` and collides with no ordinary instant.
+        // Built on `:58`: a leap nanosecond on `:59` spells `:60`, which collides with no ordinary
+        // instant.
         assert_ne!(leap, ordinary);
         assert_eq!(
             leap.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
@@ -565,9 +549,6 @@ Monitor DISPLAY2 (1920x1080):
             .as_object()
             .expect("episode metadata should serialize as an object");
 
-        // `MemoryItem.metadata` is `additionalProperties: {"type": "string"}` in the 0.8.4
-        // schema. A field added later as a number or an array would make every episode fail
-        // delivery, and this test catches that instead of a 422 in production.
         for (key, value) in metadata {
             assert!(
                 value.is_string(),
@@ -578,9 +559,6 @@ Monitor DISPLAY2 (1920x1080):
 
     #[test]
     fn consecutive_entries_with_different_text_are_never_collapsed() {
-        // Every field the fold compares is equal in these two except the text, so this is the case
-        // where text alone decides. Text is what this product delivers, and one entry standing for
-        // another would lose it.
         let observations = vec![
             observation(
                 1,
@@ -612,8 +590,6 @@ Monitor DISPLAY2 (1920x1080):
         assert!(episode.content.contains("earlier"));
         assert!(episode.content.contains("later"));
 
-        // The same promise where the text is hidden: NoText renders nothing, so these two read
-        // identically, and only the compared `ocr_text` keeps them apart.
         let hidden = vec![
             observation(
                 3,
@@ -638,8 +614,6 @@ Monitor DISPLAY2 (1920x1080):
 
     #[test]
     fn text_free_entries_from_the_same_application_fold() {
-        // A video playing: every frame renders the same line but for its time, and one line is
-        // what the reader needs from it.
         let observations = vec![
             observation(
                 1,
@@ -673,9 +647,6 @@ Monitor DISPLAY2 (1920x1080):
 
     #[test]
     fn an_identical_scene_on_another_monitor_keeps_the_entry() {
-        // The two entries differ in nothing the fold compares except the monitor, and folding
-        // across that boundary would tell the reader one screen was on when two were: the second
-        // monitor's heading, its entry line and its metadata slot all travel with the entry.
         let observations = vec![
             observation(
                 1,
@@ -710,8 +681,6 @@ Monitor DISPLAY2 (1920x1080):
 
     #[test]
     fn a_different_application_keeps_the_entry() {
-        // The switch between two text-free applications is the only thing these entries record, so
-        // folding them would leave the document with nothing to show for it.
         let observations = vec![
             observation(
                 1,
@@ -781,8 +750,6 @@ Monitor DISPLAY2 (1920x1080):
     #[test]
     fn a_failed_entry_never_folds_into_a_no_text_one() {
         let observations = vec![
-            // The same error on both sides, so the status is the only thing that differs and the
-            // only thing that can be keeping them apart. Only the `Failed` one renders it.
             observation(
                 1,
                 "2026-07-24T16:00:01Z",

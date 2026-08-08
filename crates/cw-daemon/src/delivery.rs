@@ -1,5 +1,3 @@
-// The outbox worker: claim what is due, retain it, record what happened.
-
 use chrono::TimeDelta;
 use cw_sink_hindsight::{Credentials, HindsightClient, RetainItem};
 use cw_store::control::HealthKey;
@@ -8,9 +6,7 @@ use tracing::{debug, error, info, warn};
 use windows::Win32::Foundation::{HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::System::Threading::{CreateMutexW, INFINITE, WaitForSingleObject};
 
-/// How long the worker waits when nothing is due. Episodes arrive once per window, and a retry
-/// waits at least `outbox::backoff_delay`'s first step, so there is nothing to gain by looking
-/// sooner.
+/// How long the worker waits when nothing is due.
 const IDLE: std::time::Duration = std::time::Duration::from_secs(30);
 /// Entries claimed per pass. One entry carries a whole window's OCR text, so a backlog is read a
 /// few at a time rather than in one allocation.
@@ -27,8 +23,9 @@ struct BankGate {
 
 /// Run the delivery worker on this thread. Returns as soon as it learns that delivery is not
 /// configured: the outbox keeps filling, and a run after `contextwitness setup` picks it up.
-/// Configured, it delivers nothing until it holds the machine-wide claim on `data_dir`, so the
-/// outbox rows of one directory have one deliverer however many daemons reach it.
+/// Configured, it waits until it holds the machine-wide claim on `data_dir` — so the outbox rows
+/// of one directory have one deliverer however many daemons reach it — unless the claim cannot be
+/// created or taken; that is warned about and the worker then delivers unguarded.
 pub fn run(
     mut conn: rusqlite::Connection,
     data_dir: std::path::PathBuf,
@@ -56,38 +53,20 @@ pub fn run(
             return;
         }
     };
-    // Claimed only now: a worker that is about to return because nothing is configured has no rows
-    // to guard, and holding the claim across that return would keep a configured daemon elsewhere
-    // standing by for a worker that never delivers.
     let _claim = claim_sole_deliverer(&data_dir);
-    // Only the holder of that claim may requeue: a 'delivering' row is owned by whichever worker
-    // claimed it, and `retain` holds one for as long as the sink's HTTP timeout. A second daemon
-    // sweeping those rows back to pending sends the same episode again and writes a delivered one
-    // back as failed.
     match outbox::requeue_delivering(&conn) {
         Ok(0) => {}
-        // An attempt whose outcome nobody recorded: delivery is at-least-once, so it goes round
-        // again under the same document id.
         Ok(requeued) => info!(requeued, "requeued deliveries left in flight"),
         Err(error) => error!("requeueing in-flight deliveries failed: {error}"),
     }
     let mut bank = BankGate::default();
 
     loop {
-        // A full batch *delivered* means a backlog is draining and the next pass should run now.
-        // Deliveries, not attempts: a pass of nothing but failures must fall into the idle wait,
-        // or a server answering with a short Retry-After would be re-asked in a hot loop with no
-        // backoff at all.
         match deliver_batch(&mut conn, &client, &config, &mut bank) {
             Ok(BATCH..) => continue,
             Ok(_) => {}
             Err(error) => {
                 error!("delivery pass failed: {error}");
-                // A pass that dies between the claim and the state write leaves its entry
-                // 'delivering', which `fetch_due` does not see. The claim held above is what makes
-                // this the only worker on this data directory, so any 'delivering' entry at a pass
-                // boundary is by definition this worker's own and abandoned. If the store is what
-                // failed this fails too, and the next pass tries again.
                 match outbox::requeue_delivering(&conn) {
                     Ok(0) => {}
                     Ok(count) => info!(count, "requeued entries the failed pass left claimed"),
@@ -100,17 +79,16 @@ pub fn run(
 }
 
 /// Wait until this process is the one delivering for `data_dir`, and answer with the claim it then
-/// holds. `Global\`, unlike the daemon's own per-session instance claim: two interactive sessions
-/// can be pointed at one data directory, and it is that directory's outbox rows — not the session —
-/// that only one worker may touch.
+/// holds. When the mutex cannot be created it answers `None`; when a wait fails it answers the
+/// handle without the claim; either way the worker warns and runs unguarded. `Global\`, unlike the
+/// daemon's own per-session instance claim: two interactive sessions can be pointed at one data
+/// directory, and it is that directory's outbox rows — not the session — that only one worker
+/// should touch.
 ///
 /// The handle is never closed: the OS drops it however the process dies, so there is no stale claim
 /// to recognize and clean up after a crash. `HANDLE` closes nothing when the binding goes, which is
 /// what lets the caller simply hold it.
 fn claim_sole_deliverer(data_dir: &std::path::Path) -> Option<HANDLE> {
-    // Canonical and lowercased, so the same directory reached by a different spelling — a relative
-    // parent, a short name, another case — is still the same claim. A path that cannot be resolved
-    // is used as it stands, which every daemon started the same way still spells the same.
     let path = std::fs::canonicalize(data_dir).unwrap_or_else(|_| data_dir.to_path_buf());
     // A digest, never the path: `Global\` names are enumerable by every user on the machine, and a
     // data directory's spelling usually carries the name of the user who owns it.
@@ -120,21 +98,16 @@ fn claim_sole_deliverer(data_dir: &std::path::Path) -> Option<HANDLE> {
     ));
     let handle = match unsafe { CreateMutexW(None, false, &name) } {
         Ok(handle) => handle,
-        // Unguarded rather than refusing to deliver: a name that could not be created says nothing
-        // about whether another worker is up, and an outbox nobody drains is the worse of the two.
         Err(error) => {
             warn!("the delivery claim could not be created, so this worker is unguarded: {error}");
             return None;
         }
     };
 
-    // WAIT_ABANDONED is the previous holder having died while holding it. The claim is taken: the
-    // rows it left mid-flight are exactly what the requeue after this call puts back in order.
+    // WAIT_ABANDONED is the previous holder having died while holding it; the claim is taken.
     match unsafe { WaitForSingleObject(handle, 0) } {
         WAIT_OBJECT_0 | WAIT_ABANDONED => {}
         WAIT_TIMEOUT => {
-            // Said once, before the blocking wait, so a daemon that looks idle for hours has a line
-            // saying which of the two it is.
             info!("another contextwitness delivers for this data directory; standing by");
             match unsafe { WaitForSingleObject(handle, INFINITE) } {
                 WAIT_OBJECT_0 | WAIT_ABANDONED => {}
@@ -176,23 +149,15 @@ fn deliver_batch(
     if due.is_empty() {
         return Ok(0);
     }
-    // Asked for once, and only when there is something to send: a bank that could not be reached
-    // leaves the entries pending for a later pass rather than dropping the worker, and is asked
-    // again on the same ladder the outbox retries on rather than once every idle wait.
     if !bank.ready {
         if bank.not_before.is_some_and(|at| chrono::Utc::now() < at) {
-            // Reading the clock is all this pass costs; nothing goes over the wire until the
-            // backoff has run out.
             return Ok(0);
         }
         if let Err(error) = client.ensure_bank(&config.hindsight.bank_id) {
-            // Read after the call, for the reason the retain loop below gives.
             let now = chrono::Utc::now();
             bank.attempts += 1;
-            // A permanent error backs off exactly like a retryable one instead of ending the
-            // worker: the bank is configuration state, like the credentials, not payload state, so
-            // it can be repaired while the daemon runs — and a retry that keeps coming, however
-            // slowly, is what picks that repair up.
+            // A permanent error backs off like a retryable one instead of ending the worker: the
+            // bank is configuration state, repairable while the daemon runs.
             let delay = error
                 .retry_after()
                 .and_then(|after| TimeDelta::from_std(after).ok())
@@ -212,11 +177,8 @@ fn deliver_batch(
     let mut delivered = 0;
     for entry in due {
         if !outbox::mark_delivering(conn, entry.episode_id)? {
-            // Somebody else has it, or it is no longer due.
             continue;
         }
-        // The stored snapshot is the wire form; this only checks that it is JSON, because splicing
-        // text that is not into the request body would corrupt every item in it.
         let metadata = match serde_json::value::RawValue::from_string(entry.metadata_json) {
             Ok(metadata) => metadata,
             Err(error) => {
@@ -241,9 +203,6 @@ fn deliver_batch(
         };
 
         let outcome = client.retain(&config.hindsight.bank_id, &item);
-        // Read after the call, not before it: retain blocks for up to the sink's HTTP timeout, so a
-        // `now` taken beforehand can already be in the past by the time a `Retry-After` or a
-        // backoff step is measured from it.
         let now = chrono::Utc::now();
         match outcome {
             Ok(()) => {
@@ -253,17 +212,9 @@ fn deliver_batch(
                 debug!(document = %entry.document_id, "delivered episode");
             }
             Err(error) => {
-                // The message is the sink's, which keeps the token and the response body — which
-                // would echo screen text back — out of what is stored and logged.
+                // The sink's message, which keeps the token and the response body — which would
+                // echo screen text back — out of what is stored and logged.
                 let message = error.to_string();
-                // A 404 says the bank is gone from under a gate that has already opened, so every
-                // retain answers the same until it is back. The gate shuts so the next pass runs
-                // `ensure_bank`, which creates a missing bank, and a further ensure failure rides
-                // the gate's own ladder — `attempts` is left where it is, so a bank that keeps
-                // disappearing climbs that ladder rather than restarting it. The episode backs off
-                // rather than being condemned, for the reason the sink records for 401 and 403: the
-                // bank's existence is configuration state, repairable while the daemon runs, and an
-                // episode has to outlive the gap to be there when the repair lands.
                 let retry = if error.is_bank_missing() {
                     bank.ready = false;
                     bank.not_before = None;

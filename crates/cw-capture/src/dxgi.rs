@@ -12,8 +12,8 @@ use windows_capture::monitor::Monitor;
 
 use crate::{CaptureError, Capturer, Frame, MonitorInfo, Recoverable, enumerate_monitors};
 
-/// How long one `capture` waits for a desktop update. The duplication accumulates updates between
-/// ticks, so a pending frame is normally returned at once; this budget only covers one in flight.
+/// How long each acquire waits for a desktop update. The duplication accumulates updates between
+/// ticks, so a pending frame is normally returned at once.
 const ACQUIRE_TIMEOUT_MS: u32 = 100;
 
 /// Sessions are persistent: recreating the duplication per capture is what ruled out the
@@ -61,8 +61,6 @@ impl Capturer for DxgiCapturer {
         };
 
         let captured = session.capture(monitor_id, dpi_scale);
-        // Access lost, device loss and mode changes all end the same way: drop the session and let
-        // the next tick build a new one. A timeout is not a failure, it is an idle screen.
         if matches!(&captured, Err(error) if !matches!(error, CaptureError::Recoverable(Recoverable::NoNewFrame)))
         {
             self.sessions.remove(monitor_id);
@@ -80,8 +78,6 @@ struct Session {
 
 impl Session {
     fn open(handle: HMONITOR) -> Result<Self, CaptureError> {
-        // Asking for BGRA8 makes the OS convert an HDR or 10-bit desktop for us, instead of handing
-        // over a format this frame contract cannot carry.
         let duplication = DxgiDuplicationApi::new_options(
             Monitor::from_raw_hmonitor(handle.0),
             &[DxgiDuplicationFormat::Bgra8],
@@ -136,11 +132,9 @@ impl Session {
                         pixel.swap(0, 2);
                     }
                 }
-                // 10-bit and FP16 desktops need tone mapping to reach SDR 8-bit, which v1 does not
-                // do. Skipping the monitor keeps the loop alive.
+                // 10-bit and FP16 desktops need tone mapping to SDR 8-bit, which v1 does not do.
                 other => return Err(Recoverable::UnsupportedFormat(format!("{other:?}")).into()),
             }
-            // The desktop image is opaque; downstream consumers treat the frame as such.
             for pixel in bgra.chunks_exact_mut(4) {
                 pixel[3] = 255;
             }

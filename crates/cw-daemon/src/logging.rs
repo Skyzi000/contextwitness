@@ -1,5 +1,3 @@
-// Tracing setup: console plus a daily file under the data directory.
-
 use cw_core::config::DataPaths;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -31,8 +29,6 @@ pub fn init(paths: &DataPaths) -> Option<tracing_appender::non_blocking::WorkerG
                 Some(guard),
             )
         }
-        // The console layer is still worth having, and a daemon that will not start because it
-        // cannot write its log is worse than one that says so.
         Err(error) => {
             eprintln!("file logging is disabled: {error}");
             (None, None)
@@ -53,8 +49,7 @@ fn appender(
 ) -> Result<tracing_appender::rolling::RollingFileAppender, Box<dyn std::error::Error>> {
     std::fs::create_dir_all(directory)?;
 
-    // The builder rather than `rolling::daily`, which answers a directory it cannot open with a
-    // panic during startup.
+    // The builder rather than `rolling::daily`, which panics on a directory it cannot open.
     Ok(tracing_appender::rolling::RollingFileAppender::builder()
         .rotation(tracing_appender::rolling::Rotation::DAILY)
         .filename_prefix("contextwitness")

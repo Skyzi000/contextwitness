@@ -123,7 +123,7 @@ impl Thumbnail {
     }
 }
 
-/// Whether this frame must be stored and OCR-ed based on changed logical pixels.
+/// Whether this frame counts as changed, by changed logical pixels.
 /// The first frame, a source-resolution change, and a display-scale change always count as changed.
 pub fn frame_changed(
     previous: Option<&Thumbnail>,
@@ -157,8 +157,8 @@ pub fn max_logical_pixels(width: u32, height: u32, dpi_scale: f32) -> f64 {
 /// Whether `config.change_area_logical_pixels` can ever be exceeded on a monitor of this size.
 ///
 /// `frame_changed` compares with `>`, so a threshold at or above the monitor's logical area is
-/// never satisfied and no pixel difference on that monitor is ever stored again after its first
-/// frame — silently, with no error anywhere. What still gets through is a change of dimensions or
+/// never satisfied and no pixel difference on that monitor ever counts as changed again after its
+/// first frame. What still gets through is a change of dimensions or
 /// DPI scale, which `frame_changed` answers before it compares any pixels. `Config::validate`
 /// cannot check this because no monitor is known when the config is read, so it has to be asked
 /// once per monitor, as they are enumerated. Kept here so bound and the comparison that makes it a
@@ -177,8 +177,8 @@ fn rgba_image(rgba: &[u8], width: u32, height: u32) -> Result<image::RgbaImage, 
         return Err(ImageBufferError::EmptyImage);
     }
 
-    // Counted in u128 first: `width * height * 4` can pass 2^64, and a wrapped count that
-    // happened to match the buffer would carry garbage dimensions past the check below.
+    // Counted in u128: `width * height * 4` can pass 2^64, and a wrapped count that happened to
+    // match the buffer would carry garbage dimensions past the check below.
     let expected = usize::try_from(u128::from(width) * u128::from(height) * 4)
         .map_err(|_| ImageBufferError::OversizedImage { width, height })?;
     if rgba.len() != expected {
@@ -285,8 +285,6 @@ mod tests {
     fn a_threshold_at_the_monitor_area_can_never_fire() {
         assert_eq!(max_logical_pixels(1920, 1080, 1.0), 2_073_600.0);
 
-        // A threshold in this range does not merely reduce what gets stored; past the first frame
-        // nothing but a dimension or DPI change is ever stored again — silently, with no error.
         let config = |change_area_logical_pixels| CaptureConfig {
             change_area_logical_pixels,
             ..CaptureConfig::default()
@@ -318,8 +316,6 @@ mod tests {
             &config(921_600)
         ));
 
-        // The bound is `frame_changed`'s own strict `>`, pinned through the real comparison so
-        // the helper's promise and the comparison it speaks for cannot drift apart.
         let before = Thumbnail::from_rgba(&solid(WIDTH, HEIGHT, 200), WIDTH, HEIGHT, 1.0)
             .expect("the fixed test image should build");
         let after = Thumbnail::from_rgba(&solid(WIDTH, HEIGHT, 0), WIDTH, HEIGHT, 1.0)
@@ -335,7 +331,6 @@ mod tests {
             ..CaptureConfig::default()
         };
 
-        // Failing closed is right here: a scale we cannot use must surface as a startup error.
         for dpi_scale in [0.0, -1.0, f32::NAN] {
             assert_eq!(max_logical_pixels(1920, 1080, dpi_scale), 0.0);
             assert!(!change_threshold_is_reachable(
@@ -378,7 +373,6 @@ mod tests {
         let changed_source_pixels =
             before.changed_source_pixels(&after, config.change_pixel_threshold);
 
-        // A caret must not keep the pipeline busy.
         assert!(
             !frame_changed(Some(&before), &after, &config),
             "a blinking cursor alone must be ignored; changed_source_pixels={changed_source_pixels}"
@@ -408,17 +402,7 @@ mod tests {
 
     #[test]
     fn the_same_edit_is_detected_in_each_measured_configuration() {
-        // Measured logical minima: 853, 1138, 1238, 1125, 900 — all above the 600 default, against a
-        // source-pixel spread that put 5120x2880 @200% carets above Full HD ten-character edits.
-        // 3840x2160 appears at both 100% and 150% on purpose: unscaled 4K is an ordinary setup on a
-        // large panel, and which configuration is tightest does not follow from the pixel count
-        // alone.
-        // Bounds are the measured range over every glyph offset within one full sampling-phase
-        // period — `width / gcd(width, 256)` by `height / gcd(height, 144)` source pixels, which
-        // a fractional stride stretches to 683x16 at 1366x768 — rounded outward, so a value on a
-        // measured edge is inside. Nothing in the tree reruns that sweep and the loop below
-        // places its glyph at one offset, so a change to the resize filter, the glyph fixture or
-        // the pixel threshold means deriving these again by hand.
+        // Measured bounds — do not derive these by hand.
         for (width, height, scale, logical_min, logical_max) in [
             (1024, 768, 1.0, 853.0, 1302.0),
             (1366, 768, 1.0, 1138.0, 1480.0),
@@ -454,16 +438,7 @@ mod tests {
 
     #[test]
     fn a_caret_is_ignored_in_each_measured_configuration() {
-        // Measured logical maxima: 149, 171, 225, 450, 400. 3840x2160 at 100% is the tightest
-        // configuration measured — 450 against a 600 default — and the only realistic one where
-        // a caret can measure exactly 0, because at that sample granularity one character
-        // can split across four samples with none of them crossing the per-pixel threshold.
-        // Bounds are the measured range over every glyph offset within one full sampling-phase
-        // period — `width / gcd(width, 256)` by `height / gcd(height, 144)` source pixels, which
-        // a fractional stride stretches to 683x16 at 1366x768 — rounded outward, so a value on a
-        // measured edge is inside. Nothing in the tree reruns that sweep and the loop below
-        // places its glyph at one offset, so a change to the resize filter, the glyph fixture or
-        // the pixel threshold means deriving these again by hand.
+        // Measured bounds — do not derive these by hand.
         for (width, height, scale, logical_min, logical_max) in [
             (1024, 768, 1.0, 85.0, 150.0),
             (1366, 768, 1.0, 85.0, 171.0),
@@ -497,14 +472,9 @@ mod tests {
 
     #[test]
     fn the_worst_phase_on_4k_unscaled_still_separates_a_caret_from_typing() {
-        // 3840x2160 at 100% has the least room of any measured configuration, and its sample
-        // period is exactly 15x15, so all 225 phases were enumerated offline. These two offsets are
-        // the true extremes: a caret peaks at 450 logical pixels and ten characters bottom out at
-        // 1125, which is the 450 < 600 < 1125 separation the default rests on. The tables above draw
-        // at left = 100, where the same fixtures measure a comfortable 225 and 1350 and would keep
-        // passing even if the real margin had closed. A caret also drops to 0 at
-        // left = 102, top = height / 2 + 3, where one character splits across four samples and none
-        // of them crosses the per-pixel threshold.
+        // left = 102 and 103 are the worst phases from an offline sweep of all 225 (15x15) offsets.
+        // The tables above draw at left = 100, where the same fixtures measure a comfortable 225
+        // and 1350 and would keep passing even if the real margin had closed.
         let width = 3840;
         let height = 2160;
         let config = CaptureConfig::default();
@@ -554,9 +524,8 @@ mod tests {
             .expect("the before frame must be valid RGBA");
         let config = CaptureConfig::default();
 
-        // A single-offset measurement is a sample, not a bound: this fixture varies about 1.3x
-        // across its full 683x16 sampling-phase period, of which this loop samples a 6x6 block.
-        // An earlier default was validated against one such sample as if it were an upper bound.
+        // One offset is a sample, not a bound: this fixture varies about 1.3x over its full 683x16
+        // sampling-phase period, of which this loop samples a 6x6 block.
         for left in 100..=105 {
             for top in height / 2..=height / 2 + 5 {
                 let mut after = solid(width, height, 200);
@@ -663,8 +632,7 @@ mod tests {
     fn a_non_positive_or_nan_display_scale_is_rejected() {
         let frame = solid(1, 1, 200);
 
-        // NaN never equals itself, so `frame_changed`'s scale comparison would answer "changed"
-        // on every tick and store every frame.
+        // NaN never equals itself, so an accepted NaN scale would answer "changed" on every tick.
         for dpi_scale in [0.0, -1.0, f32::NAN] {
             assert!(
                 matches!(
@@ -703,9 +671,6 @@ mod tests {
 
     #[test]
     fn dimensions_wider_than_the_address_space_are_refused() {
-        // 2^31 * 2^31 * 4 is exactly 2^64 — one past what a byte count can spell — and wrapped
-        // to zero it matched this empty buffer, carrying the pair past the size check into the
-        // panic behind it.
         let error = Thumbnail::from_rgba(&[], 1 << 31, 1 << 31, 1.0)
             .expect_err("dimensions past the address space must be refused, not panic");
         assert!(

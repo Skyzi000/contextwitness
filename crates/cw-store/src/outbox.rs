@@ -1,5 +1,3 @@
-// Delivery state machine over the outbox table.
-
 use crate::{StoreError, timestamp};
 
 /// The first retry waits this long, and every further one waits twice its predecessor up to
@@ -53,9 +51,8 @@ pub enum Retry {
 
 /// How long a retry waits after `attempts` failed attempts: 30s, 60s, … capped at 15 minutes.
 pub fn backoff_delay(attempts: u32) -> chrono::TimeDelta {
-    // The shift is clamped before it runs. Past 30 the product is already far above the ceiling,
-    // and a shift of 63 or more does not overflow into something large — it wraps to a negative
-    // count, which `TimeDelta::seconds` answers with a panic.
+    // The shift is clamped before it runs: a wide shift wraps to a negative count, and
+    // `TimeDelta::seconds` answers that with a panic.
     let seconds = FIRST_DELAY_SECONDS << attempts.saturating_sub(1).min(30);
 
     chrono::TimeDelta::seconds(seconds.min(MAX_DELAY_SECONDS))
@@ -67,8 +64,6 @@ pub fn fetch_due(
     now: chrono::DateTime<chrono::Utc>,
     limit: u32,
 ) -> Result<Vec<Due>, StoreError> {
-    // A limit rather than the whole backlog: one episode holds a window's full OCR text, so an
-    // outage of any length leaves more of them than a worker should read into memory at once.
     let mut statement = conn
         .prepare(SELECT_DUE)
         .map_err(|source| StoreError::Sql { source })?;
@@ -118,8 +113,8 @@ pub fn mark_failed(
     last_error: &str,
 ) -> Result<(), StoreError> {
     let id_text = episode_id.to_string();
-    // The count is read and written under one lock: the delay this entry waits is a function of
-    // it, so a count read outside the transaction can be stale by the time it decides anything.
+    // The count is read and written under one lock: a count read outside the transaction can be
+    // stale by the time the delay is computed from it.
     let transaction = conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(|source| StoreError::Sql { source })?;

@@ -16,7 +16,7 @@ pub enum Pause {
 /// A moment `contextwitness status` reports on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HealthKey {
-    /// When the last completed capture pass started.
+    /// When a recent tick started.
     LastTick,
     /// When a frame was last stored.
     LastCapture,
@@ -33,7 +33,7 @@ pub enum EventKind {
     /// Capture was asked to start again. A resume with nothing to resume records this too, so a row
     /// is a request rather than proof that anything moved.
     Resumed,
-    /// A tick captured nothing because the foreground process is blacklisted.
+    /// A tick captured nothing because of the process blacklist.
     BlacklistSkip,
 }
 
@@ -291,17 +291,12 @@ pub fn events_in_window(
     start: chrono::DateTime<chrono::Utc>,
     end: chrono::DateTime<chrono::Utc>,
 ) -> Result<Vec<ControlEvent>, StoreError> {
-    // An empty or reversed window is empty whatever its bounds spell, and answering it does not
-    // require them to be spellable at all.
     if end <= start {
         return Ok(Vec::new());
     }
 
-    // The window's last instant, which is what the statement compares against; asking for it rather
-    // than for `end` is also what lets a window end where no spelling exists, as year 10000 does.
-    // The guard above leaves `end` later than the earliest instant chrono has, so the subtraction
-    // cannot fail. `checked_sub_signed` rather than `-` because `-` answers that case with a panic
-    // instead of an empty window.
+    // `checked_sub_signed` rather than `-`: `-` answers an underflow with a panic instead of an
+    // empty window.
     let Some(last) = end.checked_sub_signed(chrono::TimeDelta::nanoseconds(1)) else {
         return Ok(Vec::new());
     };
@@ -484,8 +479,6 @@ mod tests {
             None
         );
 
-        // The request changed nothing, which is exactly why the row matters: the trail records what
-        // was asked for, not only what moved.
         let events = events_in_window(&conn, at(2026, 7, 30, 12, 0, 0), at(2026, 7, 30, 12, 0, 1))
             .expect("the audit window should be readable");
         assert_eq!(events.len(), 1);
@@ -498,7 +491,6 @@ mod tests {
         let (_dir, mut conn) = database();
         let first_at = at(2026, 7, 30, 12, 0, 0);
         let second_at = at(2026, 7, 30, 12, 1, 0);
-        // Fixed ids running against the timestamps, so a swap to `ORDER BY id, at` fails every run.
         let first_id = ulid::Ulid::from(9u128);
         let second_id = ulid::Ulid::from(1u128);
 
@@ -513,8 +505,6 @@ mod tests {
         );
         assert_eq!(pause_key_count(&conn), 1);
 
-        // The second request moved nothing. Its row exists because the trail records what was
-        // asked for, exactly as `EventKind::Paused` documents; nothing else here checks that.
         let events = events_in_window(&conn, first_at, second_at + TimeDelta::seconds(1))
             .expect("the audit window should be readable");
         assert_eq!(
@@ -591,8 +581,6 @@ mod tests {
         )
         .expect("the endless pause should be stored");
 
-        // Without the transaction, this state change would land while its audit row did not; this
-        // is the only test that can tell that implementation from the transactional one.
         let error = set_pause(
             &mut conn,
             Pause::Until(at(2026, 8, 1, 12, 0, 0)),
@@ -628,8 +616,6 @@ mod tests {
         )
         .expect("the endless pause should be stored");
 
-        // This is the counterpart of `a_pause_that_cannot_be_recorded_changes_nothing`; without
-        // the transaction, the pause would be gone with nothing recording that it went.
         let error = resume(&mut conn, event_id, at(2026, 7, 30, 12, 1, 0))
             .expect_err("the duplicate event id should refuse the resume");
 
@@ -651,7 +637,6 @@ mod tests {
     fn a_pause_that_is_both_kinds_at_once_is_refused() {
         let (_dir, conn) = database();
 
-        // Public functions cannot produce this contradictory state, so write it with plain SQL.
         conn.execute(
             UPSERT_STATE,
             rusqlite::params![
@@ -680,7 +665,6 @@ mod tests {
     fn an_endless_pause_spelled_any_other_way_is_refused() {
         let (_dir, conn) = database();
 
-        // Public functions cannot produce these values, so write them with plain SQL.
         for value in [Some("0"), Some("yes"), None] {
             conn.execute(UPSERT_STATE, rusqlite::params![PAUSE_INDEFINITE, value])
                 .expect("the malformed endless row should be writable");
@@ -695,7 +679,6 @@ mod tests {
     fn a_deadline_that_is_not_a_timestamp_is_refused() {
         let (_dir, conn) = database();
 
-        // Public functions cannot produce this value, so write it with plain SQL.
         conn.execute(
             UPSERT_STATE,
             rusqlite::params![PAUSE_UNTIL, "not a timestamp"],
@@ -719,7 +702,6 @@ mod tests {
         )
         .expect("the past deadline should be stored");
 
-        // Deciding whether this pause has expired belongs to the caller holding the tick's instant.
         assert_eq!(
             get_pause(&conn).expect("the past deadline should be readable"),
             Some(Pause::Until(deadline))
@@ -774,7 +756,6 @@ mod tests {
     fn a_health_mark_that_is_not_a_timestamp_is_refused() {
         let (_dir, conn) = database();
 
-        // Public functions cannot produce this value, so write it with plain SQL.
         conn.execute(
             UPSERT_STATE,
             rusqlite::params![HealthKey::LastTick.key(), "not a timestamp"],
@@ -792,7 +773,6 @@ mod tests {
         let paused_at = at(2026, 7, 30, 12, 1, 0);
         let resumed_at = at(2026, 7, 30, 12, 2, 0);
         let deadline = at(2026, 7, 30, 13, 0, 0);
-        // Fixed ids running against the timestamps, so a swap to `ORDER BY id, at` fails every run.
         let pause_id = ulid::Ulid::from(9u128);
         let resume_id = ulid::Ulid::from(1u128);
 
@@ -801,8 +781,8 @@ mod tests {
         resume(&mut conn, resume_id, resumed_at)
             .expect("the resume and its event should be stored");
 
-        // This pause is a deadline rather than an endless one here. Without this line, an
-        // implementation clearing only `pause_indefinite` passes every test in this file.
+        // The pause here is a deadline: without this line, an implementation clearing only
+        // `pause_indefinite` passes every test in this file.
         assert!(matches!(get_pause(&conn), Ok(None)));
 
         let events = events_in_window(&conn, at(2026, 7, 30, 12, 0, 0), at(2026, 7, 30, 12, 3, 0))
@@ -851,8 +831,6 @@ mod tests {
 
         record_event(&conn, &higher).expect("the higher-id audit event should be stored first");
         record_event(&conn, &lower).expect("the lower-id audit event should be stored second");
-        // Without `, id` in the ORDER BY these come back in whatever order the query plan produced,
-        // which is the one thing a stable listing has to rule out.
         let events = events_in_window(&conn, instant, instant + TimeDelta::seconds(1))
             .expect("the tied audit events should be readable");
 
@@ -882,10 +860,8 @@ mod tests {
                 .expect("the unspellable empty window should be readable");
         assert_eq!(unspellable, Vec::new());
 
-        // Reversed *and* unspellable, which is the only combination that needs the guard: with the
-        // start at MAX_UTC, anything reaching `to_sql(start)` answers TimestampOutOfRange where the
-        // contract says empty. Each half alone is covered above and neither half alone would notice
-        // the guard weakening to `end == start`.
+        // Reversed *and* unspellable is the only combination that needs the guard; neither half
+        // alone would notice it weakening to `end == start`.
         let reversed_and_unspellable = events_in_window(&conn, DateTime::<Utc>::MAX_UTC, t)
             .expect("the reversed unspellable window should be readable");
         assert_eq!(reversed_and_unspellable, Vec::new());
@@ -894,9 +870,6 @@ mod tests {
     #[test]
     fn adjacent_event_windows_tile_without_sharing_an_event() {
         let (_dir, conn) = database();
-        // Fixed ids running against the timestamps, so a swap to `ORDER BY id, at` fails every run.
-        // The rows carry `Some(detail)` and are compared whole, so a stored detail's round-trip is
-        // pinned here too.
         let first = ControlEvent {
             id: ulid::Ulid::from(4u128),
             kind: EventKind::BlacklistSkip,
@@ -957,8 +930,8 @@ mod tests {
             .expect("year 10000 should be valid");
 
         record_event(&conn, &event).expect("the last spellable event should be stored");
-        // The exclusive end has no spelling of its own. This is what tells `end - 1 ns` apart
-        // from comparing against `end` itself.
+        // The exclusive end is year 10000, which has no spelling of its own: this is what tells
+        // asking `<= end - 1ns` apart from asking against `end` itself.
         let events = events_in_window(&conn, start, end)
             .expect("the last spellable event should be searchable");
         assert_eq!(events, [event]);
@@ -974,7 +947,6 @@ mod tests {
         let id = ulid::Ulid::generate().to_string();
         let at = at(2026, 7, 30, 12, 0, 0);
 
-        // Public functions cannot produce this kind, so write it with plain SQL.
         conn.execute(
             INSERT_EVENT,
             rusqlite::params![
@@ -997,8 +969,6 @@ mod tests {
         let stored_id = "0000000000000128ggyhyyk08n";
         let at = at(2026, 7, 30, 12, 0, 0);
 
-        // This lower-cased spelling of a canonical ULID cannot be produced by this program, so
-        // write it with plain SQL; every other column uses its canonical spelling.
         conn.execute(
             INSERT_EVENT,
             rusqlite::params![

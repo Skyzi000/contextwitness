@@ -1,5 +1,3 @@
-// The command-line surface: what every subcommand does, including starting the daemon itself.
-
 use std::io::Write as _;
 
 use crate::{autostart, capture, delivery, episodes, logging, maintenance, tray};
@@ -118,18 +116,10 @@ pub fn main() {
 
 /// The daemon: everything this program does on its own, until the process ends.
 fn daemon() -> ! {
-    // Before the engine, the log file and the database: a refused second daemon must not have
-    // touched any of them.
     claim_single_instance();
-    // Asked for here, before any thread exists; judged below, once there is a log file to put the
-    // reason in.
     let dpi_aware = cw_capture::make_dpi_aware();
     cw_ocr::init_runtime();
 
-    // Every step to here runs before there is a log file, and this binary is a windows subsystem
-    // one started from the Run key: a config that cannot be read or names a relative `data_dir`
-    // has no console to complain to, so each failure has to reach a log file rather than end the
-    // logon in silence.
     let config_path = match default_config_path() {
         Ok(path) => path,
         Err(error) => refuse_before_logging(&format!("resolving the config path failed: {error}")),
@@ -142,16 +132,14 @@ fn daemon() -> ! {
         )),
     };
     let paths = DataPaths::new(data_dir);
-    // Held until the process ends: dropping it flushes the file writer.
     let logging = logging::init(&paths);
     install_panic_hook();
     if created {
         info!(path = %config_path.display(), "wrote the default config");
     }
 
-    // Without PER_MONITOR_AWARE_V2 every capture arrives at a virtualized resolution and every
-    // DPI reads 96, silently — the change threshold then measures the wrong pixels. The design
-    // (§3.2) takes a visible refusal over a daemon that degrades without saying so.
+    // Without PER_MONITOR_AWARE_V2 every capture arrives at a virtualized resolution and every DPI
+    // reads 96, silently: a visible refusal over a daemon that degrades without saying so.
     if !dpi_aware {
         error!(
             "the process could not become PER_MONITOR_AWARE_V2, and capture would be silently degraded"
@@ -160,12 +148,9 @@ fn daemon() -> ! {
         std::process::exit(1);
     }
 
-    // The capture sessions are persistent, so the engine outlives the tick that reads from it.
     let mut capture = cw_capture::CaptureEngine::new();
     if let Err(message) = check_thresholds(&mut capture, &config, &config_path) {
         error!("{message}");
-        // Before the exit, which runs no destructor: without this the reason above never reaches
-        // the log file.
         drop(logging);
         std::process::exit(1);
     }
@@ -184,8 +169,6 @@ fn daemon() -> ! {
         Err(error) => error!("the startup episode rescan failed: {error}"),
     }
 
-    // One connection per subsystem (design §7); each carries the same WAL and busy-timeout
-    // contract because every one of them comes from `db::open`.
     spawn("delivery", {
         let conn = open_for("delivery", &paths);
         let data_dir = paths.root.clone();
@@ -219,11 +202,7 @@ fn daemon() -> ! {
 /// stale lock to recognize and clean up after a crash.
 fn claim_single_instance() {
     let name = windows::core::HSTRING::from(INSTANCE_MUTEX);
-    // Held for the life of the process, and dropping this binding does nothing: the claim ends
-    // with the process.
     let _held = unsafe { CreateMutexW(None, false, &name) };
-    // A call that failed for any other reason leaves the daemon unguarded rather than refusing to
-    // start: it says nothing about whether another one is up.
     if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
         eprintln!("contextwitness is already running in this session.");
         std::process::exit(1);
@@ -253,7 +232,6 @@ fn refuse_before_logging(message: &str) -> ! {
         .ok()
         .and_then(|root| logging::init(&DataPaths::new(root)));
     error!("{message}");
-    // Before the exit, which runs no destructor.
     drop(logging);
     std::process::exit(1);
 }
@@ -283,9 +261,7 @@ fn install_panic_hook() {
     }));
 }
 
-/// Abort rather than warn when a monitor's change threshold cannot be reached (plan Task 13): the
-/// comparison in `frame_changed` is strict, so such a monitor stores nothing after its first frame,
-/// with no error anywhere — a silence the user cannot tell from working.
+/// Abort rather than warn when a monitor's change threshold cannot be reached.
 fn check_thresholds(
     capture: &mut cw_capture::CaptureEngine,
     config: &Config,
@@ -294,10 +270,8 @@ fn check_thresholds(
     let mut last_error = None;
     for attempt in 1..=MONITOR_ATTEMPTS {
         match capture.monitors() {
-            // An enumeration that lists nothing is not an answer about this machine: it is what a
-            // session still coming up and an RDP reconnect both produce, and every monitor of an
-            // empty list passes every check. Taken as an answer it would let the daemon start
-            // without the check ever having seen the real monitors.
+            // A session still coming up and an RDP reconnect both list no monitors, and every
+            // monitor of an empty list passes every check.
             Ok(monitors) if monitors.is_empty() => {
                 warn!(attempt, "listing monitors answered with no monitors");
                 last_error = Some("the enumeration listed no monitors".to_owned());
@@ -407,8 +381,6 @@ fn status() -> Result<(), Failure> {
             Err(error) => format!("unreadable: {error}"),
         },
     );
-    // Counted here rather than through the store, which has no count of its own and no other
-    // caller that wants one.
     field(
         "episodes",
         &match conn.query_one("SELECT count(*) FROM episodes", [], |row| {
@@ -418,8 +390,7 @@ fn status() -> Result<(), Failure> {
             Err(error) => format!("unreadable: {error}"),
         },
     );
-    // The URL only, ever: the token is the one thing on this screen that must not be readable
-    // over a shoulder.
+    // The URL only: the token must not be readable over a shoulder.
     field(
         "hindsight",
         &match cw_sink_hindsight::Credentials::load() {
@@ -471,7 +442,6 @@ fn pause(duration: Option<chrono::TimeDelta>) -> Result<(), Failure> {
         None => Pause::Indefinite,
     };
 
-    // This records the audit row itself, in the same transaction as the state.
     cw_store::control::set_pause(&mut conn, pause, ulid::Ulid::generate(), now)?;
     match pause {
         Pause::Until(deadline) => println!("capture paused until {}.", moment(deadline)),
@@ -508,8 +478,6 @@ fn set_autostart(action: &AutostartAction) -> Result<(), Failure> {
 /// One capture pass and nothing else: no workers, no tray, no file log. What it stores it stores
 /// exactly as a tick would, so this is also how one checks that capture works at all.
 fn capture_once(wgc: bool) -> Result<(), Failure> {
-    // The same refusal as the daemon's: a diagnostic that measures a virtualized screen would
-    // report the wrong resolution as if capture worked.
     if !cw_capture::make_dpi_aware() {
         return Err(Failure::from(
             "the process could not become PER_MONITOR_AWARE_V2, so capture would be silently degraded",
@@ -523,11 +491,7 @@ fn capture_once(wgc: bool) -> Result<(), Failure> {
     if wgc {
         capture.force_fallback();
     }
-    // Empty, so every monitor counts as changed: a single pass has nothing to compare against, and
-    // asking for one means asking for what is on screen now.
     let mut previous = std::collections::HashMap::new();
-    // One map across the retries below, so a monitor whose save keeps failing is reported once for
-    // the invocation rather than once per retry.
     let mut save_failed = std::collections::HashMap::new();
     let mut stored = capture::pass(
         &mut capture,
@@ -539,14 +503,9 @@ fn capture_once(wgc: bool) -> Result<(), Failure> {
         &mut save_failed,
         None,
     )?;
-    // WGC sessions deliver their first frame from a callback thread, and each monitor's arrives on
-    // its own schedule, so the first pass can find some or all of the mailboxes still empty — and
-    // one monitor answering says nothing about the rest. The sessions persist across passes; ask
-    // again until every monitor has answered or the deadline is up. The non-WGC path needs none of
-    // this: duplication is synchronous and answers for every monitor in the one pass above.
+    // WGC delivers each monitor's first frame from a callback thread on its own schedule, so a
+    // pass can find mailboxes still empty; the sessions persist across passes, so ask again.
     if wgc {
-        // An enumeration that fails leaves no set to cover, so the wait falls back to the weaker
-        // question of whether anything at all was stored.
         let expected: Vec<String> = capture
             .monitors()
             .map(|monitors| monitors.into_iter().map(|monitor| monitor.id).collect())
@@ -554,10 +513,6 @@ fn capture_once(wgc: bool) -> Result<(), Failure> {
         let deadline = std::time::Instant::now() + WGC_ANSWER_DEADLINE;
         while !all_answered(&stored, &expected) && std::time::Instant::now() < deadline {
             std::thread::sleep(WGC_ANSWER_RETRY);
-            // Only the monitors still unanswered: one that already stored its frame must not gain
-            // a second from the same invocation while a slow neighbor is waited out — this command
-            // promises one frame per monitor. A failed enumeration leaves no set to subtract from,
-            // so there the filter stays off and the loop keeps the weaker anything-stored contract.
             let missing: std::collections::HashSet<String> = expected
                 .iter()
                 .filter(|id| !stored.iter().any(|frame| &frame.monitor_id == *id))
@@ -583,9 +538,6 @@ fn capture_once(wgc: bool) -> Result<(), Failure> {
             })
             .map(String::as_str)
             .collect();
-        // Printed before the frames, because the frames alone read as a complete answer. Monitor
-        // ids are device names such as `\\.\DISPLAY2`, not screen content, and the lines below
-        // already carry them.
         if !missing.is_empty() {
             println!(
                 "{} of {} monitors answered within {}s; nothing from {}",
@@ -644,7 +596,6 @@ fn setup() -> Result<(), Failure> {
     setup_credentials()?;
     println!();
     setup_data_dir()?;
-    // Both are read once, at startup.
     println!("\nRestart ContextWitness for any of this to take effect.");
 
     Ok(())
@@ -659,8 +610,6 @@ fn setup_credentials() -> Result<(), Failure> {
     }
     let token = ask_secret("  API token: ")?;
     if token.is_empty() {
-        // The URL alone would leave the file incomplete, which delivery reports as a broken
-        // configuration rather than an absent one — worse than the state this started in.
         return Err("the token is required alongside the URL".into());
     }
 
@@ -700,22 +649,15 @@ fn setup_data_dir() -> Result<(), Failure> {
     };
     let mut updated = text;
     updated.replace_range(line, &format!("{DATA_DIR_KEY} = {}", toml_string(&answer)));
-    // Checked before it is written, because the escaping above is the only thing between a Windows
-    // path and a config the daemon then refuses to load.
     let parsed = Config::from_toml_str(&updated).map_err(|error| {
         format!("the updated config would not parse, so it was not written: {error}")
     })?;
-    // Parsing is not the whole of what the daemon demands of this key: a relative path parses and
-    // is then refused at every startup. Refusing it here is the only place the user is still at the
-    // prompt and can answer with another one.
     parsed
         .storage
         .resolve_data_dir()
         .map_err(|error| format!("{error}; the config was not written"))?;
-    // The line scan above is lexical, so a `data_dir = ` line inside a multi-line string is one it
-    // can hit — the replacement then lands inside that string, the file still parses, and the real
-    // key keeps its old value. Parsing proved the rewrite is valid TOML; only this proves it landed
-    // on the key.
+    // The line scan is lexical and can hit a `data_dir = ` line inside a multi-line string: the
+    // replacement lands there, the file still parses, and the real key keeps its old value.
     if parsed.storage.data_dir != answer {
         return Err(format!(
             "the rewrite did not reach the [storage] data_dir key, so the config was not written; \
@@ -725,18 +667,12 @@ fn setup_data_dir() -> Result<(), Failure> {
         .into());
     }
 
-    // Written beside the config and renamed onto it, never into it: `fs::write` truncates first,
-    // and an interruption between the truncation and the last byte leaves a config that still
-    // parses — as every default — so the daemon would collect into the per-user directory instead
-    // of the one just set, and say nothing. This rename replaces the destination, which is the
-    // point here and is why it goes by name rather than through the no-clobber publish cw-core
-    // uses to create the config in the first place.
+    // Renamed onto the config, never written into it: `fs::write` truncates first, and an
+    // interruption leaves a config that parses as every default, collecting elsewhere in silence.
     let (temporary, mut file) = create_temporary_beside(&config_path)?;
     let written = file
         .write_all(updated.as_bytes())
         .and_then(|()| file.sync_all());
-    // Closed before the rename: the handle has nothing left to do, and a scratch file left behind
-    // by a failure would sit beside the config looking like one.
     drop(file);
     if let Err(error) = written.and_then(|()| std::fs::rename(&temporary, &config_path)) {
         let _ = std::fs::remove_file(&temporary);
@@ -874,8 +810,6 @@ impl EchoOff {
 
 impl Drop for EchoOff {
     fn drop(&mut self) {
-        // Nothing to do about a failure here: the console is the only place to report it, and it
-        // is the thing that just did not answer.
         let _ = unsafe { SetConsoleMode(self.handle, self.previous) };
     }
 }

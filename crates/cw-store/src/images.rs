@@ -10,9 +10,6 @@ const COUNT_IMAGE_BY_ID: &str = "SELECT count(*) FROM images WHERE observation_i
 const SELECT_PATH_BY_ID: &str =
     "SELECT observation_id, relative_path, created_at FROM images WHERE observation_id = ?1";
 const DELETE_IMAGE: &str = "DELETE FROM images WHERE observation_id = ?1";
-// The report `orphan_rows` produces is read by a person and its order is the order the pictures
-// were taken. The sweep collects into a set, so it asks without an `ORDER BY` at all rather than
-// paying for a sort no index serves.
 const SELECT_IMAGE_ROWS: &str = "SELECT observation_id, relative_path, created_at FROM images ORDER BY created_at, observation_id";
 const SELECT_IMAGE_PATHS: &str = "SELECT observation_id, relative_path, created_at FROM images";
 
@@ -161,8 +158,6 @@ fn save_registering(
     let write_result =
         std::io::Write::write_all(&mut file, &encoded).and_then(|()| file.sync_all());
     if let Err(source) = write_result {
-        // Addressed to the handle and not to a name: nothing else in this function needs to know
-        // what the temporary was called.
         discard_written_file(&file);
         drop(file);
         return Err(StoreError::ImageIo {
@@ -171,12 +166,8 @@ fn save_registering(
         });
     }
 
-    // The INSERT decides a conflict before anything is published.
-    // `delete` takes the same IMMEDIATE lock, so no two decisions about this observation's row can
-    // be made at once. A `delete` whose transaction ran before this one cannot take this file: it
-    // removes nothing unless the name was occupied while it still held the lock, and while the name
-    // is occupied this rename cannot have put anything there. One that takes the lock after this
-    // commit does remove the file published here, which is what deleting this observation means.
+    // The INSERT decides a conflict before anything is published, and `delete` takes the same
+    // IMMEDIATE lock, so no two decisions about this observation's row can be made at once.
     let transaction = match conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
     {
         Ok(transaction) => transaction,
@@ -186,9 +177,6 @@ fn save_registering(
         }
     };
 
-    // Before the image row, because that row references this one. Discarding the temporary and
-    // dropping the transaction is the whole of the undo: neither row is published, and what is left
-    // is the unregistered file every other pre-commit failure below leaves.
     if let Some(observation) = observation
         && let Err(error) = observations::insert(&transaction, observation)
     {
@@ -200,12 +188,6 @@ fn save_registering(
         INSERT_IMAGE,
         rusqlite::params![id_text, relative, byte_size, created_at],
     ) {
-        // Two different states raise the same `SQLITE_CONSTRAINT_UNIQUE` on the path index: an
-        // identical retry, and another observation's row already holding this path, which is a
-        // database that disagrees with itself. The error alone does not separate them, so the row
-        // is asked for instead — a constraint violation aborts the statement and leaves the
-        // transaction usable. A count that cannot be taken leaves the original error to speak for
-        // itself, because nothing has established that anything is registered.
         let already_registered = matches!(
             transaction.query_one(COUNT_IMAGE_BY_ID, [id_text.as_str()], |row| row
                 .get::<_, i64>(0)),
@@ -222,12 +204,8 @@ fn save_registering(
         Ok(true) => {}
         Ok(false) => {
             discard_written_file(&file);
-            // Not `ImageAlreadyRegistered`: the insert above has already succeeded, so once this
-            // rolls back the observation has no row, and saying the database already knows about
-            // the image would point recovery the wrong way. Nothing this program registered can
-            // hold the name either — it writes one spelling per id and that spelling is this
-            // row's. A row naming this file by some other spelling would survive the index and is
-            // a database disagreeing with itself, which the sweep reports rather than this branch.
+            // Not `ImageAlreadyRegistered`: the insert above already succeeded, so once this rolls
+            // back the observation has no row and that error would point recovery the wrong way.
             return Err(StoreError::ImageIo {
                 path: destination,
                 source: std::io::Error::from(std::io::ErrorKind::AlreadyExists),
@@ -253,14 +231,9 @@ fn save_registering(
     }
 
     if let Err(source) = transaction.commit() {
-        // The picture stays. An error here does not prove the row is not there — SQLite does not
-        // promise that every failed commit rolled back — and discarding it would turn that
-        // uncertainty into the one outcome this store refuses: a registered row whose file is gone,
-        // which nothing unasked removes and retention keeps charging against a budget that is
-        // already free.
-        // If the transaction did roll back, what is left is an unregistered file, which the
-        // startup sweep collects from where its walk reaches, once nothing refuses the removal.
-        // Every other failure above can discard, because none of them has reached the commit.
+        // The picture stays: SQLite does not promise that every failed commit rolled back, and
+        // discarding it risks a registered row whose file is gone. Every other failure above can
+        // discard — none of them reached the commit.
         return Err(StoreError::Sql { source });
     }
     drop(file);
@@ -331,21 +304,6 @@ pub fn delete(
         return Ok(());
     };
     let path = root.join(relative);
-    // Opened while the transaction still holds the lock, and the removal below is addressed to this
-    // handle, so the name is resolved once and never again. Deciding by name and then resolving it
-    // a second time after the commit would remove whatever it reached by then, which need not be
-    // the file the row named: the entry can be moved aside and a `save` for this same observation
-    // can publish a new file into the freed name, and that file has a fresh row saying it is there.
-    //
-    // Asked without following the last component, because clearing a name means taking the entry
-    // that carries it and not the file at the other end. A link whose target is gone still has an
-    // entry, and leaving it would stand in the way of every later save for this observation.
-    //
-    // A row whose file is already gone is a state this store tolerates, and there the work left is
-    // nothing. Anything else that will not open is reported with the row still in place: a
-    // directory or a link to one answers `PermissionDenied` here, and committing first would leave
-    // the name taken with no row to find it by, so every later save for this observation would
-    // collide with it and nothing would ever clear it.
     let held = match cw_core::atomic_file::open_entry_for_removal(&path) {
         Ok(file) => Some(file),
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => None,
@@ -359,8 +317,6 @@ pub fn delete(
         .commit()
         .map_err(|source| StoreError::Sql { source })?;
 
-    // A file removal cannot be rolled back, so the two media cannot commit together and one of them
-    // is left over on failure.
     if let Some(file) = held {
         cw_core::atomic_file::delete_by_handle(&file)
             .map_err(|source| StoreError::ImageIo { path, source })?;
@@ -399,30 +355,11 @@ pub fn sweep_orphan_files(
     conn: &mut rusqlite::Connection,
     root: &std::path::Path,
 ) -> Result<usize, StoreError> {
-    // Resolved once, before anything is read, so that the baseline every candidate is compared
-    // against is the one taken here rather than one taken after the walk. What this does not do is
-    // pin the tree that gets enumerated: what is held is a path and not a handle, so `collect_files`
-    // resolves this spelling again and a link put at the root's name in between is followed. What
-    // keeps that from costing anything is the per-candidate check further down — a file opened
-    // under the replacement answers with a name below the replacement's target rather than with the
-    // one it was listed under, so it is kept. That check is load-bearing here and not merely a
-    // second opinion. Resolving the root after the walk would move the baseline itself, and then
-    // every file under the replacement would compare as though it belonged here.
     let root = match std::fs::canonicalize(root) {
         Ok(resolved) => resolved,
-        // Nothing there at all is the ordinary state before the first save and there is nothing to
-        // sweep, but that is a question about the entries on this path and not about what they lead
-        // to, and it has to be put to the whole path rather than to its last component.
-        // `canonicalize` answers `NotFound` for a name that was never there, for a link whose target
-        // is gone, and for a path leading through either of those, and the raw code does not
-        // separate them either. What decides is the deepest entry that does exist: none at all, or a
-        // directory, and the rest of the path is simply not created yet; anything else, and no image
-        // can ever be written here — `create_dir_all` answers `AlreadyExists` — so calling it the
-        // state before the first save would report a clean pass on every startup of a store that
-        // cannot work at all. The registered names below are read by a weaker rule on purpose:
-        // `canonicalize` answering `NotFound` is taken as absent there without asking about the
-        // entry, because that loop only needs to know which file a row names, and a name leading
-        // nowhere names none. This root has to be walked.
+        // `canonicalize` answers `NotFound` for a name that was never there, for a link whose
+        // target is gone, and for a path through either, so what decides is the deepest entry that
+        // does exist: none at all, or a directory.
         Err(source) => {
             let unreadable = StoreError::ImageIo {
                 path: root.to_path_buf(),
@@ -430,19 +367,11 @@ pub fn sweep_orphan_files(
             };
             for name in root.ancestors() {
                 match std::fs::symlink_metadata(name) {
-                    // Nothing is here. Keep climbing — the path may simply not be created yet, and
-                    // running out of names means none of it is.
                     Err(absent) if absent.kind() == std::io::ErrorKind::NotFound => {}
-                    // The name cannot be answered about, which is not the same as nothing being
-                    // there. A component Windows will not take — one holding a `|`, or longer than
-                    // a component may be — answers `InvalidFilename` while the directory above it
-                    // is perfectly ordinary, and a `storage.data_dir` typed with such a character
-                    // is exactly that. Reporting a clean sweep on a doubt would report it on every
-                    // startup.
+                    // A component Windows will not take — one holding a `|` — answers
+                    // `InvalidFilename` while the directory above it is perfectly ordinary, which
+                    // is not the same as nothing being there.
                     Err(_) => return Err(unreadable),
-                    // The deepest entry that does exist. The root itself arriving here is a name
-                    // taken by something `canonicalize` refused. Otherwise what is left of the path
-                    // is waiting to be created, and only a directory can hold it — asked with
                     // `metadata`, which follows links, because a data directory junctioned onto
                     // another volume is a directory to everything else here.
                     Ok(_) => {
@@ -456,18 +385,11 @@ pub fn sweep_orphan_files(
                     }
                 }
             }
-            // Nothing on the whole path is there. What that means depends on whether the path
-            // names its own anchor. A root that names a drive or a share carries that anchor as
-            // one of these names, so running out of them says the anchor is absent too, and
-            // `create_dir_all` makes a tail but never an anchor — no image can ever be written
-            // there, and calling it the state before the first save would report a clean pass on
-            // every startup. A root that names none is held by the directory the process is in,
-            // which is never among these names, so running out of them settles nothing and this
-            // is the ordinary state before the first save. Whether the path is absolute is the
-            // wrong question to put here: `X:images` is anchored to drive X exactly as `X:\images`
-            // is and neither can be created, yet only the second is absolute to Rust while both
-            // lead with a `Prefix` component. On a drive that is there this line is never reached,
-            // because `X:` answers `Ok` and is the deepest entry that exists.
+            // Nothing on the whole path is there. A root naming its own anchor carries it among
+            // these names and `create_dir_all` makes a tail but never an anchor; a root naming none
+            // is held by the process's directory, never among them. `is_absolute` is the wrong
+            // question: `X:images` is anchored to drive X exactly as `X:\images` is, yet only the
+            // second is absolute to Rust while both lead with a `Prefix`.
             return if matches!(
                 root.components().next(),
                 Some(std::path::Component::Prefix(_))
@@ -478,23 +400,18 @@ pub fn sweep_orphan_files(
             };
         }
     };
-    // Outside the transaction, and before it, on purpose. The walk is the long part of this pass and
-    // holding the write lock across it would stop every save for as long as the tree takes to read,
-    // while a file listed here before a save even started costs nothing: by the time the rows are
-    // read that file is either registered — and kept — or it belongs to no committed row at all.
+    // Outside the transaction and before it: holding the write lock across the walk would stop
+    // every save for as long as the tree takes to read.
     let mut files = Vec::new();
     collect_files(&root, &mut files)?;
-    // IMMEDIATE takes the write lock at BEGIN rather than at the first write, and this transaction
-    // writes nothing: what it is for is the lock, held from before the rows are read until after the
-    // last removal. `save` renames its file into place while holding the same lock and commits
-    // before releasing it, so the two orders are the only ones there are — this pass sees the row
-    // and keeps the file, or the file was never registered by anything that committed.
+    // This transaction writes nothing: what it is for is the lock, held from before the rows are
+    // read until after the last removal. `save` renames its file into place under the same lock and
+    // commits before releasing it, so this pass either sees the row and keeps the file, or the file
+    // was never registered by anything that committed.
     let transaction = conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(|source| StoreError::Sql { source })?;
     let registered = registered_paths(&transaction)?;
-    // Reads no rows itself, so it is called here rather than given the transaction: what it needs
-    // from this scope is that the lock is still held while it judges and removes.
     let removed = sweep_collected_files(&root, &registered, &files)?;
     transaction
         .commit()
@@ -512,29 +429,11 @@ fn sweep_collected_files(
     registered: &HashSet<String>,
     files: &[std::path::PathBuf],
 ) -> Result<usize, StoreError> {
-    // Whether two spellings name one file is the filesystem's rule, not this program's. A byte
+    // Whether two spellings name one file is the filesystem's rule, not this program's: a byte
     // comparison deletes a registered image on the case-insensitive directory this normally runs
-    // on, and case is not the only way one file answers to two names: a registered name can be a
-    // link to a file this loop enumerates under the name it really has, and that file is what the
-    // picture is. So the question asked of every candidate is not how it is spelled but which file
-    // it reaches, and it is asked against every registered name that no enumerated file spelled —
-    // the rows whose file, if it is there at all, is under some other name. On the ordinary
-    // directory nothing reaches this point, because every enumerated file is registered under the
-    // name it was enumerated with. `canonicalize` answers with the name actually on disk, so a
-    // difference of case, a link, or any other spelling inside the drive's namespace collapses to
-    // a single answer. A spelling through another namespace need not — measured, one file reached
-    // over a loopback share answers with the share's spelling against the walk's drive-letter one
-    // — so a registered link written that way is not matched, and the file it reaches can be taken
-    // as an orphan exactly as in the enumeration gap below. Two hardlinks are two names and stay
-    // two, which costs nothing here: removing the candidate's name leaves the registered one, and
-    // the picture with it. A candidate this cannot
-    // be answered about is kept: leaving a leftover costs disk, and removing a registered image
-    // costs the picture. Asking only about the names no enumerated file spelled is a cost decision
-    // and it leaves something out — a registered name that was an ordinary file when it was
-    // enumerated and has become a link by the time this runs is not asked about, so the file it now
-    // reaches can be taken as an orphan. Asking about every registered name instead is a filesystem
-    // round trip per registered row, paid on every startup where anything unregistered is under the
-    // root at all.
+    // on. So every candidate is asked which file it reaches, against the registered names no
+    // enumerated file spelled. That leaves out a registered name that has become a link since it
+    // was enumerated; asking about all of them is a filesystem round trip per row on every startup.
     let mut enumerated = Vec::with_capacity(files.len());
     for path in files {
         let relative = path_relative_to_root(root, path)?;
@@ -560,12 +459,9 @@ fn sweep_collected_files(
             Ok(identity) => {
                 unspelled_identities.insert(identity);
             }
-            // Nothing under the name, so no enumerated file can be what it names. This is the
-            // ordinary state of a row whose file is gone, which the sweep must not let stop it.
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
-            // The name is there and will not say which file it reaches. Any candidate might be
-            // that file, so this pass has nothing it can safely remove — a symlink pointing at
-            // itself answers `FilesystemLoop` here while its entry exists.
+            // The name is there and will not say which file it reaches — a symlink pointing at
+            // itself answers `FilesystemLoop` — so any candidate might be that file.
             Err(_) => return Ok(0),
         }
     }
@@ -575,47 +471,22 @@ fn sweep_collected_files(
         if registered.contains(relative) {
             continue;
         }
-        // Opened first, and then asked about itself, so that one file answers both the question and
-        // the removal. A candidate that cannot be opened is kept, for the same reason as one that
-        // cannot be identified: two startups can reach the same orphan, and the one that arrives
-        // second has nothing left to do. A directory cannot be opened this way at all, so no pass
-        // can remove one.
         let Ok(file) = cw_core::atomic_file::open_for_removal(path) else {
             continue;
         };
         let Ok(identity) = cw_core::atomic_file::final_path_by_handle(&file) else {
             continue;
         };
-        // What stands under a name can be replaced between resolving it and acting on it — the
-        // entry itself, or a directory above it, since Windows follows a reparse point met partway
-        // along a path. Resolving the name a second time would only produce a second answer, about
-        // whatever the name reaches by then rather than about the file being removed. So the
-        // question put here is what the open file calls itself. `collect_files` keeps only what the
-        // filesystem calls a file and a link is not one, so every candidate was an ordinary file
-        // when it was listed, and an ordinary file opened by its listed name answers with that
-        // name, while a file reached through a replaced directory answers with a name under the
-        // replacement's target instead. Anything answering differently is not standing at that name
-        // at all, and what the handle holds may be a registered image or may be outside the root
-        // entirely. What this settles is where the file is and not that it is the one the walk saw:
-        // a candidate can be moved away and another file put under its name in between, and that
-        // one answers with the listed name and goes. It is unregistered and under the root, which
-        // is what this pass removes, so the substitution costs nothing. Containment comes with it:
-        // every listed name is under the root by construction, so a handle that calls itself by its
-        // listed name is holding a file inside the root.
+        // What stands under a name can be replaced between resolving it and acting on it, and
+        // Windows follows a reparse point met partway along a path, so the question put here is
+        // what the open file calls itself. Every listed name is under the root by construction.
         if identity.as_path() != path.as_path() || unspelled_identities.contains(&identity) {
             continue;
         }
 
         // Addressed to the handle opened above, so no name is resolved between the last check and
-        // the removal. What that settles is which file goes, not where it will be when it does:
-        // this handle shares the delete right, so the candidate can be renamed in between, and the
-        // removal follows the file rather than the name it had. A candidate that will not go is
-        // kept and the pass carries on, for the same reason as one that cannot be opened or
-        // resolved: a single file must not decide whether every other orphan is collected, and a
-        // file that fails the same way on every startup would mean none of them ever are. That is
-        // reachable with no race and no privilege: a read-only file opens for removal and then
-        // answers `PermissionDenied` to the disposition call. It is not counted, because the count
-        // is of removals the filesystem accepted.
+        // the removal. A candidate that will not go is kept: a read-only file opens for removal and
+        // then answers `PermissionDenied`, and one such file must not stop the pass.
         if cw_core::atomic_file::delete_by_handle(&file).is_ok() {
             removed += 1;
         }
@@ -704,19 +575,7 @@ fn collect_files(
     while let Some(directory) = worklist.pop() {
         let entries = match std::fs::read_dir(&directory) {
             Ok(entries) => entries,
-            // Nothing at this name. Below the root that is a directory that went away while the
-            // walk was running, with nothing left under it to collect. At the root it is the root
-            // itself going away after `sweep_orphan_files` resolved it, and no orphan exists under
-            // a root that is not there. A root standing on something that cannot hold images takes
-            // the arm below instead: an ordinary file resolves, and listing it fails as something
-            // other than an absence, which is the whole of what this arm asks.
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => continue,
-            // A root that will not be listed means nothing under it was seen at all, so answering
-            // `Ok` there is a clean sweep reported on every startup of a store from which nothing
-            // is ever collected. A directory under it is one place among many, and failing the
-            // whole pass on one of them leaves every orphan everywhere else uncollected for as
-            // long as it stays, which is what a candidate that will not open or will not go is
-            // already passed over for.
             Err(source) if directory == root => {
                 return Err(StoreError::ImageIo {
                     path: directory,
@@ -729,11 +588,8 @@ fn collect_files(
         for entry in entries {
             let entry = match entry {
                 Ok(entry) => entry,
-                // The listing stopped partway, which is the arm above arriving one step later.
-                // Broken out of rather than skipped, because `ReadDir` promises nothing about what
-                // follows an error: an iterator that keeps answering with one would never let this
-                // loop end, while ending the listing early costs at most a leftover left
-                // uncollected until some later startup.
+                // Broken out of rather than skipped: `ReadDir` promises nothing about what follows
+                // an error, and one that keeps answering with it would never let this loop end.
                 Err(source) if directory == root => {
                     return Err(StoreError::ImageIo {
                         path: directory.clone(),
@@ -743,10 +599,6 @@ fn collect_files(
                 Err(_) => break,
             };
             let path = entry.path();
-            // One name that cannot be answered about, in a listing that is otherwise still
-            // arriving. It costs this pass that name, and everything under it when the name was a
-            // directory, because the worklist never learns of it. What it does not cost is the
-            // root's whole listing, so the rule above does not reach here even at the root.
             let Ok(file_type) = entry.file_type() else {
                 continue;
             };
@@ -958,10 +810,8 @@ mod tests {
         assert!(bytes.len() >= 12);
         assert_eq!(&bytes[0..4], b"RIFF");
         assert_eq!(&bytes[8..12], b"WEBP");
-        // Decoding here is a test reading back what this test just wrote; the program itself still
-        // only encodes. Without this, handing the encoder its height and width the other way round
-        // stores the same rows rewrapped at the wrong stride — a scrambled picture with its
-        // dimensions swapped — and every assertion above still holds.
+        // Without the decode, handing the encoder its height and width the other way round stores
+        // a scrambled picture and every assertion above still holds.
         let decoded = webp::Decoder::new(&bytes)
             .decode()
             .expect("the saved WebP should decode");
@@ -983,11 +833,8 @@ mod tests {
         let (_dir, mut conn, root) = database();
         let id = ulid::Ulid::generate();
         let taken_at = at(2026, 7, 30);
-        // No observation is inserted, so this image's row breaks the foreign key `db::open` turns
-        // on. SQLite enforces that check as the INSERT arrives unless it is deferred, and then it
-        // is the COMMIT that answers `ConstraintViolation` (787) — the one failure the last
-        // statement of `save` can be given from here. `save` never reads or writes this pragma, and
-        // SQLite clears it when the transaction ends.
+        // No observation is inserted, so the image row breaks a foreign key. Deferred, it is the
+        // COMMIT that answers — the one failure the last statement of `save` can be given here.
         conn.execute_batch("PRAGMA defer_foreign_keys = ON")
             .expect("the pragma should apply");
 
@@ -1003,8 +850,6 @@ mod tests {
         );
 
         assert!(matches!(result, Err(StoreError::Sql { .. })), "{result:?}");
-        // The picture is left where it was published, which is what the startup sweep collects.
-        // Discarding it instead would be the one outcome this store refuses if the row did survive.
         let published = root.join(format!("2026/07/30/{id}.webp"));
         assert!(
             published.is_file(),
@@ -1022,9 +867,6 @@ mod tests {
         let id = ulid::Ulid::generate();
         insert_observation(&conn, id, at(2026, 7, 30));
 
-        // Another connection holds the write lock this save needs, and this one is told not to wait
-        // for it, so the transaction cannot begin at all — after the temporary has been reserved
-        // and written.
         let mut blocker =
             db::open(&dir.path().join("db.sqlite3")).expect("a second connection should open");
         let held = blocker
@@ -1127,7 +969,7 @@ mod tests {
         )
         .expect("the conflicting image row should be planted");
 
-        // An identical retry and this planted path share one extended error code; the ID count is
+        // An identical retry and this planted path share one extended error code; the id count is
         // what separates them.
         let error = save(
             &mut conn,
@@ -1206,9 +1048,6 @@ mod tests {
         let oversized_id = ulid::Ulid::generate();
         let oversized = vec![0; 49_152];
 
-        // This length passes the pixel check, so the dimension guard is what refuses it.
-        // `encode_simple` returns an error rather than panicking, which is why it is called instead
-        // of `encode`.
         let oversized_error = save(
             &mut conn,
             &root,
@@ -1258,8 +1097,6 @@ mod tests {
         insert_observation(&conn, zero_id, taken_at);
         insert_observation(&conn, hundred_id, taken_at);
 
-        // The configuration allows the whole range, so the refusal of -1 says nothing about where
-        // the accepted range actually ends.
         // A four-by-three block of three repeating colours compresses to the same handful of bytes
         // at either end of the range, so a `quality` the encoder never sees would go unnoticed.
         const DETAILED: u32 = 64;
@@ -1317,15 +1154,11 @@ mod tests {
         insert_observation(&conn, id, taken_at);
         let pixels = vec![0_u8; 49_149];
 
-        // The refusal case above cannot pin this bound: a frame one pixel wider fails the encoder
-        // as well as the guard. Only this accepted side distinguishes the correct limit from one
-        // narrowed by a pixel.
         save(&mut conn, &root, id, &pixels, 16_383, 1, 75.0, taken_at)
             .expect("a frame at the encoder's dimension limit should be accepted");
 
         let second_id = ulid::Ulid::generate();
         insert_observation(&conn, second_id, taken_at);
-        // Width and height are separate bounds, so a test of one says nothing about the other.
         save(
             &mut conn, &root, second_id, &pixels, 1, 16_383, 75.0, taken_at,
         )
@@ -1376,8 +1209,6 @@ mod tests {
         let id = ulid::Ulid::generate();
         let relative = save_test_image(&mut conn, &root, id, at(2026, 7, 30), 50);
         let path = root.join(relative);
-        // Every column, not a count: untouched is a claim about the row's contents, and a count
-        // of one still passes with the payload rewritten in place.
         let before = observation_row(&conn, &id.to_string());
 
         delete(&mut conn, &root, id).expect("the image should be deleted");
@@ -1415,8 +1246,6 @@ mod tests {
         std::fs::remove_file(root.join(relative))
             .expect("the saved file should be removable without touching its row");
 
-        // This is an explicit request rather than one of the automatic paths. Keeping such a row
-        // is `orphan_rows`' rule, not this one's.
         delete(&mut conn, &root, id).expect("the explicit deletion should succeed");
 
         let count: i64 = conn
@@ -1439,9 +1268,6 @@ mod tests {
         std::fs::remove_file(&path)
             .expect("the saved file should be removable before replacement with a symlink");
 
-        // Creating a symlink needs Developer Mode or SeCreateSymbolicLinkPrivilege, so this case
-        // cannot be built everywhere the suite runs, and the test returns without asserting where
-        // it cannot.
         let Ok(()) = std::os::windows::fs::symlink_file(&missing_target, &path) else {
             return;
         };
@@ -1471,9 +1297,6 @@ mod tests {
         std::fs::remove_file(&path)
             .expect("the saved file should be removable before replacement with a symlink");
 
-        // Creating a symlink needs Developer Mode or SeCreateSymbolicLinkPrivilege, so this case
-        // cannot be built everywhere the suite runs, and the test returns without asserting where
-        // it cannot.
         let Ok(()) = std::os::windows::fs::symlink_file(&target, &path) else {
             return;
         };
@@ -1492,11 +1315,7 @@ mod tests {
         let path = root.join(relative);
 
         // A directory answers `PermissionDenied` to the open this removal needs, and measured, so
-        // does a link to one — the arrangement that would otherwise need a privilege to build. A
-        // missing file and a missing parent both come back as `NotFound`, so this is the
-        // deterministic failure that is neither. The surviving row is what tells this order apart
-        // from committing first, which would leave the name taken with no row to find it by while
-        // every later save for this observation collided with it.
+        // does a link to one; a missing file and a missing parent both come back as `NotFound`.
         std::fs::remove_file(&path).expect("the saved file should be removable before replacement");
         std::fs::create_dir(&path).expect("a directory should be creatable at the image path");
 
@@ -1633,8 +1452,6 @@ mod tests {
         let contents = b"registered image";
         std::fs::write(&path, contents).expect("the hand-placed image should be writable");
 
-        // This lower-cased spelling of a canonical ULID cannot be produced by this program, so
-        // write the image row with plain SQL; every other column uses its canonical spelling.
         conn.execute(
             "INSERT INTO images (observation_id, relative_path, byte_size, created_at) \
              VALUES (?1, ?2, ?3, ?4)",
@@ -1647,9 +1464,8 @@ mod tests {
         )
         .expect("the non-canonical image row should be inserted by hand");
 
-        // `delete` answers the question asked: no row exists under the canonical id. The sweep is
-        // what refuses this row; searching for equivalent spellings would put an unindexed scan on
-        // the retention path.
+        // `delete` answers the question asked: no row exists under the canonical id. Searching for
+        // equivalent spellings would put an unindexed scan on the retention path.
         delete(&mut conn, &root, id).expect("the canonical id should have nothing to delete");
 
         let errors = [
@@ -1702,9 +1518,6 @@ mod tests {
         let relative = save_test_image(&mut conn, &root, id, at(2026, 7, 30), 80);
         let saved = root.join(relative);
 
-        // Named the way `create_temporary_beside` names one, because a discard that will not go
-        // leaves exactly this and says nothing. Two things could keep this pass from reaching it:
-        // the name is not a `.webp`, and it starts with the whole name of a registered image.
         let mut leftover = saved.clone().into_os_string();
         leftover.push(format!(".tmp-{}-0", std::process::id()));
         let leftover = std::path::PathBuf::from(leftover);
@@ -1735,13 +1548,8 @@ mod tests {
         let mut files = Vec::new();
         super::collect_files(&resolved, &mut files).expect("the image tree should be collectable");
 
-        // Both were ordinary files when they were listed, so the registered one is spelled by a
-        // listed file and is not among the names the sweep asks about. The orphan then becomes a
-        // link to it.
-        // Creating a file link needs Developer Mode or SeCreateSymbolicLinkPrivilege, so this case
-        // cannot be built everywhere the suite runs. The junction the sweep tests use is no
-        // substitute: it names a directory, and a hard link answers its own name to the very check
-        // this test is about.
+        // Both were ordinary files when they were listed, so the registered one is not among the
+        // names the sweep asks about; the orphan then becomes a link to it.
         std::fs::remove_file(&orphan).expect("the hand-placed file should be removable");
         let Ok(()) = std::os::windows::fs::symlink_file(&picture, &orphan) else {
             return;
@@ -1773,7 +1581,6 @@ mod tests {
         std::fs::write(&left_behind, b"not registered")
             .expect("the hand-placed file should be writable");
 
-        // A row whose file is missing must not make the sweep keep everything.
         let removed =
             sweep_orphan_files(&mut conn, &root).expect("the orphan sweep should succeed");
 
@@ -1794,9 +1601,8 @@ mod tests {
         let relative = save_test_image(&mut conn, &root, id, at(2026, 7, 30), 81);
         let differently_spelled = relative.to_ascii_lowercase();
         assert_ne!(differently_spelled, relative);
-        // A directory flagged case-sensitive keeps the two spellings apart: the rename would
-        // abandon the registered name and sweeping the result would be right, so the premise —
-        // one file answering both spellings — is absent and there is nothing to assert.
+        // A directory flagged case-sensitive keeps the two spellings apart, so the premise — one
+        // file answering both — is absent and there is nothing to assert.
         if !root.join(&differently_spelled).exists() {
             return;
         }
@@ -1836,14 +1642,10 @@ mod tests {
         std::fs::rename(&path, &moved)
             .expect("the saved image should be movable under another name");
 
-        // Creating a symlink needs Developer Mode or SeCreateSymbolicLinkPrivilege, so this case
-        // cannot be built everywhere the suite runs.
         let Ok(()) = std::os::windows::fs::symlink_file(&moved, &path) else {
             return;
         };
 
-        // A file a registered row reaches only through a link must survive: deleting it would
-        // leave the row pointing at a link to nothing.
         let removed =
             sweep_orphan_files(&mut conn, &root).expect("the orphan sweep should succeed");
 
@@ -1865,8 +1667,6 @@ mod tests {
         std::fs::remove_file(&path)
             .expect("the saved file should be removable before replacement with a symlink");
 
-        // Creating a symlink needs Developer Mode or SeCreateSymbolicLinkPrivilege, so this case
-        // cannot be built everywhere the suite runs.
         let Ok(()) = std::os::windows::fs::symlink_file(&path, &path) else {
             return;
         };
@@ -1881,8 +1681,6 @@ mod tests {
         std::fs::write(&left_behind, b"not registered")
             .expect("the hand-placed file should be writable");
 
-        // The registered entry exists and answers `FilesystemLoop`, so nothing rules out that the
-        // left-behind file is what that row names.
         let removed =
             sweep_orphan_files(&mut conn, &root).expect("the orphan sweep should succeed");
 
@@ -1905,12 +1703,8 @@ mod tests {
             return;
         }
 
-        // The root itself is an ordinary directory, so resolving it after the link exists answers
-        // the same as resolving it before.
         let resolved = std::fs::canonicalize(&root).expect("the image root should resolve");
 
-        // The name as it was enumerated, before the directory above it became a link. Nothing here
-        // needs a race: the link can be in place before the sweep starts.
         let enumerated = vec![resolved.join("2026").join("orphan.webp")];
         let removed = super::sweep_collected_files(&resolved, &HashSet::new(), &enumerated)
             .expect("the sweep should succeed without removing anything");
@@ -1923,7 +1717,6 @@ mod tests {
     fn a_root_replaced_after_the_walk_does_not_redirect_the_sweep() {
         let (dir, _conn, root) = database();
         std::fs::create_dir_all(&root).expect("the image root should be creatable");
-        // What the caller resolves before it reads anything.
         let resolved = std::fs::canonicalize(&root).expect("the image root should resolve");
         let outside = dir.path().join("outside");
         std::fs::create_dir_all(&outside).expect("the outside directory should be creatable");
@@ -1937,8 +1730,6 @@ mod tests {
             return;
         }
 
-        // The whole root now leads elsewhere. A sweep that resolved it here rather than before its
-        // walk would take the replacement for its own baseline and find this file inside it.
         let enumerated = vec![resolved.join("orphan.webp")];
         let removed = super::sweep_collected_files(&resolved, &HashSet::new(), &enumerated)
             .expect("the sweep should succeed without removing anything");
@@ -1951,8 +1742,6 @@ mod tests {
     fn a_sweep_of_a_root_that_is_not_there_yet_removes_nothing() {
         let (_dir, mut conn, root) = database();
 
-        // Every startup before the first save finds no image root at all, and that is not a failure
-        // to report — it is a directory with nothing in it to sweep.
         assert!(!root.exists());
         assert_eq!(
             sweep_orphan_files(&mut conn, &root)
@@ -1970,8 +1759,6 @@ mod tests {
             return;
         }
 
-        // `canonicalize` answers `NotFound` here, exactly as it does for a name that was never
-        // there — but this name is taken, and every save will fail on it until someone clears it.
         let result = sweep_orphan_files(&mut conn, &root);
 
         assert!(
@@ -1985,8 +1772,6 @@ mod tests {
         let (dir, mut conn, _root) = database();
         let root = dir.path().join("not-yet").join("images");
 
-        // A first run whose whole data directory is still to be created. The deepest entry that
-        // does exist is the temporary directory, and it is a directory, so nothing here is wrong.
         assert_eq!(
             sweep_orphan_files(&mut conn, &root)
                 .expect("a sweep before the first save should succeed"),
@@ -2004,9 +1789,8 @@ mod tests {
             return;
         }
 
-        // The root's own entry is absent here exactly as it is in the test above, and the two are
-        // told apart by what is standing above it: a link whose target is gone, under which
-        // `create_dir_all` answers `AlreadyExists` and no image can ever be written.
+        // Told apart from the test above by what stands over the root: a link whose target is gone,
+        // under which `create_dir_all` answers `AlreadyExists` and no image can ever be written.
         let result = sweep_orphan_files(&mut conn, &root);
 
         assert!(
@@ -2018,10 +1802,6 @@ mod tests {
     #[test]
     fn a_root_the_filesystem_will_not_answer_about_is_reported() {
         let (dir, mut conn, _root) = database();
-        // A `storage.data_dir` typed with a character Windows does not take. Both `canonicalize`
-        // and `symlink_metadata` answer `InvalidFilename` here while the directory holding it is an
-        // ordinary one, so nothing about this name has been shown to be absent — and it needs no
-        // special privilege to arrange.
         let root = dir.path().join("im|ages");
 
         let result = sweep_orphan_files(&mut conn, &root);
@@ -2038,9 +1818,6 @@ mod tests {
         std::fs::write(&root, b"not a directory")
             .expect("the file standing in for the image root should be writable");
 
-        // The name resolves, so nothing above it is ever asked about and the walk is what fails.
-        // Answering `Ok` would report a clean sweep on every startup of a store that can never hold
-        // an image.
         let result = sweep_orphan_files(&mut conn, &root);
 
         assert!(
@@ -2052,12 +1829,6 @@ mod tests {
     #[test]
     fn a_relative_root_that_is_not_there_yet_removes_nothing() {
         let (_dir, mut conn, _root) = database();
-        // The config layer refuses a relative `storage.data_dir`, but this function takes a bare
-        // path and promises nothing about where it came from. A relative spelling is the simplest
-        // arrangement in which every name on the path is absent while the directory anchoring it —
-        // the one the process is in — is perfectly ordinary and never among them, so running out
-        // of names says nothing here. This is the other side of the check that reports an absolute
-        // root whose drive is not there.
         let root = std::path::PathBuf::from("cw-store-root-that-was-never-created");
         assert!(!root.exists(), "the test would say nothing if this existed");
 
@@ -2071,19 +1842,12 @@ mod tests {
     #[test]
     fn a_root_anchored_to_a_drive_that_is_not_there_is_reported() {
         let (_dir, mut conn, _root) = database();
-        // Any letter with no volume behind it. Every name on such a path answers `NotFound`, the
-        // anchor included, so this is the arrangement in which running out of names is the only
-        // signal there is.
         let Some(letter) = ('D'..='Z').find(|letter| {
             std::fs::symlink_metadata(format!("{letter}:\\"))
                 .is_err_and(|absent| absent.kind() == std::io::ErrorKind::NotFound)
         }) else {
             return;
         };
-        // Both spellings that name that drive. `X:images` is relative to whatever the current
-        // directory on drive X is, so it is anchored to a volume exactly as `X:\images` is and
-        // neither of them can be created; Rust calls only the second one absolute, which is why
-        // the answer here is decided by the leading component instead.
         for root in [
             std::path::PathBuf::from(format!("{letter}:\\ContextWitness\\images")),
             std::path::PathBuf::from(format!("{letter}:ContextWitness\\images")),
@@ -2110,11 +1874,8 @@ mod tests {
             path: path.as_str(),
             user: user.as_str(),
         };
-        // std has no way to set an ACL and this crate may hold no `unsafe`, so the check is asked
-        // of the tool Windows ships with. After this, `canonicalize` answers `PermissionDenied`
-        // while `symlink_metadata` — which is what the ancestor walk puts to the root — still
-        // answers that something is there, and that is what separates a root which will not open
-        // from a path not created yet.
+        // After the deny, `canonicalize` answers `PermissionDenied` while `symlink_metadata` still
+        // answers that something is there, which is the pair the ancestor walk turns on.
         let denied = std::process::Command::new("icacls")
             .args([
                 path.as_str(),
@@ -2123,11 +1884,6 @@ mod tests {
                 "/inheritance:r",
             ])
             .output();
-        // `Err` here does not mean the tool never ran: the standard library spawns the child first
-        // and the wait that follows is fallible on its own, so the deny may already be applied.
-        // Nothing here decides which of the two happened, because nothing has to: the guard above
-        // runs on this exit as on every other, and on a directory that was never denied it changes
-        // nothing.
         let Ok(output) = denied else {
             return;
         };
@@ -2136,11 +1892,6 @@ mod tests {
         }
 
         let result = sweep_orphan_files(&mut conn, &root);
-
-        // Nothing is dropped or restored by hand here. The temporary directory has to outlive the
-        // connection that holds `db.sqlite3` open and the guard above has to run before either, and
-        // leaving the scope — including by unwinding out of the assertion below — already drops
-        // them in that order.
 
         assert!(
             matches!(result, Err(StoreError::ImageIo { .. })),
@@ -2162,10 +1913,6 @@ mod tests {
             path: path.as_str(),
             user: user.as_str(),
         };
-        // Only the right to list the contents is taken. `canonicalize` still answers `Ok`, so the
-        // walk that reports an unopenable root never runs and the enumeration is the only thing
-        // that fails — the one arrangement that puts the question to the walk over the tree
-        // instead.
         let denied = std::process::Command::new("icacls")
             .args([path.as_str(), "/deny", &format!("{user}:(RD)")])
             .output();
@@ -2204,9 +1951,6 @@ mod tests {
             path: path.as_str(),
             user: user.as_str(),
         };
-        // With this applied the root still enumerates and still yields `blocked` as a directory,
-        // while listing `blocked` itself answers `PermissionDenied`. One such place must not decide
-        // whether anything else under the root is ever collected.
         let denied = std::process::Command::new("icacls")
             .args([path.as_str(), "/deny", &format!("{user}:(RX,RA,RD)")])
             .output();
@@ -2234,10 +1978,8 @@ mod tests {
     #[test]
     fn an_orphan_that_will_not_go_does_not_stop_the_others() {
         let (_dir, mut conn, root) = database();
-        // The refused candidate sits at the root beside one removable file, with another a
-        // directory deeper: the walk lists a directory's own files before it opens any directory
-        // under it, so the deeper file always comes after the refusal, and a pass that stopped
-        // there leaves it standing whichever way the root's own listing was ordered.
+        // The walk lists a directory's own files before it opens any directory under it, so the
+        // deeper file always comes after the refusal whichever way the root's listing was ordered.
         let deeper = root.join("2026");
         std::fs::create_dir_all(&deeper).expect("the deeper directory should be creatable");
         let stubborn = root.join("stubborn.webp");
@@ -2246,17 +1988,12 @@ mod tests {
         std::fs::write(&stubborn, b"an orphan").expect("the file should be writable");
         std::fs::write(&beside, b"an orphan").expect("the file should be writable");
         std::fs::write(&below, b"an orphan").expect("the file should be writable");
-        // A read-only file opens for removal and then refuses the disposition call with
-        // `PermissionDenied`, which is the reachable form of a candidate that will not go.
         let mut attributes = std::fs::metadata(&stubborn)
             .expect("the file should be there")
             .permissions();
         attributes.set_readonly(true);
         std::fs::set_permissions(&stubborn, attributes).expect("the attribute should be settable");
 
-        // The attribute is left set on purpose and nothing here puts it back:
-        // `std::fs::remove_file` clears it and succeeds, so the temporary directory can still take
-        // the file away — which is the same difference this test is about.
         let removed = sweep_orphan_files(&mut conn, &root);
 
         assert_eq!(
@@ -2339,13 +2076,10 @@ mod tests {
         let moved = dir.path().join("moved.webp");
         std::fs::rename(&registered, &moved).expect("the image should be movable aside");
 
-        // Creating a symlink needs Developer Mode or SeCreateSymbolicLinkPrivilege, so this case
-        // cannot be built everywhere the suite runs.
         let Ok(()) = std::os::windows::fs::symlink_file(&moved, &registered) else {
             return;
         };
 
-        // The row still reaches its picture, which is all a registered name has to do.
         assert!(
             orphan_rows(&conn, &root)
                 .expect("the report should succeed")
@@ -2362,7 +2096,6 @@ mod tests {
         std::fs::remove_file(&registered).expect("the image should be removable");
         std::fs::create_dir(&registered).expect("a directory should take the freed name");
 
-        // Something is there under that name and it is not this row's picture.
         assert_eq!(
             orphan_rows(&conn, &root).expect("the report should succeed"),
             vec![relative]
@@ -2454,8 +2187,7 @@ mod tests {
         }
 
         // No row is what tells the transaction apart from an autocommitted INSERT: the row write
-        // is its only statement and had already run when the publish was refused, so only the
-        // rollback leaves this count at zero.
+        // had already run when the publish was refused, so only the rollback leaves this at zero.
         let count: i64 = conn
             .query_row(
                 "SELECT count(*) FROM images WHERE observation_id = ?1",

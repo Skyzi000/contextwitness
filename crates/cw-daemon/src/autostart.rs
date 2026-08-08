@@ -1,5 +1,3 @@
-// Autostart via the HKCU Run key (design §10.1).
-
 use winreg::enums::{KEY_READ, KEY_SET_VALUE};
 
 /// Where Windows reads this user's logon entries from.
@@ -10,8 +8,8 @@ const VALUE_NAME: &str = "ContextWitness";
 
 /// Register this executable to start at logon.
 pub fn enable() -> std::io::Result<()> {
-    // The path is quoted because Windows splits an unquoted command on spaces, and under
-    // `C:\Program Files\...` that hands the loader a truncated executable name.
+    // Windows splits an unquoted command on spaces, and under `C:\Program Files\...` that hands
+    // the loader a truncated executable name.
     let command = format!("\"{}\" run", std::env::current_exe()?.display());
 
     run_key(KEY_SET_VALUE)?.set_value(VALUE_NAME, &command)

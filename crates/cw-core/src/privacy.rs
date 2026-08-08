@@ -35,8 +35,7 @@ fn file_names_equal(left: &str, right: &str) -> bool {
     let result =
         unsafe { windows::Win32::Globalization::CompareStringOrdinal(&left, &right, true) };
 
-    // A zero return means the call itself failed. Treat that as a match, so a comparison we could
-    // not perform never ends with recording a screen the user explicitly excluded.
+    // A zero return means the call itself failed, and counts as a match.
     result != windows::Win32::Globalization::CSTR_LESS_THAN
         && result != windows::Win32::Globalization::CSTR_GREATER_THAN
 }
@@ -140,9 +139,8 @@ mod tests {
 
     #[test]
     fn blacklist_follows_windows_file_name_identity() {
-        // Every row was verified by creating both names in one directory on NTFS and observing
-        // whether one file or two resulted. The false rows are genuinely different files, so
-        // suppressing them would cost the user history for a program they never named.
+        // Every row was verified on NTFS by creating both names in one directory and observing
+        // whether one file or two resulted.
         let cases = [
             ("\u{041A}i.exe", "\u{043A}i.exe", true), // Cyrillic capital ka / small ka
             ("\u{00E9}.exe", "\u{00C9}.exe", true), // Latin small e with acute / capital E with acute

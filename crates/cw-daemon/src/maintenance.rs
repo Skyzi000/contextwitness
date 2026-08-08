@@ -1,5 +1,3 @@
-// Image housekeeping: the startup orphan pass and the periodic retention sweep.
-
 use cw_core::config::{Config, DataPaths};
 use tracing::{error, info, warn};
 
@@ -46,8 +44,7 @@ pub fn sweep_orphans(conn: &mut rusqlite::Connection, paths: &DataPaths) {
     }
     match cw_store::images::orphan_rows(conn, &paths.images()) {
         Ok(rows) if rows.is_empty() => {}
-        // Reported, never deleted: the row is the record that the image existed, and its OCR text
-        // lives in the observation either way.
+        // Reported, never deleted: the row is the record that the image existed.
         Ok(rows) => warn!(
             count = rows.len(),
             first = %rows[0],

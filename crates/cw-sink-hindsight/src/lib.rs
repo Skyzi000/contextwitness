@@ -17,8 +17,7 @@ const RETAIN_MISSION: &str = "Record the user's on-screen activity as a time-anc
 const RETAIN_EXTRACTION_MODE: &str = "concise";
 const RETAIN_CHUNK_SIZE: u32 = 3000;
 
-// Retain is synchronous, so this waits out Hindsight's LLM extraction of a whole episode; reqwest's
-// own 30s default would turn every large episode into a spurious retryable failure.
+// Retain is synchronous, and reqwest's own 30s default is far under Hindsight's LLM extraction.
 // ponytail: fixed ceiling, promote to a config knob if real episodes ever approach it.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(600);
 
@@ -39,15 +38,12 @@ impl Credentials {
             .join("contextwitness.json");
         let env_url = from_env("CONTEXTWITNESS_HINDSIGHT_URL");
         let env_token = from_env("CONTEXTWITNESS_HINDSIGHT_TOKEN");
-        // The environment overrides the file, so when it answers both keys the file is not even
-        // read: an unreadable or unparsable file must not defeat the override.
         let file = if env_url.is_some() && env_token.is_some() {
             None
         } else {
             match std::fs::read_to_string(&path) {
-                // Deserialized as a map rather than a `Value`, the line `save` already draws: a root
-                // that is not a JSON object holds neither key, and reading it as an unconfigured
-                // file would stop delivery silently instead of naming the parse error it is.
+                // Deserialized as a map rather than a `Value`: a root that is not a JSON object
+                // holds neither key, and reading it as unconfigured would hide the parse error.
                 Ok(text) => Some(serde_json::from_str::<Map<String, Value>>(&text).map_err(
                     |source| CredentialsError::Parse {
                         path: path.clone(),
@@ -92,8 +88,6 @@ impl Credentials {
             source,
         })?;
         let path = directory.join("contextwitness.json");
-        // Deserialized as a map rather than a `Value`, so a file holding anything but a JSON object
-        // is refused as the parse error it is instead of needing an error of its own.
         let mut document: Map<String, Value> = match std::fs::read_to_string(&path) {
             Ok(text) => serde_json::from_str(&text).map_err(|source| CredentialsError::Parse {
                 path: path.clone(),
@@ -105,15 +99,11 @@ impl Credentials {
         document.insert("hindsightApiUrl".to_owned(), api_url.into());
         document.insert("hindsightApiToken".to_owned(), token.into());
 
-        // `Value`'s own `Display`, because serializing a map of strings has no failure to report.
         let text = format!("{}\n", Value::Object(document));
 
-        // Written beside the file and renamed onto it, never into it: `fs::write` truncates first,
-        // and an interruption between the truncation and the last byte leaves a file that is no
-        // longer JSON — which this function parses before writing, so the next `setup` could not
-        // repair it either, and `load` would refuse it rather than fall back. This rename replaces
-        // the destination, which is the point here and is why it goes by name rather than through
-        // the no-clobber publish cw-core offers.
+        // Renamed onto the file, never written into it: `fs::write` truncates first, and an
+        // interruption leaves invalid JSON that neither `setup` nor `load` can recover. The
+        // rename replaces the destination, which cw-core's no-clobber publish will not do.
         let (temporary, mut file) =
             cw_core::atomic_file::create_temporary_beside(&path).map_err(|source| {
                 CredentialsError::Io {
@@ -124,8 +114,6 @@ impl Credentials {
         let written = file
             .write_all(text.as_bytes())
             .and_then(|()| file.sync_all());
-        // Closed before the rename: the handle has nothing left to do, and a scratch file left
-        // behind by a failure would sit beside the credentials looking like them.
         drop(file);
         if let Err(source) = written.and_then(|()| std::fs::rename(&temporary, &path)) {
             let _ = std::fs::remove_file(&temporary);
@@ -140,7 +128,6 @@ impl Credentials {
     }
 }
 
-// Hand-written so the token cannot reach a log through a `{:?}` anywhere upstream.
 impl fmt::Debug for Credentials {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -211,8 +198,6 @@ struct RetainRequest<'a> {
 struct RetainItemWire<'a> {
     content: &'a str,
     document_id: &'a str,
-    /// Spelled by `to_rfc3339_opts(SecondsFormat::Secs, true)` at the call site, not by chrono's own
-    /// `Serialize`, which carries subsecond digits the episode window does not have.
     timestamp: String,
     context: &'a str,
     metadata: &'a RawValue,
@@ -312,7 +297,6 @@ impl HindsightClient {
     }
 }
 
-// Hand-written so the token cannot reach a log through a `{:?}` anywhere upstream.
 impl fmt::Debug for HindsightClient {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -375,14 +359,11 @@ fn check(response: Response, operation: &str) -> Result<Response, DeliveryError>
     if status.is_success() {
         return Ok(response);
     }
-    // The body stays out of the message: Hindsight echoes rejected input back, and here that input
-    // is captured screen text.
+    // The body stays out: Hindsight echoes rejected input back, and that is captured screen text.
     let message = format!("hindsight {operation} failed with HTTP {status}");
-    // 401 and 403 state that the credential is wrong, not that the payload is, so they are
-    // retryable: a token that expires mid-run would otherwise leave every episode attempted during
-    // the outage permanently unsendable, and fixing the credential would not bring them back. They
-    // follow the normal backoff ladder, which caps at 900s, so a token that stays broken costs one
-    // request per 15 minutes. Every other 4xx is a verdict on the request and stays permanent.
+    // 401 and 403 say the credential is wrong, not the payload, so they are retryable against the
+    // usual 4xx-is-permanent rule: a token expiring mid-run would otherwise leave every episode
+    // attempted during the outage permanently unsendable.
     if status.is_server_error()
         || status == StatusCode::REQUEST_TIMEOUT
         || status == StatusCode::TOO_MANY_REQUESTS
@@ -412,7 +393,28 @@ fn retry_after(response: &Response) -> Option<Duration> {
     if let Ok(seconds) = value.parse::<u64>() {
         return Some(Duration::from_secs(seconds));
     }
-    // The other legal spelling is an HTTP-date; one already past yields no delay.
     let deadline = DateTime::parse_from_rfc2822(&value).ok()?;
     (deadline.with_timezone(&Utc) - Utc::now()).to_std().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debug_output_redacts_the_token() {
+        let credentials = Credentials {
+            api_url: "http://localhost:0".to_owned(),
+            token: "the-secret-token".to_owned(),
+        };
+        let printed = format!("{credentials:?}");
+        assert!(!printed.contains("the-secret-token"), "{printed}");
+        assert!(printed.contains("<redacted>"), "{printed}");
+
+        let client =
+            HindsightClient::new(credentials).expect("building the client makes no request");
+        let printed = format!("{client:?}");
+        assert!(!printed.contains("the-secret-token"), "{printed}");
+        assert!(printed.contains("<redacted>"), "{printed}");
+    }
 }
