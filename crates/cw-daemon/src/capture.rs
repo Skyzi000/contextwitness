@@ -104,8 +104,8 @@ fn tick(
                 error!(
                     monitor = %monitor.id,
                     "this monitor ({}x{} at {}x scale) tops out at {:.0} changed logical pixels, \
-                     under capture.change_area_logical_pixels: it will store nothing after its \
-                     first frame until the threshold is lowered",
+                     under capture.change_area_logical_pixels: no pixel change can cross it until \
+                     the threshold is lowered",
                     monitor.width,
                     monitor.height,
                     monitor.dpi_scale,

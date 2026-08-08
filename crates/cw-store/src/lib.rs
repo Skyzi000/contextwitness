@@ -87,7 +87,7 @@ pub enum StoreError {
     },
     /// A value and its stored form could not be converted into one another: on the way in,
     /// before anything reaches the database, or on the way out, from a row that is already there.
-    #[error("observation {id} cannot be converted to or from its stored form: {source}")]
+    #[error("{id} cannot be converted to or from its stored form: {source}")]
     Encoding {
         /// Primary key as the failing side spells it: the spelling this store writes on the way
         /// in, the row's own on the way out.

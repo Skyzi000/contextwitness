@@ -307,8 +307,8 @@ fn check_thresholds(
                     return Ok(());
                 }
                 return Err(format!(
-                    "capture.change_area_logical_pixels is {}, which no change on these monitors \
-                     can exceed, so nothing on them would ever be stored: {}. Lower it in {}",
+                    "capture.change_area_logical_pixels is {}, which no pixel change on these \
+                     monitors can exceed: {}. Lower it in {}",
                     config.capture.change_area_logical_pixels,
                     unreachable.join("; "),
                     config_path.display()
