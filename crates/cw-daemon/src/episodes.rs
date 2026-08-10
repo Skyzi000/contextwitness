@@ -11,6 +11,9 @@ const SOURCE: &str = "screen";
 /// only the second of them stops when the writer does.
 const GRACE_SECONDS: i64 = 60;
 const _: () = assert!((cw_capture::STALE_SHOT_SECONDS as i64) < GRACE_SECONDS);
+// cw-core bounds `capture.interval_secs` by its own spelling of the staleness allowance, which
+// it cannot import; this crate is where both spellings are visible.
+const _: () = assert!(cw_core::config::MAX_CAPTURE_INTERVAL_SECS == cw_capture::STALE_SHOT_SECONDS);
 /// How often the closer looks. A window closes every `window_minutes`, so this only decides how
 /// much of the grace period is overshot.
 const POLL: std::time::Duration = std::time::Duration::from_secs(30);

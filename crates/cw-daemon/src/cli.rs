@@ -504,7 +504,7 @@ fn capture_once(wgc: bool) -> Result<(), Failure> {
         None,
     )?;
     // WGC delivers each monitor's first frame from a callback thread on its own schedule, so a
-    // pass can find mailboxes still empty; the sessions persist across passes, so ask again.
+    // pass can find sessions with nothing composed yet; they persist across passes, so ask again.
     if wgc {
         let expected: Vec<String> = capture
             .monitors()

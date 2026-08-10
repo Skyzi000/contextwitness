@@ -26,8 +26,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::BOOL;
 
-/// A shot whose callback has dwelt longer than this between stamp and post is refused and the
-/// session is restarted. This must stay under the episode closer's 60-second grace, which
+/// A frame composed longer ago than this at pull time — on either the QPC or the wall clock — is
+/// refused, and the session is torn down so a rebuilt session can compose anew instead of
+/// waiting for a repaint. This must stay under the episode closer's 60-second grace, which
 /// `cw-daemon` pins with a compile-time assert.
 pub const STALE_SHOT_SECONDS: u64 = 30;
 
@@ -39,7 +40,7 @@ pub struct Frame {
     pub dpi_scale: f32,
     pub bgra: Vec<u8>,
     /// Stamped inside the backend's own capture path — not when a consumer got around to the
-    /// frame. OCR takes seconds per frame and the fallback's mailbox holds a frame until the next
+    /// frame. OCR takes seconds per frame and the fallback holds its newest frame until the next
     /// tick, so timestamps taken downstream would drift by that much.
     pub captured_at: chrono::DateTime<chrono::Utc>,
 }
@@ -75,6 +76,8 @@ pub enum Recoverable {
     MonitorGone,
     #[error("no desktop update to capture")]
     NoNewFrame,
+    #[error("held frame is too old to deliver")]
+    StaleFrame,
     #[error("unsupported pixel format: {0}")]
     UnsupportedFormat(String),
 }
@@ -132,8 +135,9 @@ impl CaptureEngine {
 
     /// Drop the fallback's capture sessions. The daemon's privacy gate only stops the tick from
     /// *reading*; the fallback's callback threads keep composing frames regardless, and a frame
-    /// can sit in a mailbox or wait in a frame pool arbitrarily long — a suspend included. After
-    /// this call returns, no frame from a session alive before it can reach a later tick.
+    /// can sit in a held texture or wait in a frame pool arbitrarily long — a suspend included.
+    /// After this call returns, no frame composed before it is deliverable: the sessions alive
+    /// before it are destroyed, and later sessions refuse stamps from before the call.
     pub fn discard_pending(&mut self) {
         self.wgc.discard_pending();
     }

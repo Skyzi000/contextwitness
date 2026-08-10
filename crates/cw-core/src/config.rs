@@ -7,7 +7,7 @@ pub const DEFAULT_CONFIG_TOML: &str = r#"# ContextWitness configuration.
 # Every value below is the built-in default; delete a line to keep using that default.
 
 [capture]
-# Seconds between capture attempts.
+# Seconds between capture attempts (1-30).
 interval_secs = 2
 # A pixel counts as changed when its grayscale value moves by more than this (0-254).
 change_pixel_threshold = 8
@@ -66,12 +66,18 @@ pub struct Config {
     pub episode: EpisodeConfig,
 }
 
+/// Ceiling for `capture.interval_secs`, holding the configured cadence inside the staleness
+/// allowance: the capture backend refuses to deliver a frame composed more than thirty seconds
+/// before the pull. Spelled here because this crate cannot name `cw_capture::STALE_SHOT_SECONDS`;
+/// `cw-daemon` pins the two equal with a compile-time assert.
+pub const MAX_CAPTURE_INTERVAL_SECS: u64 = 30;
+
 /// Screen capture settings.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[serde(default)]
 pub struct CaptureConfig {
-    /// Seconds between capture attempts. At least 1.
+    /// Seconds between capture attempts. At least 1, at most [`MAX_CAPTURE_INTERVAL_SECS`].
     pub interval_secs: u64,
     /// Per-pixel luma delta, 0 through 254. A pixel counts as changed when it moves by strictly
     /// more than this, so 255 would mean nothing ever changed and [`Config::validate`] refuses it.
@@ -252,6 +258,13 @@ impl Config {
             return Err(ConfigError::Invalid {
                 field: "capture.interval_secs",
                 reason: "must be at least 1 second",
+            });
+        }
+
+        if self.capture.interval_secs > MAX_CAPTURE_INTERVAL_SECS {
+            return Err(ConfigError::Invalid {
+                field: "capture.interval_secs",
+                reason: "must be 30 seconds or less; the capture backend refuses older frames",
             });
         }
 
@@ -603,6 +616,23 @@ mod tests {
     }
 
     #[test]
+    fn validate_rejects_an_interval_longer_than_frames_stay_deliverable() {
+        let mut config = Config::default();
+        config.capture.interval_secs = 31;
+
+        assert!(
+            matches!(
+                config.validate(),
+                Err(ConfigError::Invalid {
+                    field: "capture.interval_secs",
+                    ..
+                })
+            ),
+            "an interval longer than frames stay deliverable should be rejected"
+        );
+    }
+
+    #[test]
     fn validate_accepts_the_smallest_and_largest_values_each_bound_allows() {
         let mut config = Config::default();
         config.capture.interval_secs = 1;
@@ -615,6 +645,7 @@ mod tests {
             .validate()
             .expect("the smallest value every bound allows should be accepted");
 
+        config.capture.interval_secs = 30;
         config.capture.webp_quality = 100;
         config.episode.window_minutes = 1440;
 
