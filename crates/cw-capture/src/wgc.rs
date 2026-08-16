@@ -72,6 +72,14 @@ impl WgcCapturer {
         // Refusing every capture forever is the correct answer to a clock that cannot be read.
         self.floor_100ns = qpc_now_100ns().unwrap_or(i64::MAX);
     }
+
+    /// Pull the held frame from an existing session only — never through enumeration, where a
+    /// transient query failure takes the session and its hold down with it — opening nothing.
+    /// The session's own delivery bounds still judge the hold.
+    pub(crate) fn drain_existing(&mut self, monitor: &MonitorInfo) -> Option<Frame> {
+        let session = self.sessions.get_mut(&monitor.id)?;
+        session.capture(&monitor.id, monitor.dpi_scale).ok()
+    }
 }
 
 impl Capturer for WgcCapturer {
@@ -473,6 +481,31 @@ impl Sink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_drain_reads_only_the_session_that_exists() {
+        let mut wgc = WgcCapturer::new();
+        let monitor = MonitorInfo {
+            id: "no-such-monitor".to_owned(),
+            width: 1,
+            height: 1,
+            dpi_scale: 1.0,
+            is_primary: false,
+        };
+        assert!(wgc.drain_existing(&monitor).is_none());
+        assert!(wgc.sessions.is_empty());
+
+        wgc.sessions.insert(
+            monitor.id.clone(),
+            Session {
+                control: None,
+                opened: Instant::now(),
+                delivered: false,
+            },
+        );
+        assert!(wgc.drain_existing(&monitor).is_none());
+        assert!(wgc.sessions.contains_key(&monitor.id));
+    }
 
     /// An arbitrary boot-relative composition instant, in `SystemRelativeTime`'s 100 ns ticks.
     const COMPOSED: i64 = 1_000 * HUNDRED_NS_PER_SECOND;

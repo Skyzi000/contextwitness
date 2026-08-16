@@ -185,7 +185,13 @@ impl CaptureEngine {
                     };
                     tracing::info!("capture backend for {} switched to {name}", monitor.id);
                     if backend == Backend::Primary {
-                        self.wgc.release(&monitor.id);
+                        drain_then_release(&mut result, |op| match op {
+                            HoldOp::Drain => self.wgc.drain_existing(&monitor),
+                            HoldOp::Release => {
+                                self.wgc.release(&monitor.id);
+                                None
+                            }
+                        });
                     }
                 }
             }
@@ -235,6 +241,28 @@ fn outcome(result: &Result<Frame, CaptureError>) -> Outcome {
         Ok(_) | Err(CaptureError::Recoverable(Recoverable::NoNewFrame)) => Outcome::Answered,
         Err(_) => Outcome::Failed,
     }
+}
+
+/// The switch-back settlement, one call so the drain cannot land after the release destroys the
+/// session: only a still probe drains, only an actual frame replaces its answer, and the release
+/// runs on every path.
+fn drain_then_release(
+    result: &mut Result<Frame, CaptureError>,
+    mut hold: impl FnMut(HoldOp) -> Option<Frame>,
+) {
+    if matches!(
+        result,
+        Err(CaptureError::Recoverable(Recoverable::NoNewFrame))
+    ) && let Some(frame) = hold(HoldOp::Drain)
+    {
+        *result = Ok(frame);
+    }
+    hold(HoldOp::Release);
+}
+
+enum HoldOp {
+    Drain,
+    Release,
 }
 
 impl Default for CaptureEngine {
@@ -388,6 +416,8 @@ fn process_name(pid: u32) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+
     use super::*;
 
     #[test]
@@ -404,5 +434,56 @@ mod tests {
             error.to_string(),
             "monitor enumeration failed: every enumerated monitor was refused: a refused; b refused"
         );
+    }
+
+    fn frame(monitor_id: &str) -> Frame {
+        Frame {
+            monitor_id: monitor_id.to_owned(),
+            width: 1,
+            height: 1,
+            dpi_scale: 1.0,
+            bgra: vec![0, 0, 0, 255],
+            captured_at: chrono::Utc::now(),
+        }
+    }
+
+    fn settle(result: &mut Result<Frame, CaptureError>, held: Option<&str>) -> Vec<&'static str> {
+        let ops = RefCell::new(Vec::new());
+        drain_then_release(result, |op| match op {
+            HoldOp::Drain => {
+                ops.borrow_mut().push("drain");
+                held.map(frame)
+            }
+            HoldOp::Release => {
+                ops.borrow_mut().push("release");
+                None
+            }
+        });
+        ops.into_inner()
+    }
+
+    #[test]
+    fn only_a_still_probe_drains_and_the_release_lands_last_on_every_path() {
+        let mut still: Result<Frame, CaptureError> = Err(Recoverable::NoNewFrame.into());
+        assert_eq!(settle(&mut still, Some("held")), ["drain", "release"]);
+        assert!(matches!(&still, Ok(frame) if frame.monitor_id == "held"));
+
+        let mut empty: Result<Frame, CaptureError> = Err(Recoverable::NoNewFrame.into());
+        assert_eq!(settle(&mut empty, None), ["drain", "release"]);
+        assert!(matches!(
+            empty,
+            Err(CaptureError::Recoverable(Recoverable::NoNewFrame))
+        ));
+
+        let mut delivered: Result<Frame, CaptureError> = Ok(frame("current"));
+        assert_eq!(settle(&mut delivered, Some("unread")), ["release"]);
+        assert!(matches!(&delivered, Ok(frame) if frame.monitor_id == "current"));
+
+        let mut failed: Result<Frame, CaptureError> = Err(Recoverable::AccessLost.into());
+        assert_eq!(settle(&mut failed, Some("unread")), ["release"]);
+        assert!(matches!(
+            failed,
+            Err(CaptureError::Recoverable(Recoverable::AccessLost))
+        ));
     }
 }
