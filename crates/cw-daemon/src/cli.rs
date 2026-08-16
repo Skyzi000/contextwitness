@@ -80,7 +80,7 @@ enum Command {
         #[command(subcommand)]
         action: AutostartAction,
     },
-    /// Capture, read and store one frame per monitor, then exit.
+    /// Capture, read and store the way a tick would, then exit.
     CaptureOnce {
         /// Capture through the fallback backend (Windows Graphics Capture) instead of the
         /// primary, to check that the failover path works on this machine.
@@ -475,7 +475,7 @@ fn set_autostart(action: &AutostartAction) -> Result<(), Failure> {
     Ok(())
 }
 
-/// One capture pass and nothing else: no workers, no tray, no file log. What it stores it stores
+/// Capture with nothing else running: no workers, no tray, no file log. What it stores it stores
 /// exactly as a tick would, so this is also how one checks that capture works at all.
 fn capture_once(wgc: bool) -> Result<(), Failure> {
     if !cw_capture::make_dpi_aware() {
