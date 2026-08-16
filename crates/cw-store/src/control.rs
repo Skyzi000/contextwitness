@@ -94,6 +94,9 @@ impl EventKind {
 const SELECT_PAUSE: &str = "SELECT key, value FROM control_state WHERE key IN (?1, ?2)";
 const UPSERT_STATE: &str = "INSERT INTO control_state (key, value) VALUES (?1, ?2) \
      ON CONFLICT(key) DO UPDATE SET value = excluded.value";
+const ADVANCE_STATE: &str = "INSERT INTO control_state (key, value) VALUES (?1, ?2) \
+     ON CONFLICT(key) DO UPDATE SET value = excluded.value \
+     WHERE control_state.value IS NULL OR control_state.value < excluded.value";
 const DELETE_STATE: &str = "DELETE FROM control_state WHERE key = ?1";
 const DELETE_PAUSE: &str = "DELETE FROM control_state WHERE key IN (?1, ?2)";
 const SELECT_STATE: &str = "SELECT value FROM control_state WHERE key = ?1";
@@ -242,6 +245,23 @@ pub fn set_health(
     Ok(())
 }
 
+/// Record when something last happened, unless a later moment already is recorded. The comparison
+/// is textual — chronological because every stored instant is spelled at one width — and lives
+/// inside the one statement, so concurrent writers land on the maximum in either order.
+pub fn advance_health(
+    conn: &rusqlite::Connection,
+    which: HealthKey,
+    at: chrono::DateTime<chrono::Utc>,
+) -> Result<(), StoreError> {
+    conn.execute(
+        ADVANCE_STATE,
+        rusqlite::params![which.key(), timestamp::to_sql(at)?],
+    )
+    .map_err(|source| StoreError::Sql { source })?;
+
+    Ok(())
+}
+
 /// When something last happened, or `None` if it never has.
 pub fn get_health(
     conn: &rusqlite::Connection,
@@ -374,8 +394,8 @@ fn decode_event(
 mod tests {
     use super::{
         ControlEvent, EventKind, HealthKey, INSERT_EVENT, PAUSE_INDEFINITE, PAUSE_UNTIL, Pause,
-        UPSERT_STATE, events_in_window, get_health, get_pause, record_event, resume, set_health,
-        set_pause,
+        UPSERT_STATE, advance_health, events_in_window, get_health, get_pause, record_event,
+        resume, set_health, set_pause,
     };
     use crate::{StoreError, db, timestamp};
     use chrono::{DateTime, TimeDelta, TimeZone, Utc};
@@ -749,6 +769,23 @@ mod tests {
             get_health(&conn, HealthKey::LastDelivery)
                 .expect("the delivery mark should remain readable"),
             Some(marks[2].1)
+        );
+    }
+
+    #[test]
+    fn advance_health_never_moves_backwards() {
+        let (_dir, conn) = database();
+        let older = at(2026, 8, 1, 12, 0, 0);
+        let newer = at(2026, 8, 1, 12, 0, 30);
+
+        advance_health(&conn, HealthKey::LastCapture, older).expect("the first mark should land");
+        advance_health(&conn, HealthKey::LastCapture, newer).expect("the newer mark should land");
+        advance_health(&conn, HealthKey::LastCapture, older)
+            .expect("the older mark should be swallowed");
+
+        assert_eq!(
+            get_health(&conn, HealthKey::LastCapture).expect("the mark should be readable"),
+            Some(newer)
         );
     }
 

@@ -295,7 +295,7 @@ pub(crate) fn pass(
             }
         };
         previous.insert(frame.monitor_id.clone(), thumbnail);
-        stored_at = Some(captured_at);
+        stored_at = stored_at.max(Some(captured_at));
         stored_frames.push(Stored {
             monitor_id: frame.monitor_id,
             width: frame.width,
@@ -305,8 +305,10 @@ pub(crate) fn pass(
             relative_path: stored,
         });
     }
+    // Advanced, not set: a fallback frame carries a composition stamp up to thirty seconds old,
+    // so this pass's newest stamp can still sit behind an earlier pass's mark.
     if let Some(at) = stored_at {
-        cw_store::control::set_health(conn, HealthKey::LastCapture, at)?;
+        cw_store::control::advance_health(conn, HealthKey::LastCapture, at)?;
     }
     // After the stores: the enumeration failure fails the pass, not the frames it arrived with.
     if let Some(error) = capture_failed {
