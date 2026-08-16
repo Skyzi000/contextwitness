@@ -7,8 +7,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use chrono::{DateTime, SecondsFormat, Utc};
-use reqwest::StatusCode;
 use reqwest::blocking::{Client, RequestBuilder, Response};
+use reqwest::{StatusCode, Url};
 use serde_json::value::RawValue;
 use serde_json::{Map, Value, json};
 
@@ -205,15 +205,77 @@ struct RetainItemWire<'a> {
     update_mode: &'static str,
 }
 
+/// A base URL [`parse_api_url`] refused.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct InvalidApiUrl(String);
+
+/// Parse a Hindsight API base URL: absolute, http or https, with a host, no query, no fragment,
+/// and — once surrounding whitespace is trimmed — no tab, carriage return or newline. The URL
+/// grammar strips those silently, so
+/// the parsed URL would name a different host or path than the one spelled. Repeated trailing
+/// slashes collapse here: the endpoint builder strips one, and any beyond it would ride into
+/// every request URL as an empty path segment.
+pub fn parse_api_url(text: &str) -> Result<Url, InvalidApiUrl> {
+    let text = text.trim();
+    if text.contains(['\t', '\r', '\n']) {
+        return Err(InvalidApiUrl(
+            "the URL carries a tab, carriage return or newline, which the URL grammar drops \
+             rather than encodes"
+                .to_owned(),
+        ));
+    }
+    let mut url =
+        Url::parse(text).map_err(|error| InvalidApiUrl(format!("not an absolute URL: {error}")))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(InvalidApiUrl(format!(
+            "the scheme is {}, not http or https",
+            url.scheme()
+        )));
+    }
+    if url.host_str().is_none() {
+        return Err(InvalidApiUrl("the URL names no host".to_owned()));
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(InvalidApiUrl(
+            "a query or fragment does not belong in a base URL".to_owned(),
+        ));
+    }
+    if url.path().ends_with("//") {
+        let trimmed = url.path().trim_end_matches('/').to_owned();
+        url.set_path(&trimmed);
+    }
+    Ok(url)
+}
+
+/// Refuse what the URL grammar drops rather than encodes: appended as a path segment, `.` and
+/// `..` vanish into the path, and tab, carriage return and newline are stripped from the segment
+/// text — before the dot spellings are matched — so an id carrying one travels as a different
+/// name, or as a dot segment the literal match cannot see.
+fn vet_bank_id(bank_id: &str) -> Result<(), DeliveryError> {
+    if matches!(bank_id, "." | "..") || bank_id.contains(['\t', '\r', '\n']) {
+        return Err(DeliveryError::Permanent {
+            message: format!("bank id {bank_id:?} cannot travel as a path segment"),
+            not_found: false,
+        });
+    }
+    Ok(())
+}
+
 /// Blocking Hindsight 0.8.4 client.
 pub struct HindsightClient {
     http: Client,
-    base_url: String,
+    base_url: Url,
     token: String,
 }
 
 impl HindsightClient {
     pub fn new(credentials: Credentials) -> Result<Self, DeliveryError> {
+        let base_url =
+            parse_api_url(&credentials.api_url).map_err(|error| DeliveryError::Permanent {
+                message: format!("the hindsight API URL is unusable: {error}"),
+                not_found: false,
+            })?;
         let http = Client::builder()
             .timeout(HTTP_TIMEOUT)
             .build()
@@ -223,14 +285,32 @@ impl HindsightClient {
             })?;
         Ok(Self {
             http,
-            base_url: credentials.api_url.trim_end_matches('/').to_owned(),
+            base_url,
             token: credentials.token,
         })
     }
 
+    /// The endpoint under the base URL, each entry of `segments` traveling as exactly one path
+    /// segment — true of what the grammar percent-encodes, not of the spellings it drops, which
+    /// `vet_bank_id` refuses before the one caller-supplied segment reaches here.
+    fn endpoint(&self, segments: &[&str]) -> Result<Url, DeliveryError> {
+        let mut url = self.base_url.clone();
+        {
+            let mut path = url
+                .path_segments_mut()
+                .map_err(|()| DeliveryError::Permanent {
+                    message: "the hindsight API URL cannot carry a path".to_owned(),
+                    not_found: false,
+                })?;
+            path.pop_if_empty().extend(segments);
+        }
+        Ok(url)
+    }
+
     /// Creates the bank when it is missing and converges its retain settings on the fixed values.
     pub fn ensure_bank(&self, bank_id: &str) -> Result<(), DeliveryError> {
-        let config_url = format!("{}/v1/default/banks/{bank_id}/config", self.base_url);
+        vet_bank_id(bank_id)?;
+        let config_url = self.endpoint(&["v1", "default", "banks", bank_id, "config"])?;
         let desired: Map<String, Value> = [
             ("retain_mission".to_owned(), RETAIN_MISSION.into()),
             (
@@ -242,13 +322,13 @@ impl HindsightClient {
         .into_iter()
         .collect();
 
-        let response = self.send(self.http.get(&config_url))?;
+        let response = self.send(self.http.get(config_url.clone()))?;
         if response.status() == StatusCode::NOT_FOUND {
-            let bank_url = format!("{}/v1/default/banks/{bank_id}", self.base_url);
+            let bank_url = self.endpoint(&["v1", "default", "banks", bank_id])?;
             // Empty body: every field is optional and the settings land in the PATCH below, so
             // losing a create race cannot reset an existing bank.
             check(
-                self.send(self.http.put(&bank_url).json(&json!({})))?,
+                self.send(self.http.put(bank_url).json(&json!({})))?,
                 "create bank",
             )?;
         } else {
@@ -266,7 +346,7 @@ impl HindsightClient {
         check(
             self.send(
                 self.http
-                    .patch(&config_url)
+                    .patch(config_url)
                     .json(&json!({ "updates": desired })),
             )?,
             "update bank config",
@@ -276,7 +356,8 @@ impl HindsightClient {
 
     /// Delivers one episode. `Ok` means Hindsight answered 2xx, which is delivery.
     pub fn retain(&self, bank_id: &str, item: &RetainItem<'_>) -> Result<(), DeliveryError> {
-        let url = format!("{}/v1/default/banks/{bank_id}/memories", self.base_url);
+        vet_bank_id(bank_id)?;
+        let url = self.endpoint(&["v1", "default", "banks", bank_id, "memories"])?;
         let request = RetainRequest {
             is_async: false,
             items: [RetainItemWire {
@@ -288,7 +369,7 @@ impl HindsightClient {
                 update_mode: "replace",
             }],
         };
-        check(self.send(self.http.post(&url).json(&request))?, "retain")?;
+        check(self.send(self.http.post(url).json(&request))?, "retain")?;
         Ok(())
     }
 
@@ -416,5 +497,66 @@ mod tests {
         let printed = format!("{client:?}");
         assert!(!printed.contains("the-secret-token"), "{printed}");
         assert!(printed.contains("<redacted>"), "{printed}");
+    }
+
+    #[test]
+    fn the_base_url_must_be_absolute_bare_http() {
+        for bad in [
+            "localhost:8000",
+            "ftp://host/x",
+            "http://host/api?x=1",
+            "http://host/api#frag",
+            "/v1",
+            "not a url",
+            "http://ho\tst:8000/api",
+            "http://host:8000/a\rpi",
+            "http://host:8000/api\n/v2",
+        ] {
+            assert!(parse_api_url(bad).is_err(), "{bad:?}");
+        }
+        assert_eq!(
+            parse_api_url(" http://host:8000/api/ ")
+                .expect("the padded URL should parse")
+                .as_str(),
+            "http://host:8000/api/"
+        );
+        for doubled in ["http://host:8000/api//", "http://host:8000/api///"] {
+            assert_eq!(
+                parse_api_url(doubled)
+                    .expect("the over-slashed URL should parse")
+                    .as_str(),
+                "http://host:8000/api",
+                "{doubled}"
+            );
+        }
+        assert_eq!(
+            parse_api_url("http://host/pre%20fix//")
+                .expect("the encoded path should parse")
+                .as_str(),
+            "http://host/pre%20fix"
+        );
+    }
+
+    #[test]
+    fn a_bank_id_travels_as_one_path_segment() {
+        let client = HindsightClient::new(Credentials {
+            api_url: "http://localhost:0/prefix/".to_owned(),
+            token: "t".to_owned(),
+        })
+        .expect("building the client makes no request");
+        let url = client
+            .endpoint(&["v1", "default", "banks", "we?ird/ba#nk%25", "memories"])
+            .expect("the endpoint should build");
+        assert_eq!(
+            url.as_str(),
+            "http://localhost:0/prefix/v1/default/banks/we%3Fird%2Fba%23nk%2525/memories"
+        );
+
+        assert!(vet_bank_id(".").is_err());
+        assert!(vet_bank_id("..").is_err());
+        assert!(vet_bank_id(".\t.").is_err());
+        assert!(vet_bank_id("..\n").is_err());
+        assert!(vet_bank_id("my\tbank").is_err());
+        assert!(vet_bank_id("an-ordinary-bank").is_ok());
     }
 }

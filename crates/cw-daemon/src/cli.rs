@@ -605,6 +605,9 @@ fn setup_credentials() -> Result<(), Failure> {
         println!("  credentials unchanged.");
         return Ok(());
     }
+    if let Err(error) = cw_sink_hindsight::parse_api_url(&api_url) {
+        return Err(format!("the URL was not saved: {error}").into());
+    }
     let token = ask_secret("  API token: ")?;
     if token.is_empty() {
         return Err("the token is required alongside the URL".into());
