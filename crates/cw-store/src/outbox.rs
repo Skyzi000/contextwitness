@@ -203,3 +203,65 @@ fn decode(row: &rusqlite::Row<'_>) -> Result<Due, Box<dyn std::error::Error + Se
         attempts,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{fetch_due, mark_delivering, requeue_delivering};
+    use crate::{db, episodes};
+    use chrono::{TimeZone, Utc};
+    use tempfile::tempdir;
+
+    #[test]
+    fn a_claimed_entry_is_due_again_only_after_the_requeue() {
+        let dir = tempdir().expect("the temporary database directory should be creatable");
+        let mut conn =
+            db::open(&dir.path().join("db.sqlite3")).expect("the fresh database should initialize");
+        let start_at = TimeZone::with_ymd_and_hms(&Utc, 2026, 8, 1, 12, 0, 0)
+            .single()
+            .expect("the test timestamp should be valid");
+        let episode = cw_core::episode::Episode {
+            source: "screen",
+            start_at,
+            end_at: start_at + chrono::TimeDelta::minutes(30),
+            document_id: "screen-2026-08-01T12:00:00Z-30m".to_owned(),
+            content: "content".to_owned(),
+            metadata: cw_core::episode::EpisodeMetadata {
+                episode_start: "2026-08-01T12:00:00Z".to_owned(),
+                episode_end: "2026-08-01T12:30:00Z".to_owned(),
+                monitors: "[]".to_owned(),
+                entry_count: "1".to_owned(),
+                image_paths: "[]".to_owned(),
+            },
+        };
+        let id = ulid::Ulid::generate();
+        episodes::insert_with_outbox(&mut conn, id, &episode, start_at)
+            .expect("the episode should register");
+        let now = start_at + chrono::TimeDelta::hours(1);
+
+        assert_eq!(
+            fetch_due(&conn, now, 10)
+                .expect("the due query should run")
+                .len(),
+            1
+        );
+        assert!(mark_delivering(&conn, id).expect("the claim should run"));
+        assert!(
+            fetch_due(&conn, now, 10)
+                .expect("the due query should run")
+                .is_empty(),
+            "a claimed entry must not be handed to another pass"
+        );
+
+        assert_eq!(
+            requeue_delivering(&conn).expect("the requeue should run"),
+            1
+        );
+        assert_eq!(
+            fetch_due(&conn, now, 10)
+                .expect("the due query should run")
+                .len(),
+            1,
+            "the requeued entry must be due again"
+        );
+    }
+}

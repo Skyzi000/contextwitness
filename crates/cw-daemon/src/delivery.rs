@@ -54,11 +54,7 @@ pub fn run(
         }
     };
     let _claim = claim_sole_deliverer(&data_dir);
-    match outbox::requeue_delivering(&conn) {
-        Ok(0) => {}
-        Ok(requeued) => info!(requeued, "requeued deliveries left in flight"),
-        Err(error) => error!("requeueing in-flight deliveries failed: {error}"),
-    }
+    requeue_until_success(&conn);
     let mut bank = BankGate::default();
 
     loop {
@@ -67,14 +63,41 @@ pub fn run(
             Ok(_) => {}
             Err(error) => {
                 error!("delivery pass failed: {error}");
-                match outbox::requeue_delivering(&conn) {
-                    Ok(0) => {}
-                    Ok(count) => info!(count, "requeued entries the failed pass left claimed"),
-                    Err(error) => error!("claimed entries could not be requeued: {error}"),
-                }
+                requeue_until_success(&conn);
             }
         }
         std::thread::sleep(IDLE);
+    }
+}
+
+/// Return claimed entries to the queue, waiting out failures: a `delivering` row is found by no
+/// later pass, so delivering again before the requeue has landed would strand whatever it covers
+/// for the life of the process.
+fn requeue_until_success(conn: &rusqlite::Connection) {
+    retry_requeue(
+        || outbox::requeue_delivering(conn),
+        || std::thread::sleep(IDLE),
+    );
+}
+
+/// The retry of [`requeue_until_success`], with the attempt and the wait handed in so the failure
+/// leg holds still for a test.
+fn retry_requeue(
+    mut requeue: impl FnMut() -> Result<usize, cw_store::StoreError>,
+    mut wait: impl FnMut(),
+) {
+    loop {
+        match requeue() {
+            Ok(0) => return,
+            Ok(requeued) => {
+                info!(requeued, "requeued deliveries left in flight");
+                return;
+            }
+            Err(error) => {
+                error!("requeueing in-flight deliveries failed: {error}");
+                wait();
+            }
+        }
     }
 }
 
@@ -244,4 +267,30 @@ fn deliver_batch(
     }
 
     Ok(delivered)
+}
+
+#[cfg(test)]
+mod tests {
+    use cw_store::StoreError;
+
+    #[test]
+    fn a_failed_requeue_waits_and_asks_again() {
+        let events = std::cell::RefCell::new(Vec::new());
+        let mut attempts = 0;
+        super::retry_requeue(
+            || {
+                attempts += 1;
+                events.borrow_mut().push("attempt");
+                if attempts == 1 {
+                    Err(StoreError::Sql {
+                        source: rusqlite::Error::InvalidQuery,
+                    })
+                } else {
+                    Ok(1)
+                }
+            },
+            || events.borrow_mut().push("wait"),
+        );
+        assert_eq!(*events.borrow(), ["attempt", "wait", "attempt"]);
+    }
 }
