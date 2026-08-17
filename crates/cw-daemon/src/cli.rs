@@ -224,8 +224,8 @@ fn load_startup_config(
 
 /// Report a startup that never got a usable config, and end. The log goes under the *default* data
 /// directory, which is the only one still standing: the config that would have named another one
-/// is the thing that failed. A machine where even that has no spelling leaves nowhere to write and
-/// no console to fall back on, so the exit code is all the caller gets.
+/// is the thing that failed. A machine where even that has no spelling leaves no place to install
+/// a log subscriber, so `error!` lands on nothing and the exit code is all the caller gets.
 fn refuse_before_logging(message: &str) -> ! {
     let logging = StorageConfig::default()
         .resolve_data_dir()
@@ -848,7 +848,8 @@ fn ask_secret(label: &str) -> std::io::Result<String> {
 
 /// Console echo, off for as long as this lives. The mode goes back in a destructor rather than
 /// after the read, because a read that fails leaves the console mute for everything that follows —
-/// including the shell the user gets back.
+/// including the shell the user gets back. Ctrl+C is not covered: its default handler ends the
+/// process without running destructors, and the console stays mute for shells that reset no modes.
 struct EchoOff {
     handle: HANDLE,
     previous: CONSOLE_MODE,
