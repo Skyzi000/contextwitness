@@ -507,9 +507,10 @@ fn capture_once(wgc: bool) -> Result<(), Failure> {
     // pass can find sessions with nothing composed yet; they persist across passes, so ask again.
     if wgc {
         let expected: Vec<String> = capture
-            .monitors()
-            .map(|monitors| monitors.into_iter().map(|monitor| monitor.id).collect())
-            .unwrap_or_default();
+            .monitors()?
+            .into_iter()
+            .map(|monitor| monitor.id)
+            .collect();
         let deadline = std::time::Instant::now() + WGC_ANSWER_DEADLINE;
         while !all_answered(&stored, &expected) && std::time::Instant::now() < deadline {
             std::thread::sleep(WGC_ANSWER_RETRY);
@@ -568,7 +569,7 @@ fn capture_once(wgc: bool) -> Result<(), Failure> {
     if !save_failed.is_empty() {
         let mut lines: Vec<String> = save_failed
             .into_iter()
-            .map(|(monitor_id, message)| format!("{monitor_id}: {message}"))
+            .map(|(monitor_id, failure)| format!("{monitor_id}: {}", failure.message))
             .collect();
         lines.sort();
         return Err(format!("saving failed on {}", lines.join("; ")).into());
@@ -577,14 +578,10 @@ fn capture_once(wgc: bool) -> Result<(), Failure> {
     Ok(())
 }
 
-/// Whether every monitor in `expected` has stored a frame. An empty `expected` is the enumeration
-/// having failed rather than a machine with no monitors: nothing names them, so the only question
-/// left is the weaker one this used to ask — whether anything at all arrived.
+/// Whether every monitor in `expected` has stored a frame. An empty `expected` is a machine with
+/// no usable monitors — a failed enumeration leaves through `?` before this is asked — and nothing
+/// can be waited for, so it is answered as complete.
 fn all_answered(stored: &[capture::Stored], expected: &[String]) -> bool {
-    if expected.is_empty() {
-        return !stored.is_empty();
-    }
-
     expected
         .iter()
         .all(|id| stored.iter().any(|frame| &frame.monitor_id == id))

@@ -10,10 +10,8 @@ use std::time::Instant;
 
 use failover::{Backend, Failover, Outcome};
 
-use windows::Win32::Foundation::{CloseHandle, LPARAM, RECT};
-use windows::Win32::Graphics::Gdi::{
-    EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
-};
+use windows::Win32::Foundation::CloseHandle;
+use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, HMONITOR, MONITORINFO, MONITORINFOEXW};
 use windows::Win32::System::Threading::{
     OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
@@ -24,7 +22,7 @@ use windows::Win32::UI::HiDpi::{
 use windows::Win32::UI::WindowsAndMessaging::{
     GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId, MONITORINFOF_PRIMARY,
 };
-use windows::core::BOOL;
+use windows_capture::monitor::Monitor;
 
 /// A frame composed longer ago than this at pull time — on either the QPC or the wall clock — is
 /// refused, and the session is torn down so a rebuilt session can compose anew instead of
@@ -72,6 +70,8 @@ pub enum Recoverable {
     AccessLost,
     #[error("graphics device error: {0}")]
     DeviceLost(String),
+    #[error("monitor enumeration failed: {0}")]
+    EnumerationFailed(String),
     #[error("monitor is no longer attached")]
     MonitorGone,
     #[error("no desktop update to capture")]
@@ -143,20 +143,22 @@ impl CaptureEngine {
     }
 
     /// Capture every monitor, each with the backend its own failover state points at. A monitor
-    /// that fails to capture is skipped, this tick only.
-    pub fn capture_all(&mut self) -> Vec<Frame> {
+    /// that fails to capture is skipped, this tick only. A failed enumeration is answered beside
+    /// the frames rather than instead of them — a captured frame is already consumed from its
+    /// backend, so an early return would lose it for good — and the caller hands them to the
+    /// ordinary change judgment and store before failing the pass, so the failure cannot be
+    /// read as every monitor having been detached.
+    pub fn capture_all(&mut self) -> (Vec<Frame>, Option<CaptureError>) {
         let monitors = match self.dxgi.monitors() {
             Ok(monitors) => monitors,
-            Err(error) => {
-                self.report("monitor enumeration", &error.to_string());
-                return Vec::new();
-            }
+            Err(error) => return (Vec::new(), Some(error)),
         };
         self.failover
             .retain(|id, _| monitors.iter().any(|monitor| &monitor.id == id));
         self.wgc.retain_monitors(&monitors);
 
         let mut frames = Vec::new();
+        let mut enumeration_failed = None;
         for monitor in monitors {
             let now = Instant::now();
             let state = self.failover.entry(monitor.id.clone()).or_default();
@@ -196,10 +198,19 @@ impl CaptureEngine {
                 Err(CaptureError::Recoverable(Recoverable::NoNewFrame)) => {
                     self.reported.remove(&monitor.id);
                 }
+                // The fallback re-enumerates on its way to a session, so this failure can surface
+                // mid-loop — and it is the pass-level refusal, not this monitor's. The loop goes
+                // on: the primary backend reads cached handles, so its monitors still answer.
+                Err(CaptureError::Recoverable(Recoverable::EnumerationFailed(message))) => {
+                    enumeration_failed.get_or_insert(message);
+                }
                 Err(error) => self.report(&monitor.id, &error.to_string()),
             }
         }
-        frames
+        (
+            frames,
+            enumeration_failed.map(|message| Recoverable::EnumerationFailed(message).into()),
+        )
     }
 
     /// The same failure repeating every tick is one line of news, not one line per tick.
@@ -255,53 +266,84 @@ pub fn make_dpi_aware() -> bool {
 }
 
 /// Every attached monitor, paired with the handle the backend needs to open a session on it.
-fn enumerate_monitors() -> Vec<(HMONITOR, MonitorInfo)> {
-    let mut handles: Vec<HMONITOR> = Vec::new();
-    unsafe {
-        let _ = EnumDisplayMonitors(
-            None,
-            None,
-            Some(collect_monitor),
-            LPARAM(&raw mut handles as isize),
-        );
+/// Refuses when the enumeration itself fails, and when it enumerates monitors but every one is
+/// refused by the per-monitor queries — either answer would read as every monitor having been
+/// detached. A handle the queries refuse is otherwise left out alone, the reason warned once per
+/// uninterrupted streak — `skips` holds the reported reasons between calls, keyed by handle,
+/// and an entry leaves it when its handle answers again or stops being enumerated.
+fn enumerate_monitors(
+    skips: &mut HashMap<isize, String>,
+) -> Result<Vec<(HMONITOR, MonitorInfo)>, CaptureError> {
+    let monitors =
+        Monitor::enumerate().map_err(|error| Recoverable::EnumerationFailed(error.to_string()))?;
+    let mut usable = Vec::new();
+    let mut skipped: HashMap<isize, String> = HashMap::new();
+    for monitor in monitors {
+        let handle = HMONITOR(monitor.as_raw_hmonitor());
+        match monitor_info(handle) {
+            Ok(info) => usable.push((handle, info)),
+            Err(reason) => {
+                let key = handle.0 as isize;
+                if skips.get(&key) != Some(&reason) {
+                    tracing::warn!("monitor {key:#x} skipped: {reason}");
+                }
+                skipped.insert(key, reason);
+            }
+        }
     }
-    handles
-        .into_iter()
-        .filter_map(|handle| monitor_info(handle).map(|info| (handle, info)))
-        .collect()
+    *skips = skipped;
+    enumeration_verdict(usable, skips)
 }
 
-unsafe extern "system" fn collect_monitor(
-    monitor: HMONITOR,
-    _dc: HDC,
-    _rect: *mut RECT,
-    lparam: LPARAM,
-) -> BOOL {
-    let monitors = unsafe { &mut *(lparam.0 as *mut Vec<HMONITOR>) };
-    monitors.push(monitor);
-    BOOL(1)
+/// The enumeration's verdict: refuses when monitors were enumerated and every one was refused
+/// by the per-monitor queries — that answer would read as every monitor having been detached —
+/// while an enumeration that answered no monitors at all is an empty success.
+fn enumeration_verdict<T>(
+    usable: Vec<T>,
+    skipped: &HashMap<isize, String>,
+) -> Result<Vec<T>, CaptureError> {
+    if usable.is_empty() && !skipped.is_empty() {
+        // Sorted: the daemon's once-per-streak failure dedup compares spellings.
+        let mut reasons: Vec<&str> = skipped.values().map(String::as_str).collect();
+        reasons.sort_unstable();
+        return Err(Recoverable::EnumerationFailed(format!(
+            "every enumerated monitor was refused: {}",
+            reasons.join("; ")
+        ))
+        .into());
+    }
+    Ok(usable)
 }
 
-fn monitor_info(monitor: HMONITOR) -> Option<MonitorInfo> {
+/// `Err` is a monitor this enumeration cannot use, carrying why: its rect is empty, or a query
+/// its enumeration-fresh handle should answer failed. A hotplug departure between the two calls
+/// answers this way too, but the queries do not say which it was, so the reason is reported
+/// rather than presumed.
+fn monitor_info(monitor: HMONITOR) -> Result<MonitorInfo, String> {
     unsafe {
         let mut info = MONITORINFOEXW::default();
         info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
         if !GetMonitorInfoW(monitor, (&raw mut info).cast::<MONITORINFO>()).as_bool() {
-            return None;
+            return Err("GetMonitorInfoW failed".to_owned());
         }
         let rect = info.monitorInfo.rcMonitor;
-        let width = u32::try_from(rect.right - rect.left).ok()?;
-        let height = u32::try_from(rect.bottom - rect.top).ok()?;
-        if width == 0 || height == 0 {
-            return None;
-        }
         let device = String::from_utf16_lossy(&info.szDevice);
+        let device = device.trim_end_matches('\0');
+        let width = u32::try_from(rect.right - rect.left).unwrap_or(0);
+        let height = u32::try_from(rect.bottom - rect.top).unwrap_or(0);
+        if width == 0 || height == 0 {
+            return Err(format!("{device}: the monitor rect has no area"));
+        }
 
-        let (mut dpi_x, mut dpi_y) = (96u32, 96u32);
-        let _ = GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y);
+        // No 96 stand-in on failure: a wrong scale silently skews the logical-pixel change
+        // threshold.
+        let (mut dpi_x, mut dpi_y) = (0u32, 0u32);
+        if let Err(error) = GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) {
+            return Err(format!("{device}: GetDpiForMonitor failed: {error}"));
+        }
 
-        Some(MonitorInfo {
-            id: device.trim_end_matches('\0').to_string(),
+        Ok(MonitorInfo {
+            id: device.to_string(),
             width,
             height,
             dpi_scale: dpi_x as f32 / 96.0,
@@ -341,5 +383,26 @@ fn process_name(pid: u32) -> Option<String> {
         result.ok()?;
         let path = String::from_utf16_lossy(&buf[..size as usize]);
         path.rsplit(['\\', '/']).next().map(str::to_string)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_an_enumeration_with_every_monitor_refused_is_a_failure() {
+        let refused = HashMap::from([(1, "b refused".to_owned()), (2, "a refused".to_owned())]);
+        assert!(
+            enumeration_verdict::<i32>(Vec::new(), &HashMap::new())
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(enumeration_verdict(vec![7], &refused).unwrap(), [7]);
+        let error = enumeration_verdict::<i32>(Vec::new(), &refused).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "monitor enumeration failed: every enumerated monitor was refused: a refused; b refused"
+        );
     }
 }

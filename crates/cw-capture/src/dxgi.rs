@@ -23,6 +23,8 @@ pub(crate) struct DxgiCapturer {
     /// one loses it.
     known: Vec<(HMONITOR, MonitorInfo)>,
     sessions: HashMap<String, Session>,
+    /// Skip reasons already warned about, held for `enumerate_monitors`'s deduplication.
+    skips: HashMap<isize, String>,
 }
 
 impl DxgiCapturer {
@@ -30,13 +32,14 @@ impl DxgiCapturer {
         Self {
             known: Vec::new(),
             sessions: HashMap::new(),
+            skips: HashMap::new(),
         }
     }
 }
 
 impl Capturer for DxgiCapturer {
     fn monitors(&mut self) -> Result<Vec<MonitorInfo>, CaptureError> {
-        self.known = enumerate_monitors();
+        self.known = enumerate_monitors(&mut self.skips)?;
         let known = &self.known;
         self.sessions
             .retain(|id, _| known.iter().any(|(_, monitor)| &monitor.id == id));

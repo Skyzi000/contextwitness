@@ -23,11 +23,12 @@ pub fn run(
     let mut previous: HashMap<String, Thumbnail> = HashMap::new();
     let mut health_written: Option<std::time::Instant> = None;
     let mut threshold_warned: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut save_failed: HashMap<String, String> = HashMap::new();
+    let mut save_failed: HashMap<String, SaveFailure> = HashMap::new();
+    let mut last_failure: Option<String> = None;
 
     loop {
         let started = std::time::Instant::now();
-        if let Err(error) = tick(
+        match tick(
             &mut capture,
             ocr,
             &mut conn,
@@ -38,10 +39,19 @@ pub fn run(
             &mut threshold_warned,
             &mut save_failed,
         ) {
-            // Fail closed: the tick may have died before it judged the pause or the privacy gate,
-            // and failing open shows a screen the gate may have been refusing.
-            capture.discard_pending();
-            error!("tick failed: {error}");
+            Ok(()) => last_failure = None,
+            Err(error) => {
+                // Fail closed: the tick may have died before it judged the pause or the privacy
+                // gate, and failing open shows a screen the gate may have been refusing.
+                capture.discard_pending();
+                // The same failure repeating every tick is one line of news, not one line per
+                // tick.
+                let message = error.to_string();
+                if last_failure.as_deref() != Some(message.as_str()) {
+                    error!("tick failed: {message}");
+                    last_failure = Some(message);
+                }
+            }
         }
         if let Some(remaining) = interval.checked_sub(started.elapsed()) {
             std::thread::sleep(remaining);
@@ -72,7 +82,7 @@ fn tick(
     previous: &mut HashMap<String, Thumbnail>,
     health_written: &mut Option<std::time::Instant>,
     threshold_warned: &mut std::collections::HashSet<String>,
-    save_failed: &mut HashMap<String, String>,
+    save_failed: &mut HashMap<String, SaveFailure>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let started = chrono::Utc::now();
 
@@ -152,8 +162,8 @@ fn tick(
 /// that, and `capture-once` is a user asking for this pass in particular. `only` narrows the pass
 /// to those monitor ids: `capture-once`'s retries ask again about the monitors that have not
 /// answered, and a monitor that already has must not gain a second frame from the same invocation.
-/// `save_failed` holds the last save error reported per monitor, so a failure that repeats is only
-/// news the first time.
+/// `save_failed` holds the last save failure reported per monitor, so a failure that repeats is
+/// only news the first time.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn pass(
     capture: &mut cw_capture::CaptureEngine,
@@ -162,7 +172,7 @@ pub(crate) fn pass(
     paths: &DataPaths,
     config: &Config,
     previous: &mut HashMap<String, Thumbnail>,
-    save_failed: &mut HashMap<String, String>,
+    save_failed: &mut HashMap<String, SaveFailure>,
     only: Option<&std::collections::HashSet<String>>,
 ) -> Result<Vec<Stored>, Box<dyn std::error::Error>> {
     let foreground = cw_capture::foreground();
@@ -192,7 +202,8 @@ pub(crate) fn pass(
     }
 
     let mut changed = Vec::new();
-    for frame in capture.capture_all() {
+    let (frames, capture_failed) = capture.capture_all();
+    for frame in frames {
         if only.is_some_and(|wanted| !wanted.contains(&frame.monitor_id)) {
             continue;
         }
@@ -266,10 +277,19 @@ pub(crate) fn pass(
             // Isolated to the one monitor rather than ending the pass: a frame wider than WebP's
             // 16,383px limit would starve every monitor behind it in the enumeration.
             Err(error) => {
-                let message = error.to_string();
-                if save_failed.get(&frame.monitor_id) != Some(&message) {
-                    error!(monitor = %frame.monitor_id, "failed to store frame: {message}");
-                    save_failed.insert(frame.monitor_id.clone(), message);
+                let key = save_failure_key(&error);
+                if save_failed
+                    .get(&frame.monitor_id)
+                    .is_none_or(|last| last.key != key)
+                {
+                    error!(monitor = %frame.monitor_id, "failed to store frame: {error}");
+                    save_failed.insert(
+                        frame.monitor_id.clone(),
+                        SaveFailure {
+                            key,
+                            message: error.to_string(),
+                        },
+                    );
                 }
                 continue;
             }
@@ -288,8 +308,36 @@ pub(crate) fn pass(
     if let Some(at) = stored_at {
         cw_store::control::set_health(conn, HealthKey::LastCapture, at)?;
     }
+    // After the stores: the enumeration failure fails the pass, not the frames it arrived with.
+    if let Some(error) = capture_failed {
+        return Err(error.into());
+    }
 
     Ok(stored_frames)
+}
+
+/// A monitor's standing save failure: the spelling repeats are judged by, and the full message
+/// of the first failure that spelled it, for `capture-once`'s summary.
+pub(crate) struct SaveFailure {
+    pub key: String,
+    pub message: String,
+}
+
+/// The spelling `save_failed` deduplicates on. Several store errors name the freshly minted
+/// observation id, or the image path derived from it, so their full messages never repeat; the
+/// key keeps the parts that spell the same while the cause does.
+fn save_failure_key(error: &cw_store::StoreError) -> String {
+    use cw_store::StoreError;
+    match error {
+        StoreError::ImageIo { source, .. } => format!("image io: {source}"),
+        StoreError::Encode { reason, .. } => format!("encode: {reason}"),
+        StoreError::Insert { source, .. } => format!("insert: {source}"),
+        StoreError::NotFaithful { .. } => "observation would not read back as given".to_owned(),
+        StoreError::DurationOutOfRange { duration_ms, .. } => {
+            format!("duration {duration_ms} out of range")
+        }
+        other => other.to_string(),
+    }
 }
 
 fn mark_tick(
@@ -319,4 +367,50 @@ fn bgra_to_rgb(bgra: &[u8]) -> Vec<u8> {
     bgra.chunks_exact(4)
         .flat_map(|pixel| [pixel[2], pixel[1], pixel[0]])
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::save_failure_key;
+    use cw_store::StoreError;
+
+    #[test]
+    fn a_save_failure_key_survives_a_fresh_observation_id() {
+        let io_first = save_failure_key(&StoreError::ImageIo {
+            path: "root/2026/08/16/01J5AAAAAAAAAAAAAAAAAAAAAA.webp".into(),
+            source: std::io::Error::other("disk full"),
+        });
+        let io_second = save_failure_key(&StoreError::ImageIo {
+            path: "root/2026/08/16/01J5BBBBBBBBBBBBBBBBBBBBBB.webp".into(),
+            source: std::io::Error::other("disk full"),
+        });
+        assert_eq!(io_first, io_second);
+
+        let encode_first = save_failure_key(&StoreError::Encode {
+            id: "01J5AAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+            reason: "the image is too wide".to_owned(),
+        });
+        let encode_second = save_failure_key(&StoreError::Encode {
+            id: "01J5BBBBBBBBBBBBBBBBBBBBBB".to_owned(),
+            reason: "the image is too wide".to_owned(),
+        });
+        assert_eq!(encode_first, encode_second);
+
+        let insert_first = save_failure_key(&StoreError::Insert {
+            id: "01J5AAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+            source: rusqlite::Error::InvalidQuery,
+        });
+        let insert_second = save_failure_key(&StoreError::Insert {
+            id: "01J5BBBBBBBBBBBBBBBBBBBBBB".to_owned(),
+            source: rusqlite::Error::InvalidQuery,
+        });
+        assert_eq!(insert_first, insert_second);
+
+        let distinct = [&io_first, &encode_first, &insert_first];
+        for (index, key) in distinct.iter().enumerate() {
+            for other in &distinct[index + 1..] {
+                assert_ne!(key, other);
+            }
+        }
+    }
 }

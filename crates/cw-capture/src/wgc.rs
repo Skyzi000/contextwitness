@@ -33,6 +33,8 @@ type Control = CaptureControl<Sink, <Sink as GraphicsCaptureApiHandler>::Error>;
 pub(crate) struct WgcCapturer {
     known: Vec<(HMONITOR, MonitorInfo)>,
     sessions: HashMap<String, Session>,
+    /// Skip reasons already warned about, held for `enumerate_monitors`'s deduplication.
+    skips: HashMap<isize, String>,
     /// Delivery floor set by `discard_pending`; sessions opened after it refuse older stamps.
     floor_100ns: i64,
 }
@@ -42,6 +44,7 @@ impl WgcCapturer {
         Self {
             known: Vec::new(),
             sessions: HashMap::new(),
+            skips: HashMap::new(),
             floor_100ns: 0,
         }
     }
@@ -73,7 +76,7 @@ impl WgcCapturer {
 
 impl Capturer for WgcCapturer {
     fn monitors(&mut self) -> Result<Vec<MonitorInfo>, CaptureError> {
-        self.known = enumerate_monitors();
+        self.known = enumerate_monitors(&mut self.skips)?;
         let known = &self.known;
         self.sessions
             .retain(|id, _| known.iter().any(|(_, monitor)| &monitor.id == id));

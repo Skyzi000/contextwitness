@@ -142,8 +142,10 @@ pub enum StoreError {
         #[source]
         source: Box<dyn std::error::Error + Send + Sync>,
     },
-    /// Appending to the audit trail failed.
-    #[error("failed to record control event {id}: {source}")]
+    /// Appending to the audit trail failed. The message leaves `id` out: callers mint a fresh id
+    /// per attempt, so a failure that repeats has to spell the same every time to read as one
+    /// failure.
+    #[error("failed to record control event: {source}")]
     RecordEvent {
         /// Primary key of the event that was not recorded.
         id: String,
