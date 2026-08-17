@@ -129,7 +129,8 @@ fn tick(
         }
     }
 
-    for stored in pass(
+    let mut stored = Vec::new();
+    let outcome = pass(
         capture,
         ocr,
         conn,
@@ -138,17 +139,19 @@ fn tick(
         previous,
         save_failed,
         None,
-    )? {
+        &mut stored,
+    );
+    report_then_finish(outcome, &stored, |frame| {
         info!(
-            monitor = %stored.monitor_id,
-            width = stored.width,
-            height = stored.height,
-            ocr = ?stored.ocr_status,
-            chars = stored.text_chars,
-            path = %stored.relative_path,
+            monitor = %frame.monitor_id,
+            width = frame.width,
+            height = frame.height,
+            ocr = ?frame.ocr_status,
+            chars = frame.text_chars,
+            path = %frame.relative_path,
             "stored frame"
         );
-    }
+    })?;
 
     // When this mark becomes readable, every shot the pass pulled has been stored or refused. An
     // error return skips the mark, which stalls the closer — the safe direction.
@@ -163,7 +166,8 @@ fn tick(
 /// to those monitor ids: `capture-once`'s retries ask again about the monitors that have not
 /// answered, and a monitor that already has must not gain a second frame from the same invocation.
 /// `save_failed` holds the last save failure reported per monitor, so a failure that repeats is
-/// only news the first time.
+/// only news the first time. `stored` receives each frame as it lands, so an error return leaves
+/// the report of the stores in the caller's hands rather than taking it down with the pass.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn pass(
     capture: &mut cw_capture::CaptureEngine,
@@ -174,7 +178,8 @@ pub(crate) fn pass(
     previous: &mut HashMap<String, Thumbnail>,
     save_failed: &mut HashMap<String, SaveFailure>,
     only: Option<&std::collections::HashSet<String>>,
-) -> Result<Vec<Stored>, Box<dyn std::error::Error>> {
+    stored: &mut Vec<Stored>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let foreground = cw_capture::foreground();
     let skip_detail = match cw_core::privacy::decide_capture(
         foreground.process.as_deref(),
@@ -198,7 +203,7 @@ pub(crate) fn pass(
         )?;
         // Without the process name: the audit trail is where that belongs, not the log.
         debug!("tick skipped by the privacy gate");
-        return Ok(Vec::new());
+        return Ok(());
     }
 
     let mut changed = Vec::new();
@@ -234,7 +239,6 @@ pub(crate) fn pass(
     });
 
     let mut stored_at = None;
-    let mut stored_frames = Vec::new();
     for ((frame, thumbnail), ocr) in changed.into_iter().zip(outcomes) {
         let captured_at = frame.captured_at;
         let text_chars = ocr.text.as_deref().map_or(0, |text| text.chars().count());
@@ -260,7 +264,7 @@ pub(crate) fn pass(
             ));
         }
         let rgb = bgra_to_rgb(&frame.bgra);
-        let stored = match cw_store::images::save_with_observation(
+        let relative_path = match cw_store::images::save_with_observation(
             conn,
             &paths.images(),
             &observation,
@@ -296,13 +300,13 @@ pub(crate) fn pass(
         };
         previous.insert(frame.monitor_id.clone(), thumbnail);
         stored_at = stored_at.max(Some(captured_at));
-        stored_frames.push(Stored {
+        stored.push(Stored {
             monitor_id: frame.monitor_id,
             width: frame.width,
             height: frame.height,
             ocr_status: ocr.status,
             text_chars,
-            relative_path: stored,
+            relative_path,
         });
     }
     // Advanced, not set: a fallback frame carries a composition stamp up to thirty seconds old,
@@ -315,7 +319,20 @@ pub(crate) fn pass(
         return Err(error.into());
     }
 
-    Ok(stored_frames)
+    Ok(())
+}
+
+/// Hands every stored frame to `report` before the outcome may leave, so a failing pass cannot
+/// take the report of its stores down with it.
+pub(crate) fn report_then_finish(
+    outcome: Result<(), Box<dyn std::error::Error>>,
+    stored: &[Stored],
+    mut report: impl FnMut(&Stored),
+) -> Result<(), Box<dyn std::error::Error>> {
+    for frame in stored {
+        report(frame);
+    }
+    outcome
 }
 
 /// A monitor's standing save failure: the spelling repeats are judged by, and the full message
@@ -373,8 +390,31 @@ fn bgra_to_rgb(bgra: &[u8]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::save_failure_key;
+    use super::{Stored, report_then_finish, save_failure_key};
     use cw_store::StoreError;
+
+    fn stored_frame(monitor_id: &str) -> Stored {
+        Stored {
+            monitor_id: monitor_id.to_owned(),
+            width: 1,
+            height: 1,
+            ocr_status: cw_core::model::OcrStatus::NoText,
+            text_chars: 0,
+            relative_path: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_failing_pass_still_reports_every_stored_frame() {
+        let stored = vec![stored_frame("a"), stored_frame("b")];
+        let mut reported = Vec::new();
+        let outcome = report_then_finish(Err("enumeration refused".into()), &stored, |frame| {
+            reported.push(frame.monitor_id.clone());
+        });
+        assert_eq!(reported, ["a", "b"]);
+        assert_eq!(outcome.unwrap_err().to_string(), "enumeration refused");
+        assert!(report_then_finish(Ok(()), &stored, |_| {}).is_ok());
+    }
 
     #[test]
     fn a_save_failure_key_survives_a_fresh_observation_id() {
