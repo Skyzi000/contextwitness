@@ -238,15 +238,7 @@ fn deliver_batch(
                 // The sink's message, which keeps the token and the response body — which would
                 // echo screen text back — out of what is stored and logged.
                 let message = error.to_string();
-                let retry = if error.is_bank_missing() {
-                    bank.ready = false;
-                    bank.not_before = None;
-                    info!(
-                        bank = %config.hindsight.bank_id,
-                        "hindsight bank is missing, so the next pass checks it again"
-                    );
-                    Retry::Backoff
-                } else if error.is_retryable() {
+                let retry = if error.is_retryable() {
                     error
                         .retry_after()
                         .and_then(|after| TimeDelta::from_std(after).ok())

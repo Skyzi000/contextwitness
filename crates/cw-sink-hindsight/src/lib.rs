@@ -280,13 +280,12 @@ fn vet_bank_id(bank_id: &str) -> Result<(), DeliveryError> {
     if matches!(bank_id, "." | "..") || bank_id.contains(['\t', '\r', '\n']) {
         return Err(DeliveryError::Permanent {
             message: format!("bank id {bank_id:?} cannot travel as a path segment"),
-            not_found: false,
         });
     }
     Ok(())
 }
 
-/// Blocking Hindsight 0.8.4 client.
+/// Blocking Hindsight client.
 pub struct HindsightClient {
     http: Client,
     base_url: Url,
@@ -298,14 +297,13 @@ impl HindsightClient {
         let base_url =
             parse_api_url(&credentials.api_url).map_err(|error| DeliveryError::Permanent {
                 message: format!("the hindsight API URL is unusable: {error}"),
-                not_found: false,
             })?;
         let http = Client::builder()
+            .user_agent(concat!("contextwitness/", env!("CARGO_PKG_VERSION")))
             .timeout(HTTP_TIMEOUT)
             .build()
             .map_err(|error| DeliveryError::Permanent {
                 message: format!("failed to build the HTTP client: {error}"),
-                not_found: false,
             })?;
         Ok(Self {
             http,
@@ -324,58 +322,26 @@ impl HindsightClient {
                 .path_segments_mut()
                 .map_err(|()| DeliveryError::Permanent {
                     message: "the hindsight API URL cannot carry a path".to_owned(),
-                    not_found: false,
                 })?;
             path.pop_if_empty().extend(segments);
         }
         Ok(url)
     }
 
-    /// Creates the bank when it is missing and converges its retain settings on the fixed values.
+    /// Upserts the bank with the fixed retain settings. The server creates a missing bank and
+    /// merges the settings into an existing one's config.
     pub fn ensure_bank(&self, bank_id: &str) -> Result<(), DeliveryError> {
         vet_bank_id(bank_id)?;
-        let config_url = self.endpoint(&["v1", "default", "banks", bank_id, "config"])?;
-        let desired: Map<String, Value> = [
-            ("retain_mission".to_owned(), RETAIN_MISSION.into()),
-            (
-                "retain_extraction_mode".to_owned(),
-                RETAIN_EXTRACTION_MODE.into(),
-            ),
-            ("retain_chunk_size".to_owned(), RETAIN_CHUNK_SIZE.into()),
-        ]
-        .into_iter()
-        .collect();
-
-        let response = self.send(self.http.get(config_url.clone()))?;
-        if response.status() == StatusCode::NOT_FOUND {
-            let bank_url = self.endpoint(&["v1", "default", "banks", bank_id])?;
-            // Empty body: every field is optional and the settings land in the PATCH below, so
-            // losing a create race cannot reset an existing bank.
-            check(
-                self.send(self.http.put(bank_url).json(&json!({})))?,
-                "create bank",
-            )?;
-        } else {
-            let current: Value = check(response, "read bank config")?
-                .json()
-                .map_err(transport)?;
-            let current = current.get("config");
-            if desired
-                .iter()
-                .all(|(key, value)| current.and_then(|config| config.get(key)) == Some(value))
-            {
-                return Ok(());
-            }
-        }
+        let url = self.endpoint(&["v1", "default", "banks", bank_id])?;
+        let desired = json!({
+            "retain_mission": RETAIN_MISSION,
+            "retain_extraction_mode": RETAIN_EXTRACTION_MODE,
+            "retain_chunk_size": RETAIN_CHUNK_SIZE,
+        });
         check(
-            self.send(
-                self.http
-                    .patch(config_url)
-                    .json(&json!({ "updates": desired })),
-            )?,
-            "update bank config",
-        )?;
-        Ok(())
+            self.send(self.http.put(url).json(&desired))?,
+            UPSERT_BANK_OPERATION,
+        )
     }
 
     /// Delivers one episode. `Ok` means Hindsight answered 2xx, which is delivery.
@@ -393,8 +359,10 @@ impl HindsightClient {
                 update_mode: "replace",
             }],
         };
-        check(self.send(self.http.post(url).json(&request))?, "retain")?;
-        Ok(())
+        check(
+            self.send(self.http.post(url).json(&request))?,
+            RETAIN_OPERATION,
+        )
     }
 
     /// The Authorization header travels only when there is a token, as in Hindsight's own
@@ -430,26 +398,12 @@ pub enum DeliveryError {
         retry_after: Option<Duration>,
     },
     #[error("{message}")]
-    Permanent { message: String, not_found: bool },
+    Permanent { message: String },
 }
 
 impl DeliveryError {
     pub fn is_retryable(&self) -> bool {
         matches!(self, Self::Retryable { .. })
-    }
-
-    /// Whether the answer was 404, which this API gives when the bank is not there — deleted, or
-    /// never created at the URL the credentials now point at. That is configuration state and not a
-    /// verdict on the episode, so the caller runs `ensure_bank` again instead of condemning it.
-    /// Every other permanent failure is about the request that was sent.
-    pub fn is_bank_missing(&self) -> bool {
-        matches!(
-            self,
-            Self::Permanent {
-                not_found: true,
-                ..
-            }
-        )
     }
 
     /// The server's own `Retry-After`, when it sent one.
@@ -468,31 +422,66 @@ fn transport(error: reqwest::Error) -> DeliveryError {
     }
 }
 
-fn check(response: Response, operation: &str) -> Result<Response, DeliveryError> {
+const RETAIN_OPERATION: &str = "retain";
+const UPSERT_BANK_OPERATION: &str = "upsert bank";
+
+fn check(response: Response, operation: &str) -> Result<(), DeliveryError> {
     let status = response.status();
     if status.is_success() {
-        return Ok(response);
+        return Ok(());
     }
     // The body stays out: Hindsight echoes rejected input back, and that is captured screen text.
-    let message = format!("hindsight {operation} failed with HTTP {status}");
-    // 401 and 403 say the credential is wrong, not the payload, so they are retryable against the
-    // usual 4xx-is-permanent rule: a token expiring mid-run would otherwise leave every episode
-    // attempted during the outage permanently unsendable.
-    if status.is_server_error()
-        || status == StatusCode::REQUEST_TIMEOUT
-        || status == StatusCode::TOO_MANY_REQUESTS
-        || status == StatusCode::UNAUTHORIZED
-        || status == StatusCode::FORBIDDEN
-    {
+    let message = format!(
+        "hindsight {operation} failed with HTTP {status}{}",
+        status_hint(operation, status)
+    );
+    if retryable_status(status) {
         Err(DeliveryError::Retryable {
             message,
             retry_after: retry_after(&response),
         })
     } else {
-        Err(DeliveryError::Permanent {
-            message,
-            not_found: status == StatusCode::NOT_FOUND,
-        })
+        Err(DeliveryError::Permanent { message })
+    }
+}
+
+/// Deployment faults, repairable while episodes wait; everything unlisted is condemned.
+fn retryable_status(status: StatusCode) -> bool {
+    status.is_server_error()
+        || matches!(
+            status,
+            StatusCode::REQUEST_TIMEOUT
+                | StatusCode::TOO_MANY_REQUESTS
+                | StatusCode::UNAUTHORIZED
+                | StatusCode::FORBIDDEN
+                | StatusCode::NOT_FOUND
+                | StatusCode::BAD_REQUEST
+                | StatusCode::PAYLOAD_TOO_LARGE
+        )
+}
+
+fn status_hint(operation: &str, status: StatusCode) -> &'static str {
+    match (operation, status) {
+        (UPSERT_BANK_OPERATION, StatusCode::NOT_FOUND) => {
+            " (a missing bank cannot cause this, so the base URL is likely wrong)"
+        }
+        (UPSERT_BANK_OPERATION, StatusCode::UNPROCESSABLE_ENTITY) => {
+            " (the server rejected this client's fixed bank settings as invalid)"
+        }
+        (RETAIN_OPERATION, StatusCode::NOT_FOUND) => {
+            " (a missing bank cannot cause this; the memories route itself was refused)"
+        }
+        (RETAIN_OPERATION, StatusCode::BAD_REQUEST) => {
+            " (possibly a batch-enabled server refusing synchronous retain)"
+        }
+        (RETAIN_OPERATION, StatusCode::PAYLOAD_TOO_LARGE) => {
+            " (the body exceeds a proxy or server body-size limit; raising the limit or \
+             shrinking the episode is needed)"
+        }
+        (RETAIN_OPERATION, StatusCode::UNPROCESSABLE_ENTITY) => {
+            " (the server refused the content: validation or memory defense)"
+        }
+        _ => "",
     }
 }
 
@@ -636,5 +625,50 @@ mod tests {
         assert!(vet_bank_id("..\n").is_err());
         assert!(vet_bank_id("my\tbank").is_err());
         assert!(vet_bank_id("an-ordinary-bank").is_ok());
+    }
+
+    #[test]
+    fn deployment_faults_retry_and_everything_else_is_condemned() {
+        for (status, retryable) in [
+            (StatusCode::BAD_REQUEST, true),
+            (StatusCode::UNAUTHORIZED, true),
+            (StatusCode::FORBIDDEN, true),
+            (StatusCode::NOT_FOUND, true),
+            (StatusCode::REQUEST_TIMEOUT, true),
+            (StatusCode::PAYLOAD_TOO_LARGE, true),
+            (StatusCode::TOO_MANY_REQUESTS, true),
+            (StatusCode::INTERNAL_SERVER_ERROR, true),
+            (StatusCode::SERVICE_UNAVAILABLE, true),
+            (StatusCode::UNPROCESSABLE_ENTITY, false),
+            (StatusCode::CONFLICT, false),
+            (StatusCode::GONE, false),
+        ] {
+            assert_eq!(retryable_status(status), retryable, "{status}");
+        }
+
+        assert!(status_hint(RETAIN_OPERATION, StatusCode::BAD_REQUEST).contains("batch"));
+        assert!(status_hint(RETAIN_OPERATION, StatusCode::PAYLOAD_TOO_LARGE).contains("proxy"));
+        assert!(
+            status_hint(RETAIN_OPERATION, StatusCode::PAYLOAD_TOO_LARGE)
+                .contains("raising the limit")
+        );
+        assert!(
+            status_hint(RETAIN_OPERATION, StatusCode::UNPROCESSABLE_ENTITY).contains("defense")
+        );
+        assert!(status_hint(RETAIN_OPERATION, StatusCode::NOT_FOUND).contains("memories route"));
+        assert!(status_hint(UPSERT_BANK_OPERATION, StatusCode::NOT_FOUND).contains("base URL"));
+        assert!(
+            status_hint(UPSERT_BANK_OPERATION, StatusCode::UNPROCESSABLE_ENTITY)
+                .contains("settings")
+        );
+        assert_eq!(
+            status_hint(UPSERT_BANK_OPERATION, StatusCode::BAD_REQUEST),
+            ""
+        );
+        assert_eq!(
+            status_hint(UPSERT_BANK_OPERATION, StatusCode::PAYLOAD_TOO_LARGE),
+            ""
+        );
+        assert_eq!(status_hint(RETAIN_OPERATION, StatusCode::FORBIDDEN), "");
     }
 }
