@@ -880,23 +880,23 @@ impl EchoOff {
         if unsafe { GetConsoleMode(handle, &mut previous) }.is_err() {
             return Ok(None);
         }
-        // Best effort: a failed registration leaves only what was already true — an abort keeps
-        // the console mute — and is no reason to refuse reading the token.
-        static HANDLER: std::sync::Once = std::sync::Once::new();
-        HANDLER.call_once(|| {
-            let _ = unsafe { SetConsoleCtrlHandler(Some(restore_echo_on_ctrl_c), true) };
-        });
-        // Recorded before the mute so no muted instant is outside the handler's reach; a Ctrl+C
-        // in the gap restores a mode that never changed.
-        if let Ok(mut muted) = MUTED.lock() {
-            *muted = Some((handle.0 as usize, previous.0));
-        }
+        // Refused rather than best-effort, like the mute below: echo off with no registered
+        // restorer leaves the console mute after a Ctrl+C, the ordinary way out of a token
+        // prompt. Registering twice would only make the restore run twice.
+        unsafe { SetConsoleCtrlHandler(Some(restore_echo_on_ctrl_c), true) }
+            .map_err(std::io::Error::other)?;
+        // The record and the mute share one guard, so the handler — which must take the lock —
+        // can never run between them and "restore" a mode that is yet to be muted. A lock this
+        // thread cannot take means a restore nobody could perform, so the prompt is refused,
+        // not muted unprotected.
+        let mut muted = MUTED
+            .lock()
+            .map_err(|_| std::io::Error::other("the echo-restore record is unusable"))?;
+        *muted = Some((handle.0 as usize, previous.0));
         // Refused rather than reported: this failing on something that *is* a console means the
         // next thing typed would be echoed, and that thing is the token.
         if let Err(error) = unsafe { SetConsoleMode(handle, previous & !ENABLE_ECHO_INPUT) } {
-            if let Ok(mut muted) = MUTED.lock() {
-                *muted = None;
-            }
+            *muted = None;
             return Err(std::io::Error::other(error));
         }
 
