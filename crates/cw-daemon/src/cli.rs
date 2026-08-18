@@ -8,7 +8,8 @@ use cw_store::control::{HealthKey, Pause};
 use tracing::{error, info, warn};
 use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, HANDLE};
 use windows::Win32::System::Console::{
-    CONSOLE_MODE, ENABLE_ECHO_INPUT, GetConsoleMode, GetStdHandle, STD_INPUT_HANDLE, SetConsoleMode,
+    CONSOLE_MODE, ENABLE_ECHO_INPUT, GetConsoleMode, GetStdHandle, STD_INPUT_HANDLE,
+    SetConsoleCtrlHandler, SetConsoleMode,
 };
 use windows::Win32::System::Threading::CreateMutexW;
 
@@ -848,11 +849,26 @@ fn ask_secret(label: &str) -> std::io::Result<String> {
 
 /// Console echo, off for as long as this lives. The mode goes back in a destructor rather than
 /// after the read, because a read that fails leaves the console mute for everything that follows —
-/// including the shell the user gets back. Ctrl+C is not covered: its default handler ends the
-/// process without running destructors, and the console stays mute for shells that reset no modes.
+/// including the shell the user gets back. Ctrl+C ends the process without running destructors, so
+/// [`restore_echo_on_ctrl_c`] covers that exit from the console's control thread.
 struct EchoOff {
     handle: HANDLE,
     previous: CONSOLE_MODE,
+}
+
+/// The muted console's raw handle and previous mode. Written by [`EchoOff`] on the prompt thread,
+/// read by [`restore_echo_on_ctrl_c`] on the control thread the console injects.
+static MUTED: std::sync::Mutex<Option<(usize, u32)>> = std::sync::Mutex::new(None);
+
+/// The restore [`EchoOff`]'s destructor cannot deliver on a Ctrl+C exit happens here instead.
+/// Returning FALSE hands the event on, so the process still ends the default way.
+unsafe extern "system" fn restore_echo_on_ctrl_c(_ctrl_type: u32) -> windows::core::BOOL {
+    if let Ok(muted) = MUTED.lock()
+        && let Some((handle, mode)) = *muted
+    {
+        let _ = unsafe { SetConsoleMode(HANDLE(handle as _), CONSOLE_MODE(mode)) };
+    }
+    windows::core::BOOL(0)
 }
 
 impl EchoOff {
@@ -864,10 +880,25 @@ impl EchoOff {
         if unsafe { GetConsoleMode(handle, &mut previous) }.is_err() {
             return Ok(None);
         }
+        // Best effort: a failed registration leaves only what was already true — an abort keeps
+        // the console mute — and is no reason to refuse reading the token.
+        static HANDLER: std::sync::Once = std::sync::Once::new();
+        HANDLER.call_once(|| {
+            let _ = unsafe { SetConsoleCtrlHandler(Some(restore_echo_on_ctrl_c), true) };
+        });
+        // Recorded before the mute so no muted instant is outside the handler's reach; a Ctrl+C
+        // in the gap restores a mode that never changed.
+        if let Ok(mut muted) = MUTED.lock() {
+            *muted = Some((handle.0 as usize, previous.0));
+        }
         // Refused rather than reported: this failing on something that *is* a console means the
         // next thing typed would be echoed, and that thing is the token.
-        unsafe { SetConsoleMode(handle, previous & !ENABLE_ECHO_INPUT) }
-            .map_err(std::io::Error::other)?;
+        if let Err(error) = unsafe { SetConsoleMode(handle, previous & !ENABLE_ECHO_INPUT) } {
+            if let Ok(mut muted) = MUTED.lock() {
+                *muted = None;
+            }
+            return Err(std::io::Error::other(error));
+        }
 
         Ok(Some(Self { handle, previous }))
     }
@@ -876,6 +907,9 @@ impl EchoOff {
 impl Drop for EchoOff {
     fn drop(&mut self) {
         let _ = unsafe { SetConsoleMode(self.handle, self.previous) };
+        if let Ok(mut muted) = MUTED.lock() {
+            *muted = None;
+        }
     }
 }
 
