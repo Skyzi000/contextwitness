@@ -22,64 +22,72 @@ const RETAIN_CHUNK_SIZE: u32 = 3000;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Hindsight connection details, resolved from `~/.hindsight/contextwitness.json` or the
-/// environment.
+/// environment. The token is optional, as it is for Hindsight's own integrations: a server that
+/// requires none is a normal deployment.
 #[derive(Clone)]
 pub struct Credentials {
     api_url: String,
-    token: String,
+    token: Option<String>,
 }
 
 impl Credentials {
     /// `Ok(None)` means delivery is simply not configured, which is a normal state.
+    ///
+    /// The environment and the file are each taken whole, never mixed: a URL from one source with
+    /// a token from the other would send that token to a server it was never meant for. So when
+    /// `CONTEXTWITNESS_HINDSIGHT_URL` is set, the environment is the entire credential set and the
+    /// file goes unread; `CONTEXTWITNESS_HINDSIGHT_TOKEN` on its own is an error rather than a
+    /// silent fallback to the file's URL.
     pub fn load() -> Result<Option<Self>, CredentialsError> {
+        let env_token = from_env("CONTEXTWITNESS_HINDSIGHT_TOKEN");
+        if let Some(api_url) = from_env("CONTEXTWITNESS_HINDSIGHT_URL") {
+            return Ok(Some(Self {
+                api_url,
+                token: env_token,
+            }));
+        }
+        if env_token.is_some() {
+            return Err(CredentialsError::EnvTokenWithoutUrl);
+        }
         let path = dirs::home_dir()
             .ok_or(CredentialsError::NoHome)?
             .join(".hindsight")
             .join("contextwitness.json");
-        let env_url = from_env("CONTEXTWITNESS_HINDSIGHT_URL");
-        let env_token = from_env("CONTEXTWITNESS_HINDSIGHT_TOKEN");
-        let file = if env_url.is_some() && env_token.is_some() {
-            None
-        } else {
-            match std::fs::read_to_string(&path) {
-                // Deserialized as a map rather than a `Value`: a root that is not a JSON object
-                // holds neither key, and reading it as unconfigured would hide the parse error.
-                Ok(text) => Some(serde_json::from_str::<Map<String, Value>>(&text).map_err(
-                    |source| CredentialsError::Parse {
-                        path: path.clone(),
-                        source,
-                    },
-                )?),
-                Err(source) if source.kind() == std::io::ErrorKind::NotFound => None,
-                Err(source) => return Err(CredentialsError::Io { path, source }),
-            }
+        let file = match std::fs::read_to_string(&path) {
+            // Deserialized as a map rather than a `Value`: a root that is not a JSON object
+            // holds neither key, and reading it as unconfigured would hide the parse error.
+            Ok(text) => serde_json::from_str::<Map<String, Value>>(&text).map_err(|source| {
+                CredentialsError::Parse {
+                    path: path.clone(),
+                    source,
+                }
+            })?,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => return Err(CredentialsError::Io { path, source }),
         };
         let from_file = |key: &str| {
-            file.as_ref()
-                .and_then(|map| map.get(key))
+            file.get(key)
                 .and_then(Value::as_str)
                 .map(str::to_owned)
                 .filter(|value| !value.trim().is_empty())
         };
-        let api_url = env_url.or_else(|| from_file("hindsightApiUrl"));
-        let token = env_token.or_else(|| from_file("hindsightApiToken"));
-        match (api_url, token) {
-            (Some(api_url), Some(token)) => Ok(Some(Self { api_url, token })),
-            (None, None) => Ok(None),
-            (api_url, _) => Err(CredentialsError::Incomplete {
-                missing: if api_url.is_none() { "URL" } else { "token" },
-                path,
-            }),
+        let token = from_file("hindsightApiToken");
+        match from_file("hindsightApiUrl") {
+            Some(api_url) => Ok(Some(Self { api_url, token })),
+            None if token.is_none() => Ok(None),
+            None => Err(CredentialsError::NoUrl { path }),
         }
     }
 
     /// Write the URL and token that [`load`](Self::load) reads, creating `~/.hindsight` when it is
-    /// missing, and answer the file they landed in. Any other key in that file is kept as it was:
-    /// this owns two of them and cannot know what wrote the rest.
+    /// missing, and answer the file they landed in. `None` removes any recorded token: the file
+    /// says what setup last answered, and a token left behind would ride along to the new URL. Any
+    /// other key in that file is kept as it was: this owns two of them and cannot know what wrote
+    /// the rest.
     ///
-    /// The environment is not touched, so `CONTEXTWITNESS_HINDSIGHT_URL` and
-    /// `CONTEXTWITNESS_HINDSIGHT_TOKEN` still outrank whatever this writes.
-    pub fn save(api_url: &str, token: &str) -> Result<PathBuf, CredentialsError> {
+    /// The environment is not touched: when `CONTEXTWITNESS_HINDSIGHT_URL` is set,
+    /// [`load`](Self::load) takes the environment whole and reads nothing of what this writes.
+    pub fn save(api_url: &str, token: Option<&str>) -> Result<PathBuf, CredentialsError> {
         let directory = dirs::home_dir()
             .ok_or(CredentialsError::NoHome)?
             .join(".hindsight");
@@ -96,8 +104,7 @@ impl Credentials {
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => Map::new(),
             Err(source) => return Err(CredentialsError::Io { path, source }),
         };
-        document.insert("hindsightApiUrl".to_owned(), api_url.into());
-        document.insert("hindsightApiToken".to_owned(), token.into());
+        Self::apply(&mut document, api_url, token);
 
         let text = format!("{}\n", Value::Object(document));
 
@@ -123,6 +130,21 @@ impl Credentials {
         Ok(path)
     }
 
+    /// [`save`](Self::save)'s document mutation, apart from the file it lands in.
+    fn apply(document: &mut Map<String, Value>, api_url: &str, token: Option<&str>) {
+        // A blank token is the no-token state, not a value to record.
+        let token = token.filter(|token| !token.trim().is_empty());
+        document.insert("hindsightApiUrl".to_owned(), api_url.into());
+        match token {
+            Some(token) => {
+                document.insert("hindsightApiToken".to_owned(), token.into());
+            }
+            None => {
+                document.remove("hindsightApiToken");
+            }
+        }
+    }
+
     pub fn api_url(&self) -> &str {
         &self.api_url
     }
@@ -133,7 +155,7 @@ impl fmt::Debug for Credentials {
         formatter
             .debug_struct("Credentials")
             .field("api_url", &self.api_url)
-            .field("token", &"<redacted>")
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
             .finish()
     }
 }
@@ -159,11 +181,13 @@ pub enum CredentialsError {
         path: PathBuf,
         source: serde_json::Error,
     },
-    #[error("hindsight {missing} is missing; run `contextwitness setup` to write {path}")]
-    Incomplete {
-        missing: &'static str,
-        path: PathBuf,
-    },
+    #[error("{path} holds a token but no URL; run `contextwitness setup` to rewrite it")]
+    NoUrl { path: PathBuf },
+    #[error(
+        "CONTEXTWITNESS_HINDSIGHT_TOKEN is set without CONTEXTWITNESS_HINDSIGHT_URL, which \
+         would pair the token with a URL from another source; set both or neither"
+    )]
+    EnvTokenWithoutUrl,
 }
 
 /// One episode, ready to hand to Hindsight. Maps onto the API's `MemoryItem`.
@@ -266,7 +290,7 @@ fn vet_bank_id(bank_id: &str) -> Result<(), DeliveryError> {
 pub struct HindsightClient {
     http: Client,
     base_url: Url,
-    token: String,
+    token: Option<String>,
 }
 
 impl HindsightClient {
@@ -373,8 +397,17 @@ impl HindsightClient {
         Ok(())
     }
 
+    /// The Authorization header travels only when there is a token, as in Hindsight's own
+    /// integrations.
+    fn authorize(&self, request: RequestBuilder) -> RequestBuilder {
+        match &self.token {
+            Some(token) => request.bearer_auth(token),
+            None => request,
+        }
+    }
+
     fn send(&self, request: RequestBuilder) -> Result<Response, DeliveryError> {
-        request.bearer_auth(&self.token).send().map_err(transport)
+        self.authorize(request).send().map_err(transport)
     }
 }
 
@@ -383,7 +416,7 @@ impl fmt::Debug for HindsightClient {
         formatter
             .debug_struct("HindsightClient")
             .field("base_url", &self.base_url)
-            .field("token", &"<redacted>")
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
             .finish()
     }
 }
@@ -486,7 +519,7 @@ mod tests {
     fn debug_output_redacts_the_token() {
         let credentials = Credentials {
             api_url: "http://localhost:0".to_owned(),
-            token: "the-secret-token".to_owned(),
+            token: Some("the-secret-token".to_owned()),
         };
         let printed = format!("{credentials:?}");
         assert!(!printed.contains("the-secret-token"), "{printed}");
@@ -497,6 +530,51 @@ mod tests {
         let printed = format!("{client:?}");
         assert!(!printed.contains("the-secret-token"), "{printed}");
         assert!(printed.contains("<redacted>"), "{printed}");
+    }
+
+    #[test]
+    fn an_absent_or_blank_token_leaves_no_recorded_one_behind() {
+        let mut document: Map<String, Value> = [
+            ("hindsightApiToken".to_owned(), "stale".into()),
+            ("retainEveryNTurns".to_owned(), 1.into()),
+        ]
+        .into_iter()
+        .collect();
+        Credentials::apply(&mut document, "http://host:1/api", Some("  "));
+        assert_eq!(document.get("hindsightApiToken"), None);
+        Credentials::apply(&mut document, "http://host:2/api", Some("t"));
+        assert_eq!(document.get("hindsightApiToken"), Some(&Value::from("t")));
+        Credentials::apply(&mut document, "http://host:3/api", None);
+        assert_eq!(document.get("hindsightApiToken"), None);
+        assert_eq!(
+            document.get("hindsightApiUrl"),
+            Some(&Value::from("http://host:3/api"))
+        );
+        assert_eq!(document.get("retainEveryNTurns"), Some(&Value::from(1)));
+    }
+
+    #[test]
+    fn the_authorization_header_travels_only_with_a_token() {
+        let header = |token: Option<String>| {
+            let client = HindsightClient::new(Credentials {
+                api_url: "http://localhost:0".to_owned(),
+                token,
+            })
+            .expect("building the client makes no request");
+            client
+                .authorize(client.http.get("http://localhost:0/x"))
+                .build()
+                .expect("a plain GET builds")
+                .headers()
+                .get(reqwest::header::AUTHORIZATION)
+                .cloned()
+        };
+        assert_eq!(header(None), None);
+        let sent = header(Some("the-secret-token".to_owned())).expect("the token should travel");
+        assert_eq!(
+            sent.to_str().expect("the header is ASCII"),
+            "Bearer the-secret-token"
+        );
     }
 
     #[test]
@@ -541,7 +619,7 @@ mod tests {
     fn a_bank_id_travels_as_one_path_segment() {
         let client = HindsightClient::new(Credentials {
             api_url: "http://localhost:0/prefix/".to_owned(),
-            token: "t".to_owned(),
+            token: None,
         })
         .expect("building the client makes no request");
         let url = client

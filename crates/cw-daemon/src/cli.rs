@@ -673,13 +673,16 @@ fn setup_credentials() -> Result<(), Failure> {
     if let Err(error) = cw_sink_hindsight::parse_api_url(&api_url) {
         return Err(format!("the URL was not saved: {error}").into());
     }
-    let token = ask_secret("  API token: ")?;
-    if token.is_empty() {
-        return Err("the token is required alongside the URL".into());
-    }
+    let token =
+        ask_secret("  API token (replaces the stored one; empty when the server needs none): ")?;
+    let token = (!token.is_empty()).then_some(token);
 
-    let path = cw_sink_hindsight::Credentials::save(&api_url, &token)?;
-    println!("  wrote {}", path.display());
+    let path = cw_sink_hindsight::Credentials::save(&api_url, token.as_deref())?;
+    println!(
+        "  wrote {}{}",
+        path.display(),
+        if token.is_some() { "" } else { " (no token)" }
+    );
 
     Ok(())
 }
