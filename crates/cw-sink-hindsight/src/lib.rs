@@ -17,9 +17,16 @@ const RETAIN_MISSION: &str = "Record the user's on-screen activity as a time-anc
 const RETAIN_EXTRACTION_MODE: &str = "concise";
 const RETAIN_CHUNK_SIZE: u32 = 3000;
 
-// Retain is synchronous, and reqwest's own 30s default is far under Hindsight's LLM extraction.
+/// Bounds the whole exchange, request-body upload included, so the largest configurable episode
+/// over a slow link must fit within it; detecting a dead host promptly is [`CONNECT_TIMEOUT`]'s
+/// job, not this one's.
 // ponytail: fixed ceiling, promote to a config knob if real episodes ever approach it.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(600);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// A control exchange — the status GET, the bank upsert — carries no episode text, so it must
+/// not inherit the upload-sized [`HTTP_TIMEOUT`]: a server that stalls mid-exchange would hold
+/// the single delivery thread for 600 s, and at the bank upsert that gates every delivery.
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Hindsight connection details, resolved from `~/.hindsight/contextwitness.json` or the
 /// environment. The token is optional, as it is for Hindsight's own integrations: a server that
@@ -192,6 +199,9 @@ pub enum CredentialsError {
 
 /// One episode, ready to hand to Hindsight. Maps onto the API's `MemoryItem`.
 pub struct RetainItem<'a> {
+    /// Feeds only the operation id, never the wire: document ids repeat across installs sharing
+    /// a bank, so the id that must not collide is salted with this row's ULID instead.
+    pub episode_id: &'a str,
     /// Stable id; re-sending the same one replaces the previous document server-side.
     pub document_id: &'a str,
     pub content: &'a str,
@@ -212,10 +222,37 @@ pub struct RetainItem<'a> {
 /// writes a `RawValue` out verbatim.
 #[derive(serde::Serialize)]
 struct RetainRequest<'a> {
-    /// Explicit: the caller must be able to read 2xx as processed, not as queued.
     #[serde(rename = "async")]
     is_async: bool,
+    operation_id: &'a str,
     items: [RetainItemWire<'a>; 1],
+}
+
+#[derive(serde::Deserialize)]
+struct RetainAccepted {
+    operation_id: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct OperationWire {
+    status: String,
+}
+
+/// `Processing` and `Failed` ask the caller to try [`retain`](HindsightClient::retain) again
+/// later: the fixed operation id lets that later call find the same operation and ask how it
+/// stands, without re-submitting the body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RetainOutcome {
+    Delivered,
+    Processing {
+        operation_id: String,
+    },
+    /// The extraction ran out of the server's own retries. The episode is parked and the
+    /// operation watched rather than condemned: the operations API can `/retry` it, and a
+    /// condemned entry would never poll again, making that documented recovery invisible here.
+    Failed {
+        operation_id: String,
+    },
 }
 
 #[derive(serde::Serialize)]
@@ -301,6 +338,7 @@ impl HindsightClient {
         let http = Client::builder()
             .user_agent(concat!("contextwitness/", env!("CARGO_PKG_VERSION")))
             .timeout(HTTP_TIMEOUT)
+            .connect_timeout(CONNECT_TIMEOUT)
             .build()
             .map_err(|error| DeliveryError::Permanent {
                 message: format!("failed to build the HTTP client: {error}"),
@@ -338,18 +376,32 @@ impl HindsightClient {
             "retain_extraction_mode": RETAIN_EXTRACTION_MODE,
             "retain_chunk_size": RETAIN_CHUNK_SIZE,
         });
-        check(
-            self.send(self.http.put(url).json(&desired))?,
+        accept(
+            self.send(self.http.put(url).json(&desired).timeout(CONTROL_TIMEOUT))?,
             UPSERT_BANK_OPERATION,
         )
+        .map(drop)
     }
 
-    /// Delivers one episode. `Ok` means Hindsight answered 2xx, which is delivery.
-    pub fn retain(&self, bank_id: &str, item: &RetainItem<'_>) -> Result<(), DeliveryError> {
+    /// One delivery step for an episode, cheapest question first: ask how its fixed operation
+    /// stands, and submit the body only when the server has never seen it. The submission carries
+    /// the episode's whole text, and re-POSTing it as a status check would upload, parse and
+    /// validate that text on every poll. `Delivered` only when the server reports it completed.
+    pub fn retain(
+        &self,
+        bank_id: &str,
+        item: &RetainItem<'_>,
+    ) -> Result<RetainOutcome, DeliveryError> {
         vet_bank_id(bank_id)?;
+        let operation_id = retain_operation_id(bank_id, item.episode_id);
+        let status = self.operation_status(bank_id, &operation_id)?;
+        if status != OPERATION_ABSENT {
+            return operation_outcome(&status, &operation_id);
+        }
         let url = self.endpoint(&["v1", "default", "banks", bank_id, "memories"])?;
         let request = RetainRequest {
-            is_async: false,
+            is_async: true,
+            operation_id: &operation_id,
             items: [RetainItemWire {
                 content: item.content,
                 document_id: item.document_id,
@@ -359,10 +411,38 @@ impl HindsightClient {
                 update_mode: "replace",
             }],
         };
-        check(
-            self.send(self.http.post(url).json(&request))?,
+        let accepted: RetainAccepted = parse(
+            accept(
+                self.send(self.http.post(url).json(&request))?,
+                RETAIN_OPERATION,
+            )
+            .map_err(exchange_fault)?,
             RETAIN_OPERATION,
-        )
+        )?;
+        vet_operation_echo(&operation_id, accepted.operation_id.as_deref())?;
+        // Answered directly: an asynchronous extraction cannot be complete in the same instant,
+        // so a status GET here buys one round trip and a spurious not-yet-visible failure path.
+        Ok(RetainOutcome::Processing { operation_id })
+    }
+
+    fn operation_status(&self, bank_id: &str, operation_id: &str) -> Result<String, DeliveryError> {
+        let url = self.endpoint(&[
+            "v1",
+            "default",
+            "banks",
+            bank_id,
+            "operations",
+            operation_id,
+        ])?;
+        let operation: OperationWire = parse(
+            accept(
+                self.send(self.http.get(url).timeout(CONTROL_TIMEOUT))?,
+                POLL_OPERATION,
+            )
+            .map_err(exchange_fault)?,
+            POLL_OPERATION,
+        )?;
+        Ok(operation.status)
     }
 
     /// The Authorization header travels only when there is a token, as in Hindsight's own
@@ -399,6 +479,10 @@ pub enum DeliveryError {
     },
     #[error("{message}")]
     Permanent { message: String },
+    /// The server itself cannot run this client — a fault of the deployment, not a verdict on
+    /// any one episode.
+    #[error("{message}")]
+    Unsupported { message: String },
 }
 
 impl DeliveryError {
@@ -410,7 +494,7 @@ impl DeliveryError {
     pub fn retry_after(&self) -> Option<Duration> {
         match self {
             Self::Retryable { retry_after, .. } => *retry_after,
-            Self::Permanent { .. } => None,
+            Self::Permanent { .. } | Self::Unsupported { .. } => None,
         }
     }
 }
@@ -424,11 +508,12 @@ fn transport(error: reqwest::Error) -> DeliveryError {
 
 const RETAIN_OPERATION: &str = "retain";
 const UPSERT_BANK_OPERATION: &str = "upsert bank";
+const POLL_OPERATION: &str = "operation status";
 
-fn check(response: Response, operation: &str) -> Result<(), DeliveryError> {
+fn accept(response: Response, operation: &str) -> Result<Response, DeliveryError> {
     let status = response.status();
     if status.is_success() {
-        return Ok(());
+        return Ok(response);
     }
     // The body stays out: Hindsight echoes rejected input back, and that is captured screen text.
     let message = format!(
@@ -445,7 +530,105 @@ fn check(response: Response, operation: &str) -> Result<(), DeliveryError> {
     }
 }
 
-/// Deployment faults, repairable while episodes wait; everything unlisted is condemned.
+fn parse<T: serde::de::DeserializeOwned>(
+    response: Response,
+    operation: &str,
+) -> Result<T, DeliveryError> {
+    // The decode error stays out of the message: serde spells it with fragments of the body.
+    response.json().map_err(|_| DeliveryError::Retryable {
+        message: format!("hindsight {operation} answered an unreadable body"),
+        retry_after: None,
+    })
+}
+
+/// A refused exchange is never a verdict on the episode: the asynchronous POST only submits and
+/// the poll only asks — the verdict is the operation status alone.
+fn exchange_fault(error: DeliveryError) -> DeliveryError {
+    match error {
+        DeliveryError::Permanent { message } => DeliveryError::Retryable {
+            message,
+            retry_after: None,
+        },
+        other => other,
+    }
+}
+
+fn vet_operation_echo(sent: &str, answered: Option<&str>) -> Result<(), DeliveryError> {
+    // Case-insensitive: UUID hex is compared caseless per RFC 9562, and a server re-rendering
+    // the id through a UUID type must not read as one that ignored it.
+    if answered.is_some_and(|answered| answered.eq_ignore_ascii_case(sent)) {
+        return Ok(());
+    }
+    Err(DeliveryError::Unsupported {
+        message: "hindsight retain failed: the server ignored the supplied operation id; \
+                  hindsight v0.8.6 or later is required"
+            .to_owned(),
+    })
+}
+
+/// The status a server answers for an operation it has never seen — the one status
+/// [`HindsightClient::retain`] consumes itself, as the cue to submit.
+const OPERATION_ABSENT: &str = "not_found";
+
+/// Maps the server's operation status; the incoming value never travels into a message, and
+/// [`OPERATION_ABSENT`] never arrives — [`HindsightClient::retain`] consumes it as the submit
+/// cue. The operation id rides every non-completed outcome — the operator's only handle on the
+/// server's operations API, and derived from nothing but the bank and episode ids.
+fn operation_outcome(status: &str, operation_id: &str) -> Result<RetainOutcome, DeliveryError> {
+    match status {
+        "completed" => Ok(RetainOutcome::Delivered),
+        "pending" | "processing" => Ok(RetainOutcome::Processing {
+            operation_id: operation_id.to_owned(),
+        }),
+        "failed" => Ok(RetainOutcome::Failed {
+            operation_id: operation_id.to_owned(),
+        }),
+        "cancelled" => Err(DeliveryError::Permanent {
+            message: format!(
+                "hindsight retain failed: operation {operation_id} was cancelled on the server"
+            ),
+        }),
+        _ => Err(DeliveryError::Retryable {
+            message: format!(
+                "hindsight retain failed: operation {operation_id} answered an unrecognized status"
+            ),
+            retry_after: None,
+        }),
+    }
+}
+
+/// The fixed operation id of an episode's retain: resubmitting under the same id returns the
+/// original operation instead of new work, which is what makes a retry safe.
+fn retain_operation_id(bank_id: &str, episode_id: &str) -> String {
+    let mut bits = fnv1a_128(&format!("{bank_id}\n{episode_id}"));
+    // UUID version-8/variant bits: the server validates the id as a UUID.
+    bits = (bits & !(0xf << 76)) | (0x8 << 76);
+    bits = (bits & !(0x3 << 62)) | (0x2 << 62);
+    let hex = format!("{bits:032x}");
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
+}
+
+/// FNV-1a, 128 bits: wide enough that two episodes sharing an id is not a real event.
+fn fnv1a_128(text: &str) -> u128 {
+    let mut hash: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
+    for byte in text.as_bytes() {
+        hash ^= u128::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0000_0100_0000_0000_0000_0000_013b);
+    }
+    hash
+}
+
+/// Deployment faults, repairable while episodes wait; everything unlisted classifies
+/// Permanent. On the retain path [`exchange_fault`] overrides that verdict and the bank upsert
+/// backs off rather than condemns, so the split steers retry shape — never an episode's
+/// survival.
 fn retryable_status(status: StatusCode) -> bool {
     status.is_server_error()
         || matches!(
@@ -470,9 +653,6 @@ fn status_hint(operation: &str, status: StatusCode) -> &'static str {
         }
         (RETAIN_OPERATION, StatusCode::NOT_FOUND) => {
             " (a missing bank cannot cause this; the memories route itself was refused)"
-        }
-        (RETAIN_OPERATION, StatusCode::BAD_REQUEST) => {
-            " (possibly a batch-enabled server refusing synchronous retain)"
         }
         (RETAIN_OPERATION, StatusCode::PAYLOAD_TOO_LARGE) => {
             " (the body exceeds a proxy or server body-size limit; raising the limit or \
@@ -628,7 +808,7 @@ mod tests {
     }
 
     #[test]
-    fn deployment_faults_retry_and_everything_else_is_condemned() {
+    fn deployment_faults_retry_and_everything_else_classifies_permanent() {
         for (status, retryable) in [
             (StatusCode::BAD_REQUEST, true),
             (StatusCode::UNAUTHORIZED, true),
@@ -645,30 +825,263 @@ mod tests {
         ] {
             assert_eq!(retryable_status(status), retryable, "{status}");
         }
+    }
 
-        assert!(status_hint(RETAIN_OPERATION, StatusCode::BAD_REQUEST).contains("batch"));
-        assert!(status_hint(RETAIN_OPERATION, StatusCode::PAYLOAD_TOO_LARGE).contains("proxy"));
+    #[test]
+    fn a_server_that_ignores_the_operation_id_is_refused() {
+        assert!(vet_operation_echo("the-id", Some("the-id")).is_ok());
         assert!(
-            status_hint(RETAIN_OPERATION, StatusCode::PAYLOAD_TOO_LARGE)
-                .contains("raising the limit")
+            vet_operation_echo("the-id", Some("THE-ID")).is_ok(),
+            "UUID hex compares caseless, and a re-rendered echo is not an ignored id"
         );
-        assert!(
-            status_hint(RETAIN_OPERATION, StatusCode::UNPROCESSABLE_ENTITY).contains("defense")
+        for answered in [None, Some("another-id")] {
+            let error = vet_operation_echo("the-id", answered).unwrap_err();
+            assert!(
+                matches!(error, DeliveryError::Unsupported { .. }),
+                "{error}"
+            );
+            assert!(error.to_string().contains("0.8.6"), "{error}");
+        }
+    }
+
+    #[test]
+    fn the_operation_id_is_a_stable_uuid_per_episode() {
+        let id = retain_operation_id("bank", "ep-1");
+        assert_eq!(
+            id, "aaf7ec6e-1706-8fb0-9644-442e1b38dd3c",
+            "a changed derivation re-buys extraction for every in-flight episode"
         );
-        assert!(status_hint(RETAIN_OPERATION, StatusCode::NOT_FOUND).contains("memories route"));
-        assert!(status_hint(UPSERT_BANK_OPERATION, StatusCode::NOT_FOUND).contains("base URL"));
+        assert_ne!(id, retain_operation_id("bank", "ep-2"));
+        assert_ne!(id, retain_operation_id("bank2", "ep-1"));
+        assert_ne!(
+            retain_operation_id("ab", "c"),
+            retain_operation_id("a", "bc")
+        );
+
+        assert_eq!(id.as_bytes()[14], b'8', "{id}");
         assert!(
-            status_hint(UPSERT_BANK_OPERATION, StatusCode::UNPROCESSABLE_ENTITY)
-                .contains("settings")
+            matches!(id.as_bytes()[19], b'8' | b'9' | b'a' | b'b'),
+            "{id}"
+        );
+    }
+
+    #[test]
+    fn the_operation_status_decides_the_episode() {
+        let outcome = |status| operation_outcome(status, "the-operation-id");
+        assert_eq!(outcome("completed").unwrap(), RetainOutcome::Delivered);
+        for waiting in ["pending", "processing"] {
+            assert_eq!(
+                outcome(waiting).unwrap(),
+                RetainOutcome::Processing {
+                    operation_id: "the-operation-id".to_owned()
+                },
+                "{waiting}"
+            );
+        }
+        assert_eq!(
+            outcome("failed").unwrap(),
+            RetainOutcome::Failed {
+                operation_id: "the-operation-id".to_owned()
+            },
+            "a failed operation must stay watchable: the server's /retry has no local effect \
+             on an entry that never polls again"
+        );
+        let cancelled = outcome("cancelled").unwrap_err();
+        assert!(!cancelled.is_retryable());
+        assert!(
+            cancelled.to_string().contains("the-operation-id"),
+            "the operator's server-side handle must be named: {cancelled}"
+        );
+        for unhandled in [OPERATION_ABSENT, "someday-maybe"] {
+            let unknown = outcome(unhandled).unwrap_err();
+            assert!(
+                unknown.is_retryable(),
+                "an unmapped status must stay retryable, never a verdict: {unhandled}"
+            );
+            assert!(
+                !unknown.to_string().contains("someday-maybe"),
+                "{unhandled}"
+            );
+            assert!(
+                unknown.to_string().contains("the-operation-id"),
+                "{unhandled}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_refused_exchange_never_condemns_the_episode() {
+        let refused = exchange_fault(DeliveryError::Permanent {
+            message: "m".to_owned(),
+        });
+        assert!(refused.is_retryable(), "{refused}");
+        let kept = exchange_fault(DeliveryError::Retryable {
+            message: "m".to_owned(),
+            retry_after: Some(Duration::from_secs(7)),
+        });
+        assert_eq!(
+            kept.retry_after(),
+            Some(Duration::from_secs(7)),
+            "the server's own Retry-After must survive the downgrade path untouched"
+        );
+    }
+
+    #[test]
+    fn the_retain_wire_spellings_survive_serialization() {
+        let metadata = RawValue::from_string(r#"{"b":"1","a":"2"}"#.to_owned())
+            .expect("the object is valid JSON");
+        let request = RetainRequest {
+            is_async: true,
+            operation_id: "the-id",
+            items: [RetainItemWire {
+                content: "c",
+                document_id: "d",
+                timestamp: "t".to_owned(),
+                context: "x",
+                metadata: &metadata,
+                update_mode: "replace",
+            }],
+        };
+        let body = serde_json::to_string(&request).expect("the request serializes");
+        assert!(
+            body.contains(r#""metadata":{"b":"1","a":"2"}"#),
+            "the stored metadata bytes must reach the wire verbatim, not re-emitted alphabetized: {body}"
+        );
+        let value: Value = serde_json::from_str(&body).expect("the body is valid JSON");
+        assert_eq!(value["async"], Value::Bool(true));
+        assert_eq!(value["operation_id"], Value::from("the-id"));
+        assert_eq!(value["items"][0]["update_mode"], Value::from("replace"));
+    }
+
+    /// One scripted exchange: the method and path asked, and the body that came with it.
+    fn read_request(stream: &mut std::net::TcpStream) -> (String, String) {
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        let header_end = loop {
+            let read = stream.read(&mut buffer).expect("the request reads");
+            assert!(read > 0, "the client hung up mid-request");
+            bytes.extend_from_slice(&buffer[..read]);
+            if let Some(position) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                break position + 4;
+            }
+        };
+        let head = String::from_utf8(bytes[..header_end].to_vec()).expect("the head is UTF-8");
+        let content_length = head
+            .lines()
+            .find_map(|line| {
+                line.to_ascii_lowercase()
+                    .strip_prefix("content-length:")
+                    .map(|value| value.trim().parse::<usize>().expect("a numeric length"))
+            })
+            .unwrap_or(0);
+        while bytes.len() < header_end + content_length {
+            let read = stream.read(&mut buffer).expect("the body reads");
+            assert!(read > 0, "the client hung up mid-body");
+            bytes.extend_from_slice(&buffer[..read]);
+        }
+        let request_line = head.lines().next().expect("a request line");
+        let asked = request_line
+            .rsplit_once(' ')
+            .expect("an HTTP version")
+            .0
+            .to_owned();
+        let body = String::from_utf8(bytes[header_end..].to_vec()).expect("the body is UTF-8");
+        (asked, body)
+    }
+
+    #[test]
+    fn the_delivery_lifecycle_submits_the_body_once_and_then_only_asks() {
+        let operation_id = retain_operation_id("bank", "ep-1");
+        let scripted = [
+            r#"{"status":"not_found"}"#.to_owned(),
+            format!(r#"{{"operation_id":"{operation_id}"}}"#),
+            r#"{"status":"processing"}"#.to_owned(),
+            r#"{"status":"failed"}"#.to_owned(),
+            r#"{"status":"completed"}"#.to_owned(),
+        ];
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("loopback binds");
+        let port = listener
+            .local_addr()
+            .expect("the socket has an address")
+            .port();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for body in scripted {
+                let (mut stream, _) = listener.accept().expect("the client connects");
+                // Bounded, so a client that stops sending fails the test fast instead of
+                // holding the accept loop for the client's own 600 s timeout.
+                let bound = Some(std::time::Duration::from_secs(10));
+                stream.set_read_timeout(bound).expect("the timeout applies");
+                stream
+                    .set_write_timeout(bound)
+                    .expect("the timeout applies");
+                requests.push(read_request(&mut stream));
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                std::io::Write::write_all(&mut stream, response.as_bytes())
+                    .expect("the response writes");
+            }
+            let _ = sender.send(requests);
+        });
+
+        let client = HindsightClient::new(Credentials {
+            api_url: format!("http://127.0.0.1:{port}"),
+            token: None,
+        })
+        .expect("building the client makes no request");
+        let metadata = RawValue::from_string(r#"{"k":"v"}"#.to_owned()).expect("valid JSON");
+        let item = RetainItem {
+            episode_id: "ep-1",
+            document_id: "doc",
+            content: "the episode text",
+            timestamp: Utc::now(),
+            context: "ctx",
+            metadata: &metadata,
+        };
+        let processing = RetainOutcome::Processing {
+            operation_id: operation_id.clone(),
+        };
+        assert_eq!(client.retain("bank", &item).unwrap(), processing);
+        assert_eq!(client.retain("bank", &item).unwrap(), processing);
+        assert_eq!(
+            client.retain("bank", &item).unwrap(),
+            RetainOutcome::Failed {
+                operation_id: operation_id.clone()
+            }
         );
         assert_eq!(
-            status_hint(UPSERT_BANK_OPERATION, StatusCode::BAD_REQUEST),
-            ""
+            client.retain("bank", &item).unwrap(),
+            RetainOutcome::Delivered,
+            "a server-side /retry must be picked up by the plain next attempt"
         );
+
+        let requests = receiver
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the server saw every scripted exchange");
+        let ask = format!("GET /v1/default/banks/bank/operations/{operation_id}");
         assert_eq!(
-            status_hint(UPSERT_BANK_OPERATION, StatusCode::PAYLOAD_TOO_LARGE),
-            ""
+            requests
+                .iter()
+                .map(|(asked, _)| asked.as_str())
+                .collect::<Vec<_>>(),
+            [
+                ask.as_str(),
+                "POST /v1/default/banks/bank/memories",
+                ask.as_str(),
+                ask.as_str(),
+                ask.as_str(),
+            ],
+            "the body must travel exactly once, and only after the server answers not_found"
         );
-        assert_eq!(status_hint(RETAIN_OPERATION, StatusCode::FORBIDDEN), "");
+        let submitted = &requests[1].1;
+        assert!(
+            submitted.contains(&format!(r#""operation_id":"{operation_id}""#)),
+            "{submitted}"
+        );
+        assert!(submitted.contains("the episode text"), "{submitted}");
     }
 }
