@@ -46,15 +46,11 @@ impl Credentials {
     /// file goes unread; `CONTEXTWITNESS_HINDSIGHT_TOKEN` on its own is an error rather than a
     /// silent fallback to the file's URL.
     pub fn load() -> Result<Option<Self>, CredentialsError> {
-        let env_token = from_env("CONTEXTWITNESS_HINDSIGHT_TOKEN");
-        if let Some(api_url) = from_env("CONTEXTWITNESS_HINDSIGHT_URL") {
-            return Ok(Some(Self {
-                api_url,
-                token: env_token,
-            }));
-        }
-        if env_token.is_some() {
-            return Err(CredentialsError::EnvTokenWithoutUrl);
+        if let Some(credentials) = Self::from_environment(
+            from_env("CONTEXTWITNESS_HINDSIGHT_URL"),
+            from_env("CONTEXTWITNESS_HINDSIGHT_TOKEN"),
+        )? {
+            return Ok(Some(credentials));
         }
         let path = dirs::home_dir()
             .ok_or(CredentialsError::NoHome)?
@@ -72,14 +68,35 @@ impl Credentials {
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(source) => return Err(CredentialsError::Io { path, source }),
         };
-        let from_file = |key: &str| {
-            file.get(key)
+        Self::from_document(&file, path)
+    }
+
+    /// [`load`](Self::load)'s environment decision, apart from the process environment.
+    fn from_environment(
+        api_url: Option<String>,
+        token: Option<String>,
+    ) -> Result<Option<Self>, CredentialsError> {
+        match (api_url, token) {
+            (Some(api_url), token) => Ok(Some(Self { api_url, token })),
+            (None, Some(_)) => Err(CredentialsError::EnvTokenWithoutUrl),
+            (None, None) => Ok(None),
+        }
+    }
+
+    /// [`load`](Self::load)'s document interpretation, apart from the file it came from.
+    fn from_document(
+        document: &Map<String, Value>,
+        path: PathBuf,
+    ) -> Result<Option<Self>, CredentialsError> {
+        let field = |key: &str| {
+            document
+                .get(key)
                 .and_then(Value::as_str)
                 .map(str::to_owned)
                 .filter(|value| !value.trim().is_empty())
         };
-        let token = from_file("hindsightApiToken");
-        match from_file("hindsightApiUrl") {
+        let token = field("hindsightApiToken");
+        match field("hindsightApiUrl") {
             Some(api_url) => Ok(Some(Self { api_url, token })),
             None if token.is_none() => Ok(None),
             None => Err(CredentialsError::NoUrl { path }),
@@ -704,6 +721,75 @@ mod tests {
         let printed = format!("{client:?}");
         assert!(!printed.contains("the-secret-token"), "{printed}");
         assert!(printed.contains("<redacted>"), "{printed}");
+    }
+
+    #[test]
+    fn a_tokenless_source_still_configures_delivery() {
+        let document: Map<String, Value> =
+            [("hindsightApiUrl".to_owned(), "http://host:1/api".into())]
+                .into_iter()
+                .collect();
+        let credentials =
+            Credentials::from_document(&document, PathBuf::from("contextwitness.json"))
+                .unwrap()
+                .expect("a URL alone is a configured deployment, not a broken one");
+        assert_eq!(credentials.api_url(), "http://host:1/api");
+        assert_eq!(credentials.token, None);
+
+        let credentials = Credentials::from_environment(Some("http://host:2/api".to_owned()), None)
+            .unwrap()
+            .expect("a URL alone is a configured deployment, not a broken one");
+        assert_eq!(credentials.token, None);
+    }
+
+    #[test]
+    fn each_credential_source_is_taken_whole_or_not_at_all() {
+        let credentials = Credentials::from_environment(
+            Some("http://host:3/api".to_owned()),
+            Some("the-token".to_owned()),
+        )
+        .unwrap()
+        .expect("a full credential set configures delivery");
+        assert_eq!(credentials.token.as_deref(), Some("the-token"));
+
+        let document: Map<String, Value> = [
+            ("hindsightApiUrl".to_owned(), "http://host:4/api".into()),
+            ("hindsightApiToken".to_owned(), "the-token".into()),
+        ]
+        .into_iter()
+        .collect();
+        let credentials =
+            Credentials::from_document(&document, PathBuf::from("contextwitness.json"))
+                .unwrap()
+                .expect("a full credential set configures delivery");
+        assert_eq!(
+            credentials.token.as_deref(),
+            Some("the-token"),
+            "the file's token must ride along, not just its URL"
+        );
+
+        assert!(matches!(
+            Credentials::from_environment(None, Some("the-token".to_owned())),
+            Err(CredentialsError::EnvTokenWithoutUrl)
+        ));
+        assert!(
+            Credentials::from_environment(None, None).unwrap().is_none(),
+            "an empty environment defers to the file"
+        );
+
+        let document: Map<String, Value> = [("hindsightApiToken".to_owned(), "the-token".into())]
+            .into_iter()
+            .collect();
+        assert!(matches!(
+            Credentials::from_document(&document, PathBuf::from("contextwitness.json")),
+            Err(CredentialsError::NoUrl { .. })
+        ));
+        assert!(
+            Credentials::from_document(&Map::new(), PathBuf::from("contextwitness.json"))
+                .unwrap()
+                .is_none(),
+            "a document holding neither key configures nothing"
+        );
     }
 
     #[test]
