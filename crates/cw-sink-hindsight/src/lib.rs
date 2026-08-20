@@ -654,12 +654,17 @@ fn status_hint(operation: &str, status: StatusCode) -> &'static str {
         (RETAIN_OPERATION, StatusCode::NOT_FOUND) => {
             " (a missing bank cannot cause this; the memories route itself was refused)"
         }
+        (POLL_OPERATION, StatusCode::NOT_FOUND) => {
+            " (an unknown operation answers not_found in the body, so the operations route \
+             itself was refused)"
+        }
         (RETAIN_OPERATION, StatusCode::PAYLOAD_TOO_LARGE) => {
             " (the body exceeds a proxy or server body-size limit; raising the limit or \
              shrinking the episode is needed)"
         }
         (RETAIN_OPERATION, StatusCode::UNPROCESSABLE_ENTITY) => {
-            " (the server refused the content: validation or memory defense)"
+            " (the server refused the submission; check its validation policy and the \
+             client/server version pairing)"
         }
         _ => "",
     }
@@ -910,6 +915,42 @@ mod tests {
     }
 
     #[test]
+    fn the_hints_survive_for_the_operator() {
+        for (operation, status, fragment) in [
+            (UPSERT_BANK_OPERATION, StatusCode::NOT_FOUND, "base URL"),
+            (
+                UPSERT_BANK_OPERATION,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "fixed bank settings",
+            ),
+            (RETAIN_OPERATION, StatusCode::NOT_FOUND, "route"),
+            (POLL_OPERATION, StatusCode::NOT_FOUND, "operations route"),
+            (
+                RETAIN_OPERATION,
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "body-size limit",
+            ),
+            (
+                RETAIN_OPERATION,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "validation policy",
+            ),
+        ] {
+            let hint = status_hint(operation, status);
+            assert!(hint.contains(fragment), "{operation} {status}: {hint}");
+        }
+        assert_eq!(
+            status_hint(RETAIN_OPERATION, StatusCode::INTERNAL_SERVER_ERROR),
+            ""
+        );
+        assert_eq!(
+            status_hint(UPSERT_BANK_OPERATION, StatusCode::PAYLOAD_TOO_LARGE),
+            "",
+            "a hint keyed to one operation must not leak into the other"
+        );
+    }
+
+    #[test]
     fn a_refused_exchange_never_condemns_the_episode() {
         let refused = exchange_fault(DeliveryError::Permanent {
             message: "m".to_owned(),
@@ -1083,5 +1124,61 @@ mod tests {
             "{submitted}"
         );
         assert!(submitted.contains("the episode text"), "{submitted}");
+    }
+
+    #[test]
+    fn a_refusal_carries_the_hint_and_never_the_body() {
+        let sentinel = "the captured screen text";
+        let scripted = [
+            ("HTTP/1.1 200 OK", r#"{"status":"not_found"}"#.to_owned()),
+            (
+                "HTTP/1.1 422 Unprocessable Entity",
+                format!(r#"{{"detail":"rejected: {sentinel}"}}"#),
+            ),
+        ];
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("loopback binds");
+        let port = listener
+            .local_addr()
+            .expect("the socket has an address")
+            .port();
+        let server = std::thread::spawn(move || {
+            for (status_line, body) in scripted {
+                let (mut stream, _) = listener.accept().expect("the client connects");
+                let bound = Some(std::time::Duration::from_secs(10));
+                stream.set_read_timeout(bound).expect("the timeout applies");
+                stream
+                    .set_write_timeout(bound)
+                    .expect("the timeout applies");
+                read_request(&mut stream);
+                let response = format!(
+                    "{status_line}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                std::io::Write::write_all(&mut stream, response.as_bytes())
+                    .expect("the response writes");
+            }
+        });
+
+        let client = HindsightClient::new(Credentials {
+            api_url: format!("http://127.0.0.1:{port}"),
+            token: None,
+        })
+        .expect("building the client makes no request");
+        let metadata = RawValue::from_string(r#"{"k":"v"}"#.to_owned()).expect("valid JSON");
+        let item = RetainItem {
+            episode_id: "ep-1",
+            document_id: "doc",
+            content: sentinel,
+            timestamp: Utc::now(),
+            context: "ctx",
+            metadata: &metadata,
+        };
+        let refusal = client.retain("bank", &item).unwrap_err().to_string();
+        assert!(
+            !refusal.contains(sentinel),
+            "a refusal must not echo the server's body: {refusal}"
+        );
+        assert!(refusal.contains("validation policy"), "{refusal}");
+        server.join().expect("the server saw both exchanges");
     }
 }
