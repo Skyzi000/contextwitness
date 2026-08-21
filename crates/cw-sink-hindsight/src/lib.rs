@@ -216,10 +216,12 @@ pub enum CredentialsError {
 
 /// One episode, ready to hand to Hindsight. Maps onto the API's `MemoryItem`.
 pub struct RetainItem<'a> {
-    /// Feeds only the operation id, never the wire: document ids repeat across installs sharing
-    /// a bank, so the id that must not collide is salted with this row's ULID instead.
+    /// Salts the operation id and the wire document id: document ids repeat across installs
+    /// sharing a bank, so every id that must not collide across them carries this row's ULID.
     pub episode_id: &'a str,
-    /// Stable id; re-sending the same one replaces the previous document server-side.
+    /// Stable per window within this install; [`retain`](HindsightClient::retain) suffixes
+    /// [`episode_id`](Self::episode_id) onto it for the wire, so a resubmit replaces this
+    /// install's document and `update_mode` replace can never hand it another install's.
     pub document_id: &'a str,
     pub content: &'a str,
     /// End of the episode window.
@@ -416,12 +418,13 @@ impl HindsightClient {
             return operation_outcome(&status, &operation_id);
         }
         let url = self.endpoint(&["v1", "default", "banks", bank_id, "memories"])?;
+        let document_id = format!("{}-{}", item.document_id, item.episode_id);
         let request = RetainRequest {
             is_async: true,
             operation_id: &operation_id,
             items: [RetainItemWire {
                 content: item.content,
-                document_id: item.document_id,
+                document_id: &document_id,
                 timestamp: item.timestamp.to_rfc3339_opts(SecondsFormat::Secs, true),
                 context: item.context,
                 metadata: item.metadata,
@@ -1210,6 +1213,11 @@ mod tests {
             "{submitted}"
         );
         assert!(submitted.contains("the episode text"), "{submitted}");
+        assert!(
+            submitted.contains(r#""document_id":"doc-ep-1""#),
+            "the wire document id must carry the episode id: bare wall-clock ids repeat across \
+             installs sharing a bank, and replace mode would overwrite the other install: {submitted}"
+        );
     }
 
     #[test]

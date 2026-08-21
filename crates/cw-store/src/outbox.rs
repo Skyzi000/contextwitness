@@ -27,7 +27,6 @@ const COUNT_BY_STATE: &str = "SELECT state, count(*) FROM outbox GROUP BY state 
 pub struct Due {
     /// Primary key of both rows.
     pub episode_id: ulid::Ulid,
-    /// Hindsight `document_id`.
     pub document_id: String,
     /// End of the window, which is the `timestamp` the memory is retained under.
     pub end_at: chrono::DateTime<chrono::Utc>,

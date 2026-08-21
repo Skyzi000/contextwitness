@@ -16,7 +16,8 @@ pub struct Episode {
     pub start_at: chrono::DateTime<chrono::Utc>,
     /// Exclusive end of the window.
     pub end_at: chrono::DateTime<chrono::Utc>,
-    /// Stable Hindsight document id derived from the source, window start, and window length.
+    /// Stable per-window id derived from the source, window start, and window length; the
+    /// delivery layer suffixes the episode id onto it for the wire.
     pub document_id: String,
     /// Rendered delivery text.
     pub content: String,

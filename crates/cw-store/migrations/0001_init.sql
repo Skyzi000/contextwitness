@@ -20,7 +20,7 @@ CREATE TABLE episodes (
   source TEXT NOT NULL,
   start_at TEXT NOT NULL,
   end_at TEXT NOT NULL,
-  document_id TEXT NOT NULL UNIQUE, -- Hindsight document_id; the UNIQUE is what stops a rescan
+  document_id TEXT NOT NULL UNIQUE, -- the window's stable id; the UNIQUE is what stops a rescan
                                     -- from delivering the same window twice
   content TEXT NOT NULL,            -- the delivered body, snapshotted at close so a retry sends
                                     -- the same bytes rather than rebuilding them
