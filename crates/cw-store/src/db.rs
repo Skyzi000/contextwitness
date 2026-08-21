@@ -4,7 +4,10 @@ use crate::StoreError;
 
 /// Every migration, in order. A script's index plus one is the schema version it produces, so
 /// [`SCHEMA_VERSION`] cannot drift away from the list.
-const MIGRATIONS: &[&str] = &[include_str!("../migrations/0001_init.sql")];
+const MIGRATIONS: &[&str] = &[
+    include_str!("../migrations/0001_init.sql"),
+    include_str!("../migrations/0002_outbox_last_note.sql"),
+];
 
 /// The schema version this build understands.
 pub const SCHEMA_VERSION: i32 = MIGRATIONS.len() as i32;
@@ -299,14 +302,119 @@ mod tests {
         let version: i32 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("the initialized schema version should be readable");
-        assert_eq!(version, 1);
+        assert_eq!(version, SCHEMA_VERSION);
 
         drop(conn);
         let conn = open(&path).expect("the initialized database should reopen");
         let version: i32 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("the reopened schema version should be readable");
-        assert_eq!(version, 1);
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    /// The version-1 schema as it shipped, frozen: building the fixture from `MIGRATIONS[0]`
+    /// would track any (forbidden) edit to the applied migration and hide exactly the
+    /// divergence this test exists to catch. Verbatim, comments included — `sqlite_master`
+    /// stores the CREATE text as written, and the equality check below compares that text.
+    const VERSION_ONE_SCHEMA: &str = r#"
+CREATE TABLE observations (
+  id TEXT PRIMARY KEY,              -- ULID
+  source TEXT NOT NULL,
+  observed_at TEXT NOT NULL,        -- RFC 3339, UTC
+  duration_ms INTEGER,
+  schema_version INTEGER NOT NULL,  -- the payload's schema, not this file's
+  payload TEXT NOT NULL             -- JSON
+);
+
+CREATE INDEX idx_obs_time ON observations(observed_at);
+
+CREATE TABLE episodes (
+  id TEXT PRIMARY KEY,              -- ULID
+  source TEXT NOT NULL,
+  start_at TEXT NOT NULL,
+  end_at TEXT NOT NULL,
+  document_id TEXT NOT NULL UNIQUE, -- the window's stable id; the UNIQUE is what stops a rescan
+                                    -- from delivering the same window twice
+  content TEXT NOT NULL,            -- the delivered body, snapshotted at close so a retry sends
+                                    -- the same bytes rather than rebuilding them
+  metadata_json TEXT NOT NULL,      -- the retain metadata, snapshotted for the same reason
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE images (               -- the truth about which image files exist and how big they
+                                    -- are; the observation's payload JSON is never rewritten
+  observation_id TEXT PRIMARY KEY REFERENCES observations(id),
+  relative_path TEXT NOT NULL UNIQUE,
+  byte_size INTEGER NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE outbox (
+  episode_id TEXT PRIMARY KEY REFERENCES episodes(id),
+  state TEXT NOT NULL,              -- pending / delivering / delivered / failed
+  attempts INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at TEXT,
+  last_error TEXT
+);
+
+CREATE TABLE control_events (       -- append-only audit trail: pause, resume, blacklist skips
+  id TEXT PRIMARY KEY,
+  kind TEXT NOT NULL,
+  at TEXT NOT NULL,
+  detail TEXT
+);
+
+CREATE TABLE control_state (        -- current state, and the one that is authoritative;
+                                    -- control_events is history
+  key TEXT PRIMARY KEY,             -- 'pause_until' | 'pause_indefinite' | 'last_tick_at'
+                                    -- | 'last_capture_at' | 'last_delivery_at'
+  value TEXT
+);
+"#;
+
+    fn schema_sql(conn: &rusqlite::Connection) -> Vec<String> {
+        let mut statement = conn
+            .prepare("SELECT sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY name")
+            .expect("the schema should be queryable");
+        let rows = statement
+            .query_map([], |row| row.get(0))
+            .expect("the schema query should run");
+        rows.collect::<Result<_, _>>()
+            .expect("the schema rows should read")
+    }
+
+    #[test]
+    fn an_existing_version_one_database_gains_the_outbox_note_column() {
+        let dir = tempdir().expect("the temporary database directory should be creatable");
+        let path = dir.path().join("db.sqlite3");
+        {
+            let conn = rusqlite::Connection::open(&path).expect("the raw database should open");
+            conn.execute_batch(CONNECTION_SETTINGS)
+                .expect("the connection settings should apply");
+            conn.execute_batch(VERSION_ONE_SCHEMA)
+                .expect("the frozen version-one schema should apply");
+            conn.pragma_update(None, "application_id", APPLICATION_ID)
+                .expect("the ownership mark should write");
+            conn.pragma_update(None, "user_version", 1)
+                .expect("the version should write");
+        }
+
+        let conn = open(&path).expect("the version-one database should migrate forward");
+        let version: i32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("the migrated schema version should be readable");
+        assert_eq!(version, SCHEMA_VERSION);
+        conn.execute("UPDATE outbox SET last_note = NULL", [])
+            .expect("the added column must exist on the migrated database");
+
+        let fresh_dir = tempdir().expect("the temporary database directory should be creatable");
+        let fresh =
+            open(&fresh_dir.path().join("db.sqlite3")).expect("the fresh database should open");
+        assert_eq!(
+            schema_sql(&conn),
+            schema_sql(&fresh),
+            "a migrated version-one file must land on the schema a fresh database gets"
+        );
     }
 
     #[test]

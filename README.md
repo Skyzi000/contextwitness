@@ -61,7 +61,7 @@ ContextWitness records the screen. Know what that means before running it:
 - **`privacy.process_blacklist`** skips capture on *all* monitors while a listed process (matched by executable name, case-insensitively) is in the foreground. When a blacklist is configured and the foreground process cannot be determined, the tick is skipped rather than risked.
 - **Pause** stops the capture loop: from the tray menu, or `contextwitness pause 30m` (no duration means until `resume`).
 - **Retention** prunes stored images by age and total size. Episode text in the local database is kept indefinitely — it is the memory this tool exists to build.
-- **Logs never contain screen text**, and delivery-error messages never echo server response bodies.
+- **Logs** contain no captured content, with one exception: delivery diagnostics quote server-returned error text, which may echo OCR content — and `contextwitness status` shows the newest of those errors. Treat both as sensitive.
 
 ## License
 

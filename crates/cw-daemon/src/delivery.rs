@@ -390,13 +390,16 @@ fn deliver_batch(
                 } else {
                     debug!(document = %entry.document_id, "{note}");
                 }
-                outbox::mark_waiting(conn, entry.episode_id, until, &note)?;
+                outbox::mark_waiting(conn, entry.episode_id, until, outbox::Note::Progress(&note))?;
             }
-            Ok(RetainOutcome::Failed { operation_id }) => {
+            Ok(RetainOutcome::Failed {
+                operation_id,
+                server_report,
+            }) => {
                 let note = format!(
-                    "hindsight failed the retain (operation {operation_id}); the reason and a \
-                     retry are on the server's operations API, and this episode keeps watching \
-                     for that retry"
+                    "hindsight failed the retain (operation {operation_id}); the server said: \
+                     {server_report}; a retry is on the server's operations API, and this \
+                     episode keeps watching for that retry"
                 );
                 let until = now
                     .checked_add_signed(TimeDelta::seconds(FAILED_WATCH_SECONDS))
@@ -408,12 +411,12 @@ fn deliver_batch(
                 } else {
                     debug!(document = %entry.document_id, "{note}");
                 }
-                outbox::mark_waiting(conn, entry.episode_id, until, &note)?;
+                outbox::mark_waiting(conn, entry.episode_id, until, outbox::Note::Error(&note))?;
             }
             Err(error @ DeliveryError::Unsupported { .. }) => {
                 let message = error.to_string();
                 warn!(document = %entry.document_id, "delivery failed: {message}");
-                outbox::mark_waiting(conn, entry.episode_id, now, &message)?;
+                outbox::mark_waiting(conn, entry.episode_id, now, outbox::Note::Error(&message))?;
                 return Ok(Pass::ServerUnsupported);
             }
             Err(error) => {
@@ -423,8 +426,7 @@ fn deliver_batch(
                     in_flight.first_seen.remove(&entry.episode_id);
                     in_flight.failed_warned.remove(&entry.episode_id);
                 }
-                // The sink's message, which keeps the token and the response body — which would
-                // echo screen text back — out of what is stored and logged.
+                // The sink's message: it carries the server's bounded words.
                 let message = error.to_string();
                 let retry = if error.is_retryable() {
                     error

@@ -12,15 +12,24 @@ const SELECT_DUE: &str = "SELECT o.episode_id, o.attempts, e.document_id, e.end_
 const CLAIM: &str = "UPDATE outbox SET state = 'delivering' \
      WHERE episode_id = ?1 AND state IN ('pending', 'failed')";
 const MARK_DELIVERED: &str = "UPDATE outbox \
-     SET state = 'delivered', next_attempt_at = NULL, last_error = NULL WHERE episode_id = ?1";
+     SET state = 'delivered', next_attempt_at = NULL, last_error = NULL, last_note = NULL \
+     WHERE episode_id = ?1";
 const SELECT_ATTEMPTS: &str = "SELECT attempts FROM outbox WHERE episode_id = ?1";
 const MARK_FAILED: &str = "UPDATE outbox \
-     SET state = 'failed', attempts = ?2, next_attempt_at = ?3, last_error = ?4 \
+     SET state = 'failed', attempts = ?2, next_attempt_at = ?3, last_error = ?4, \
+     last_note = NULL WHERE episode_id = ?1";
+const MARK_WAITING_ERROR: &str = "UPDATE outbox \
+     SET state = 'pending', next_attempt_at = ?2, last_error = ?3, last_note = NULL \
      WHERE episode_id = ?1";
-const MARK_WAITING: &str = "UPDATE outbox \
-     SET state = 'pending', next_attempt_at = ?2, last_error = ?3 WHERE episode_id = ?1";
+const MARK_WAITING_PROGRESS: &str = "UPDATE outbox \
+     SET state = 'pending', next_attempt_at = ?2, last_note = ?3, last_error = NULL \
+     WHERE episode_id = ?1";
 const REQUEUE_DELIVERING: &str = "UPDATE outbox SET state = 'pending' WHERE state = 'delivering'";
 const COUNT_BY_STATE: &str = "SELECT state, count(*) FROM outbox GROUP BY state ORDER BY state";
+const NEWEST_ERROR: &str = "SELECT e.document_id, o.state, o.last_error, \
+     (SELECT count(*) FROM outbox WHERE last_error IS NOT NULL) \
+     FROM outbox o JOIN episodes e ON e.id = o.episode_id \
+     WHERE o.last_error IS NOT NULL ORDER BY o.episode_id DESC LIMIT 1";
 
 /// An entry whose turn has come, carrying the episode snapshot the delivery worker sends.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -147,6 +156,18 @@ pub fn mark_failed(
         .map_err(|source| StoreError::Sql { source })
 }
 
+/// What a parked entry has to say for itself. The two kinds land in different columns, and
+/// each write clears the other: a healthy in-flight note must never answer as an error, and a
+/// note superseding an error means that error is resolved.
+#[derive(Debug, Clone, Copy)]
+pub enum Note<'a> {
+    /// Healthy in-flight work — carries the operation id so a wedged operation stays
+    /// addressable from the database.
+    Progress(&'a str),
+    /// A failure the operator should read, e.g. a server-side failed operation under watch.
+    Error(&'a str),
+}
+
 /// Park the entry until `until` with no attempt counted: the caller is coming back to look
 /// again — at in-flight work, or at a server-side failure awaiting its retry — and looking is
 /// not a delivery attempt.
@@ -154,11 +175,15 @@ pub fn mark_waiting(
     conn: &rusqlite::Connection,
     episode_id: ulid::Ulid,
     until: chrono::DateTime<chrono::Utc>,
-    note: &str,
+    note: Note<'_>,
 ) -> Result<(), StoreError> {
+    let (sql, text) = match note {
+        Note::Progress(text) => (MARK_WAITING_PROGRESS, text),
+        Note::Error(text) => (MARK_WAITING_ERROR, text),
+    };
     conn.execute(
-        MARK_WAITING,
-        rusqlite::params![episode_id.to_string(), timestamp::to_sql(until)?, note],
+        sql,
+        rusqlite::params![episode_id.to_string(), timestamp::to_sql(until)?, text],
     )
     .map_err(|source| StoreError::Sql { source })?;
 
@@ -195,6 +220,37 @@ pub fn counts_by_state(conn: &rusqlite::Connection) -> Result<Vec<(String, i64)>
     Ok(counts)
 }
 
+/// The newest window still carrying a delivery error, for `contextwitness status`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewestError {
+    pub document_id: String,
+    pub state: String,
+    pub message: String,
+    /// How many entries currently carry an error, this one counted.
+    pub entries: i64,
+}
+
+/// The table records no error instant, so "newest" is the newest affected window, not
+/// necessarily the last error written.
+pub fn newest_error(conn: &rusqlite::Connection) -> Result<Option<NewestError>, StoreError> {
+    let mut statement = conn
+        .prepare(NEWEST_ERROR)
+        .map_err(|source| StoreError::Sql { source })?;
+    let mut rows = statement
+        .query([])
+        .map_err(|source| StoreError::Sql { source })?;
+    let Some(row) = rows.next().map_err(|source| StoreError::Sql { source })? else {
+        return Ok(None);
+    };
+    let read = |index| row.get(index).map_err(|source| StoreError::Sql { source });
+    Ok(Some(NewestError {
+        document_id: read(0)?,
+        state: read(1)?,
+        message: read(2)?,
+        entries: row.get(3).map_err(|source| StoreError::Sql { source })?,
+    }))
+}
+
 fn from_row(row: &rusqlite::Row<'_>) -> Result<Due, StoreError> {
     let id: String = row.get(0).map_err(|source| StoreError::Sql { source })?;
     decode(row).map_err(|source| StoreError::Encoding { id, source })
@@ -229,8 +285,8 @@ fn decode(row: &rusqlite::Row<'_>) -> Result<Due, Box<dyn std::error::Error + Se
 #[cfg(test)]
 mod tests {
     use super::{
-        Retry, counts_by_state, fetch_due, mark_delivering, mark_failed, mark_waiting,
-        requeue_delivering,
+        Note, Retry, counts_by_state, fetch_due, mark_delivered, mark_delivering, mark_failed,
+        mark_waiting, newest_error, requeue_delivering,
     };
     use crate::{db, episodes};
     use chrono::{TimeZone, Utc};
@@ -270,6 +326,191 @@ mod tests {
     }
 
     #[test]
+    fn the_newest_windows_error_answers_for_the_backlog() {
+        let dir = tempdir().expect("the temporary database directory should be creatable");
+        let mut conn =
+            db::open(&dir.path().join("db.sqlite3")).expect("the fresh database should initialize");
+        let start_at = TimeZone::with_ymd_and_hms(&Utc, 2026, 8, 1, 12, 0, 0)
+            .single()
+            .expect("the test timestamp should be valid");
+        let older = ulid::Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").expect("a valid ulid");
+        let newer = ulid::Ulid::from_string("01BRZ3NDEKTSV4RRFFQ69G5FAV").expect("a valid ulid");
+        episodes::insert_with_outbox(
+            &mut conn,
+            older,
+            &test_episode(start_at, "screen-2026-08-01T12:00:00Z-30m"),
+            start_at,
+        )
+        .expect("the episode should register");
+        episodes::insert_with_outbox(
+            &mut conn,
+            newer,
+            &test_episode(
+                start_at + chrono::TimeDelta::hours(2),
+                "screen-2026-08-01T14:00:00Z-30m",
+            ),
+            start_at,
+        )
+        .expect("the episode should register");
+        assert_eq!(newest_error(&conn).expect("readable"), None);
+
+        mark_failed(
+            &mut conn,
+            older,
+            start_at,
+            Retry::Backoff,
+            "the older refusal",
+        )
+        .expect("the failure should record");
+        mark_failed(
+            &mut conn,
+            newer,
+            start_at,
+            Retry::Backoff,
+            "the newer refusal",
+        )
+        .expect("the failure should record");
+        let error = newest_error(&conn)
+            .expect("readable")
+            .expect("two entries carry errors");
+        assert_eq!(error.document_id, "screen-2026-08-01T14:00:00Z-30m");
+        assert_eq!(error.state, "failed");
+        assert_eq!(error.message, "the newer refusal");
+        assert_eq!(error.entries, 2);
+
+        assert!(mark_delivering(&conn, newer).expect("the claim should work"));
+        mark_delivered(&conn, newer).expect("the delivery should record");
+        let error = newest_error(&conn)
+            .expect("readable")
+            .expect("one entry still carries its error");
+        assert_eq!(error.message, "the older refusal");
+        assert_eq!(
+            error.entries, 1,
+            "a delivered entry must stop answering for errors"
+        );
+
+        let parked = ulid::Ulid::from_string("01CRZ3NDEKTSV4RRFFQ69G5FAV").expect("a valid ulid");
+        episodes::insert_with_outbox(
+            &mut conn,
+            parked,
+            &test_episode(
+                start_at + chrono::TimeDelta::hours(4),
+                "screen-2026-08-01T16:00:00Z-30m",
+            ),
+            start_at,
+        )
+        .expect("the episode should register");
+        mark_waiting(
+            &conn,
+            parked,
+            start_at,
+            Note::Progress("hindsight is still processing the episode (operation op-3)"),
+        )
+        .expect("the wait should record");
+        let error = newest_error(&conn)
+            .expect("readable")
+            .expect("the older error must still answer");
+        assert_eq!(
+            error.message, "the older refusal",
+            "a healthy in-flight note must neither surface as an error nor mask one"
+        );
+        assert_eq!(error.entries, 1, "an in-flight note is not an error");
+
+        mark_waiting(&conn, older, start_at, Note::Progress("accepted at last"))
+            .expect("the wait should record");
+        assert_eq!(
+            newest_error(&conn).expect("readable"),
+            None,
+            "an accepted resubmission resolves the error it answered for"
+        );
+
+        mark_waiting(
+            &conn,
+            parked,
+            start_at,
+            Note::Error("the server said: the extractor gave out"),
+        )
+        .expect("the wait should record");
+        let error = newest_error(&conn)
+            .expect("readable")
+            .expect("a parked server-side failure is an error");
+        assert_eq!(error.state, "pending");
+        assert_eq!(error.message, "the server said: the extractor gave out");
+        assert_eq!(error.entries, 1);
+    }
+
+    fn note_and_error(
+        conn: &rusqlite::Connection,
+        id: ulid::Ulid,
+    ) -> (Option<String>, Option<String>) {
+        conn.query_row(
+            "SELECT last_note, last_error FROM outbox WHERE episode_id = ?1",
+            [id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("the outbox row should read")
+    }
+
+    #[test]
+    fn a_parked_note_never_survives_the_next_mark() {
+        let dir = tempdir().expect("the temporary database directory should be creatable");
+        let mut conn =
+            db::open(&dir.path().join("db.sqlite3")).expect("the fresh database should initialize");
+        let (id, start_at) = registered_episode(&mut conn);
+
+        mark_waiting(
+            &conn,
+            id,
+            start_at,
+            Note::Progress("waiting on operation op-9"),
+        )
+        .expect("the wait should record");
+        mark_waiting(&conn, id, start_at, Note::Error("the server said: no"))
+            .expect("the wait should record");
+        assert_eq!(
+            note_and_error(&conn, id),
+            (None, Some("the server said: no".to_owned())),
+            "a parked error must replace the note, not sit beside it"
+        );
+
+        mark_waiting(
+            &conn,
+            id,
+            start_at,
+            Note::Progress("waiting on operation op-9"),
+        )
+        .expect("the wait should record");
+        mark_failed(
+            &mut conn,
+            id,
+            start_at,
+            Retry::Backoff,
+            "the transport gave out",
+        )
+        .expect("the failure should record");
+        assert_eq!(
+            note_and_error(&conn, id),
+            (None, Some("the transport gave out".to_owned())),
+            "a failure must replace the note, not sit beside it"
+        );
+
+        mark_waiting(
+            &conn,
+            id,
+            start_at,
+            Note::Progress("waiting on operation op-9"),
+        )
+        .expect("the wait should record");
+        assert!(mark_delivering(&conn, id).expect("the claim should work"));
+        mark_delivered(&conn, id).expect("the delivery should record");
+        assert_eq!(
+            note_and_error(&conn, id),
+            (None, None),
+            "a delivered entry must carry neither note nor error"
+        );
+    }
+
+    #[test]
     fn an_earlier_due_instant_outranks_an_older_window() {
         let dir = tempdir().expect("the temporary database directory should be creatable");
         let mut conn =
@@ -290,7 +531,7 @@ mod tests {
             &conn,
             old_id,
             young_due + chrono::TimeDelta::minutes(10),
-            "still processing",
+            Note::Progress("still processing"),
         )
         .expect("the wait should record");
 
@@ -360,7 +601,8 @@ mod tests {
         mark_failed(&mut conn, id, now, Retry::Backoff, "one real failure")
             .expect("the failure should record");
         assert!(mark_delivering(&conn, id).expect("the claim should run"));
-        mark_waiting(&conn, id, until, "still processing").expect("the wait should record");
+        mark_waiting(&conn, id, until, Note::Progress("still processing"))
+            .expect("the wait should record");
         assert_eq!(
             counts_by_state(&conn).expect("the counts should run"),
             [("pending".to_owned(), 1)],

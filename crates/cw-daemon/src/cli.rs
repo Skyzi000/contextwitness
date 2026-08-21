@@ -391,6 +391,10 @@ fn status() -> Result<(), Failure> {
             Err(error) => format!("unreadable: {error}"),
         },
     );
+    field(
+        "last error",
+        &last_error_line(cw_store::outbox::newest_error(&conn)),
+    );
     // The URL only: the token must not be readable over a shoulder.
     field(
         "hindsight",
@@ -816,6 +820,38 @@ fn field(label: &str, value: &str) {
     println!("{label:<STATUS_LABEL$}{value}");
 }
 
+/// The `status` screen's budget for the recorded message: enough for the HTTP status, the
+/// operation id and the start of the server's words on one screen line or two — the log files
+/// and the database keep the whole text.
+const LAST_ERROR_DISPLAY_CHARS: usize = 200;
+
+/// The newest recorded delivery failure — the sink's messages name the HTTP status, the
+/// server's words and the operation id, and this line carries their first
+/// [`LAST_ERROR_DISPLAY_CHARS`] characters.
+fn last_error_line(
+    newest: Result<Option<cw_store::outbox::NewestError>, cw_store::StoreError>,
+) -> String {
+    match newest {
+        Ok(None) => "none recorded".to_owned(),
+        Ok(Some(error)) => {
+            let mut message: String = error
+                .message
+                .chars()
+                .take(LAST_ERROR_DISPLAY_CHARS)
+                .collect();
+            if message.len() < error.message.len() {
+                message.push('…');
+            }
+            let more = match error.entries - 1 {
+                0 => String::new(),
+                others => format!(" (+{others} more entries carry errors)"),
+            };
+            format!("[{} {}] {message}{more}", error.state, error.document_id)
+        }
+        Err(error) => format!("unreadable: {error}"),
+    }
+}
+
 /// A recorded instant as the local wall clock, which is the one whoever reads this screen is
 /// comparing it against.
 fn moment(at: chrono::DateTime<chrono::Utc>) -> String {
@@ -918,8 +954,54 @@ impl Drop for EchoOff {
 
 #[cfg(test)]
 mod tests {
-    use super::{await_answers, closing_report};
+    use super::{await_answers, closing_report, last_error_line};
     use crate::capture::{SaveFailure, Stored};
+    use cw_store::outbox::NewestError;
+
+    #[test]
+    fn the_last_error_line_names_the_failure_and_the_backlog() {
+        assert_eq!(last_error_line(Ok(None)), "none recorded");
+        let newest = NewestError {
+            document_id: "screen-2026-08-01T12:00:00Z-5m".to_owned(),
+            state: "failed".to_owned(),
+            message: "hindsight retain failed with HTTP 422; the server said: no".to_owned(),
+            entries: 1,
+        };
+        assert_eq!(
+            last_error_line(Ok(Some(newest.clone()))),
+            "[failed screen-2026-08-01T12:00:00Z-5m] hindsight retain failed with HTTP 422; \
+             the server said: no"
+        );
+        let crowded = NewestError {
+            entries: 3,
+            ..newest
+        };
+        assert!(
+            last_error_line(Ok(Some(crowded))).ends_with("(+2 more entries carry errors)"),
+            "the backlog behind the newest error must be visible"
+        );
+
+        let flooded = NewestError {
+            document_id: "screen-2026-08-01T12:00:00Z-5m".to_owned(),
+            state: "failed".to_owned(),
+            message: format!(
+                "hindsight retain failed with HTTP 422; the server said: {}",
+                "z".repeat(4000)
+            ),
+            entries: 3,
+        };
+        let line = last_error_line(Ok(Some(flooded)));
+        assert!(
+            line.len() < 300,
+            "the status screen must show a bounded slice, the logs keep the rest: {} bytes",
+            line.len()
+        );
+        assert!(line.contains('…'), "a cut must be visible: {line}");
+        assert!(
+            line.ends_with("(+2 more entries carry errors)"),
+            "the backlog count must survive the cut: {line}"
+        );
+    }
 
     fn stored_frame(monitor_id: &str) -> Stored {
         Stored {

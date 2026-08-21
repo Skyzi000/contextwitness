@@ -27,6 +27,10 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// not inherit the upload-sized [`HTTP_TIMEOUT`]: a server that stalls mid-exchange would hold
 /// the single delivery thread for 600 s, and at the bank upsert that gates every delivery.
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
+/// How much of a server reply travels into an error message: the server's stated reason is the
+/// diagnosis and must reach the operator (owner ruling 2026-08-22), bounded so a refusal that
+/// quotes the submission back cannot flood a log line.
+const BODY_EXCERPT_BYTES: usize = 2048;
 
 /// Hindsight connection details, resolved from `~/.hindsight/contextwitness.json` or the
 /// environment. The token is optional, as it is for Hindsight's own integrations: a server that
@@ -255,6 +259,8 @@ struct RetainAccepted {
 #[derive(serde::Deserialize)]
 struct OperationWire {
     status: String,
+    /// The server's stated reason when the operation failed.
+    error_message: Option<String>,
 }
 
 /// `Processing` and `Failed` ask the caller to try [`retain`](HindsightClient::retain) again
@@ -271,6 +277,8 @@ pub enum RetainOutcome {
     /// condemned entry would never poll again, making that documented recovery invisible here.
     Failed {
         operation_id: String,
+        /// A bounded excerpt of the operation-status body — the server's stated reason.
+        server_report: String,
     },
 }
 
@@ -413,9 +421,9 @@ impl HindsightClient {
     ) -> Result<RetainOutcome, DeliveryError> {
         vet_bank_id(bank_id)?;
         let operation_id = retain_operation_id(bank_id, item.episode_id);
-        let status = self.operation_status(bank_id, &operation_id)?;
+        let (status, report) = self.operation_status(bank_id, &operation_id)?;
         if status != OPERATION_ABSENT {
-            return operation_outcome(&status, &operation_id);
+            return operation_outcome(&status, &operation_id, &report);
         }
         let url = self.endpoint(&["v1", "default", "banks", bank_id, "memories"])?;
         let document_id = format!("{}-{}", item.document_id, item.episode_id);
@@ -445,7 +453,14 @@ impl HindsightClient {
         Ok(RetainOutcome::Processing { operation_id })
     }
 
-    fn operation_status(&self, bank_id: &str, operation_id: &str) -> Result<String, DeliveryError> {
+    /// The operation's status, and the server's account of it — its `error_message` when it
+    /// states one, the whole status body otherwise, so a failing operation never reports
+    /// nothing.
+    fn operation_status(
+        &self,
+        bank_id: &str,
+        operation_id: &str,
+    ) -> Result<(String, String), DeliveryError> {
         let url = self.endpoint(&[
             "v1",
             "default",
@@ -454,15 +469,15 @@ impl HindsightClient {
             "operations",
             operation_id,
         ])?;
-        let operation: OperationWire = parse(
-            accept(
-                self.send(self.http.get(url).timeout(CONTROL_TIMEOUT))?,
-                POLL_OPERATION,
-            )
-            .map_err(exchange_fault)?,
+        let response = accept(
+            self.send(self.http.get(url).timeout(CONTROL_TIMEOUT))?,
             POLL_OPERATION,
-        )?;
-        Ok(operation.status)
+        )
+        .map_err(exchange_fault)?;
+        let text = read_text(response, POLL_OPERATION)?;
+        let operation: OperationWire = parse_text(&text, POLL_OPERATION)?;
+        let report = operation.error_message.unwrap_or(text);
+        Ok((operation.status, report))
     }
 
     /// The Authorization header travels only when there is a token, as in Hindsight's own
@@ -535,28 +550,108 @@ fn accept(response: Response, operation: &str) -> Result<Response, DeliveryError
     if status.is_success() {
         return Ok(response);
     }
-    // The body stays out: Hindsight echoes rejected input back, and that is captured screen text.
-    let message = format!(
-        "hindsight {operation} failed with HTTP {status}{}",
-        status_hint(operation, status)
-    );
+    let retry_after = retry_after(&response);
+    let body = match read_prefix(response) {
+        Ok(text) => excerpt(&text),
+        Err(error) => format!("(the body could not be read: {error})"),
+    };
+    let message =
+        format!("hindsight {operation} failed with HTTP {status}; the server said: {body}");
     if retryable_status(status) {
         Err(DeliveryError::Retryable {
             message,
-            retry_after: retry_after(&response),
+            retry_after,
         })
     } else {
         Err(DeliveryError::Permanent { message })
     }
 }
 
+/// At most [`BODY_EXCERPT_BYTES`] and one spare byte — the spare is how [`excerpt`] knows there
+/// was more — so a misbehaving proxy's error page is never buffered whole.
+fn read_prefix(response: Response) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut prefix = Vec::new();
+    response
+        .take(BODY_EXCERPT_BYTES as u64 + 1)
+        .read_to_end(&mut prefix)?;
+    Ok(String::from_utf8_lossy(&prefix).into_owned())
+}
+
+/// The server's words, bounded and printable. A refusal can quote the submitted input back —
+/// for a retain that is a whole episode — so the excerpt keeps a megabyte out of every log
+/// line while the actual reason still reaches the operator; control characters are escaped so
+/// one log line stays one line.
+fn excerpt(text: &str) -> String {
+    // Decided before the trim: `read_prefix` stops one byte past the bound, and a trimmed
+    // leading newline must not erase the marker that spare byte carries.
+    let mut truncated = text.len() > BODY_EXCERPT_BYTES;
+    let text = text.trim();
+    if text.is_empty() {
+        return "(empty body)".to_owned();
+    }
+    // The budget bounds the output, escapes included: a control character spends its escaped
+    // width, so a body of nothing but controls cannot ride a 2048-byte allowance into a
+    // several-fold longer log line.
+    let mut bounded = String::with_capacity(text.len().min(BODY_EXCERPT_BYTES));
+    for character in text.chars() {
+        let start = bounded.len();
+        if character.is_control() {
+            bounded.extend(character.escape_default());
+        } else {
+            bounded.push(character);
+        }
+        if bounded.len() > BODY_EXCERPT_BYTES {
+            bounded.truncate(start);
+            truncated = true;
+            break;
+        }
+    }
+    // No byte count in the marker: under the capped read the total is unknown here.
+    if truncated {
+        bounded.push_str(" [truncated]");
+    }
+    bounded
+}
+
 fn parse<T: serde::de::DeserializeOwned>(
     response: Response,
     operation: &str,
 ) -> Result<T, DeliveryError> {
-    // The decode error stays out of the message: serde spells it with fragments of the body.
-    response.json().map_err(|_| DeliveryError::Retryable {
-        message: format!("hindsight {operation} answered an unreadable body"),
+    parse_text(&read_text(response, operation)?, operation)
+}
+
+/// Bounds even the success-path read: every parsed body is a small control answer, so a
+/// megabyte already means a broken server — the cap turns it into a decode error instead of
+/// an unbounded buffer on the single delivery thread.
+const PARSED_BODY_CAP: u64 = 1024 * 1024;
+
+fn read_text(response: Response, operation: &str) -> Result<String, DeliveryError> {
+    use std::io::Read;
+    let mut body = Vec::new();
+    response
+        .take(PARSED_BODY_CAP)
+        .read_to_end(&mut body)
+        .map_err(|error| DeliveryError::Retryable {
+            message: format!("hindsight {operation} answered an unreadable body: {error}"),
+            retry_after: None,
+        })?;
+    Ok(String::from_utf8_lossy(&body).into_owned())
+}
+
+fn parse_text<T: serde::de::DeserializeOwned>(
+    text: &str,
+    operation: &str,
+) -> Result<T, DeliveryError> {
+    serde_json::from_str(text).map_err(|error| DeliveryError::Retryable {
+        // The decode error itself is bounded too: serde embeds the whole body in a struct-level
+        // type mismatch (`Unexpected::Str`), which on a 2xx answer is capped only by
+        // `PARSED_BODY_CAP`.
+        message: format!(
+            "hindsight {operation} answered an undecodable body: {}; the server said: {}",
+            excerpt(&error.to_string()),
+            excerpt(text)
+        ),
         retry_after: None,
     })
 }
@@ -590,11 +685,16 @@ fn vet_operation_echo(sent: &str, answered: Option<&str>) -> Result<(), Delivery
 /// [`HindsightClient::retain`] consumes itself, as the cue to submit.
 const OPERATION_ABSENT: &str = "not_found";
 
-/// Maps the server's operation status; the incoming value never travels into a message, and
-/// [`OPERATION_ABSENT`] never arrives — [`HindsightClient::retain`] consumes it as the submit
-/// cue. The operation id rides every non-completed outcome — the operator's only handle on the
-/// server's operations API, and derived from nothing but the bank and episode ids.
-fn operation_outcome(status: &str, operation_id: &str) -> Result<RetainOutcome, DeliveryError> {
+/// Maps the server's operation status; [`OPERATION_ABSENT`] never arrives —
+/// [`HindsightClient::retain`] consumes it as the submit cue. The operation id rides every
+/// non-completed outcome — the operator's handle on the server's operations API, derived from
+/// nothing but the bank and episode ids — and `report`, the status body, rides the failing ones
+/// as the server's own account of what happened.
+fn operation_outcome(
+    status: &str,
+    operation_id: &str,
+    report: &str,
+) -> Result<RetainOutcome, DeliveryError> {
     match status {
         "completed" => Ok(RetainOutcome::Delivered),
         "pending" | "processing" => Ok(RetainOutcome::Processing {
@@ -602,15 +702,20 @@ fn operation_outcome(status: &str, operation_id: &str) -> Result<RetainOutcome, 
         }),
         "failed" => Ok(RetainOutcome::Failed {
             operation_id: operation_id.to_owned(),
+            server_report: excerpt(report),
         }),
         "cancelled" => Err(DeliveryError::Permanent {
             message: format!(
-                "hindsight retain failed: operation {operation_id} was cancelled on the server"
+                "hindsight retain failed: operation {operation_id} was cancelled on the server; \
+                 the server said: {}",
+                excerpt(report)
             ),
         }),
         _ => Err(DeliveryError::Retryable {
             message: format!(
-                "hindsight retain failed: operation {operation_id} answered an unrecognized status"
+                "hindsight retain failed: operation {operation_id} answered the unrecognized \
+                 status \"{}\"",
+                excerpt(status)
             ),
             retry_after: None,
         }),
@@ -661,33 +766,6 @@ fn retryable_status(status: StatusCode) -> bool {
                 | StatusCode::BAD_REQUEST
                 | StatusCode::PAYLOAD_TOO_LARGE
         )
-}
-
-fn status_hint(operation: &str, status: StatusCode) -> &'static str {
-    match (operation, status) {
-        (UPSERT_BANK_OPERATION, StatusCode::NOT_FOUND) => {
-            " (a missing bank cannot cause this, so the base URL is likely wrong)"
-        }
-        (UPSERT_BANK_OPERATION, StatusCode::UNPROCESSABLE_ENTITY) => {
-            " (the server rejected this client's fixed bank settings as invalid)"
-        }
-        (RETAIN_OPERATION, StatusCode::NOT_FOUND) => {
-            " (a missing bank cannot cause this; the memories route itself was refused)"
-        }
-        (POLL_OPERATION, StatusCode::NOT_FOUND) => {
-            " (an unknown operation answers not_found in the body, so the operations route \
-             itself was refused)"
-        }
-        (RETAIN_OPERATION, StatusCode::PAYLOAD_TOO_LARGE) => {
-            " (the body exceeds a proxy or server body-size limit; raising the limit or \
-             shrinking the episode is needed)"
-        }
-        (RETAIN_OPERATION, StatusCode::UNPROCESSABLE_ENTITY) => {
-            " (the server refused the submission; check its validation policy and the \
-             client/server version pairing)"
-        }
-        _ => "",
-    }
 }
 
 fn retry_after(response: &Response) -> Option<Duration> {
@@ -961,7 +1039,8 @@ mod tests {
 
     #[test]
     fn the_operation_status_decides_the_episode() {
-        let outcome = |status| operation_outcome(status, "the-operation-id");
+        let report = r#"{"status":"whatever","error":"the extractor's own account"}"#;
+        let outcome = |status| operation_outcome(status, "the-operation-id", report);
         assert_eq!(outcome("completed").unwrap(), RetainOutcome::Delivered);
         for waiting in ["pending", "processing"] {
             assert_eq!(
@@ -975,16 +1054,23 @@ mod tests {
         assert_eq!(
             outcome("failed").unwrap(),
             RetainOutcome::Failed {
-                operation_id: "the-operation-id".to_owned()
+                operation_id: "the-operation-id".to_owned(),
+                server_report: report.to_owned(),
             },
-            "a failed operation must stay watchable: the server's /retry has no local effect \
-             on an entry that never polls again"
+            "a failed operation must stay watchable and carry the server's stated reason: the \
+             operations body is the only place that reason exists"
         );
         let cancelled = outcome("cancelled").unwrap_err();
         assert!(!cancelled.is_retryable());
         assert!(
             cancelled.to_string().contains("the-operation-id"),
             "the operator's server-side handle must be named: {cancelled}"
+        );
+        assert!(
+            cancelled
+                .to_string()
+                .contains("the extractor's own account"),
+            "the server's account must ride the condemnation: {cancelled}"
         );
         for unhandled in [OPERATION_ABSENT, "someday-maybe"] {
             let unknown = outcome(unhandled).unwrap_err();
@@ -993,50 +1079,39 @@ mod tests {
                 "an unmapped status must stay retryable, never a verdict: {unhandled}"
             );
             assert!(
-                !unknown.to_string().contains("someday-maybe"),
-                "{unhandled}"
+                unknown.to_string().contains(unhandled),
+                "the unrecognized value is the diagnosis: {unknown}"
             );
             assert!(
                 unknown.to_string().contains("the-operation-id"),
                 "{unhandled}"
             );
         }
+        let flooded = outcome(&"z".repeat(BODY_EXCERPT_BYTES * 4)).unwrap_err();
+        assert!(
+            flooded.to_string().len() < BODY_EXCERPT_BYTES * 2,
+            "an unrecognized status is server-controlled text and must stay bounded: \
+             {} bytes",
+            flooded.to_string().len()
+        );
+        assert!(flooded.to_string().contains("[truncated]"), "{flooded}");
     }
 
     #[test]
-    fn the_hints_survive_for_the_operator() {
-        for (operation, status, fragment) in [
-            (UPSERT_BANK_OPERATION, StatusCode::NOT_FOUND, "base URL"),
-            (
-                UPSERT_BANK_OPERATION,
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "fixed bank settings",
-            ),
-            (RETAIN_OPERATION, StatusCode::NOT_FOUND, "route"),
-            (POLL_OPERATION, StatusCode::NOT_FOUND, "operations route"),
-            (
-                RETAIN_OPERATION,
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "body-size limit",
-            ),
-            (
-                RETAIN_OPERATION,
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "validation policy",
-            ),
-        ] {
-            let hint = status_hint(operation, status);
-            assert!(hint.contains(fragment), "{operation} {status}: {hint}");
-        }
-        assert_eq!(
-            status_hint(RETAIN_OPERATION, StatusCode::INTERNAL_SERVER_ERROR),
-            ""
+    fn an_undecodable_body_is_reported_in_bounded_words() {
+        let flood = format!("\"{}\"", "z".repeat(BODY_EXCERPT_BYTES * 4));
+        let message = match parse_text::<OperationWire>(&flood, POLL_OPERATION) {
+            Ok(_) => panic!("a bare string body must not decode as an operation"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            message.len() < BODY_EXCERPT_BYTES * 3,
+            "the decode error embeds the whole body on a struct-level mismatch and must be \
+             bounded like the body itself: {} bytes",
+            message.len()
         );
-        assert_eq!(
-            status_hint(UPSERT_BANK_OPERATION, StatusCode::PAYLOAD_TOO_LARGE),
-            "",
-            "a hint keyed to one operation must not leak into the other"
-        );
+        assert!(message.contains("undecodable"), "{message}");
+        assert!(message.contains("[truncated]"), "{message}");
     }
 
     #[test]
@@ -1127,7 +1202,7 @@ mod tests {
             r#"{"status":"not_found"}"#.to_owned(),
             format!(r#"{{"operation_id":"{operation_id}"}}"#),
             r#"{"status":"processing"}"#.to_owned(),
-            r#"{"status":"failed"}"#.to_owned(),
+            r#"{"status":"failed","error_message":"the extractor gave out"}"#.to_owned(),
             r#"{"status":"completed"}"#.to_owned(),
         ];
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("loopback binds");
@@ -1180,8 +1255,10 @@ mod tests {
         assert_eq!(
             client.retain("bank", &item).unwrap(),
             RetainOutcome::Failed {
-                operation_id: operation_id.clone()
-            }
+                operation_id: operation_id.clone(),
+                server_report: "the extractor gave out".to_owned(),
+            },
+            "the server's error_message is the reason the operator reads"
         );
         assert_eq!(
             client.retain("bank", &item).unwrap(),
@@ -1221,13 +1298,40 @@ mod tests {
     }
 
     #[test]
-    fn a_refusal_carries_the_hint_and_never_the_body() {
-        let sentinel = "the captured screen text";
+    fn the_excerpt_bounds_the_body_on_a_character_boundary() {
+        let text = "あ".repeat(BODY_EXCERPT_BYTES);
+        let bounded = excerpt(&text);
+        assert!(bounded.len() < text.len(), "{} bytes", bounded.len());
+        assert!(bounded.ends_with(" [truncated]"), "{bounded}");
+        assert!(
+            excerpt(&format!("\n{}", "z".repeat(BODY_EXCERPT_BYTES))).ends_with(" [truncated]"),
+            "a trimmed leading newline must not erase the marker"
+        );
+        let flooded = excerpt(&"\u{1f}".repeat(BODY_EXCERPT_BYTES));
+        assert!(
+            flooded.len() <= BODY_EXCERPT_BYTES + " [truncated]".len(),
+            "escaping must spend the budget, not multiply it: {} bytes",
+            flooded.len()
+        );
+        assert!(flooded.ends_with(" [truncated]"), "{flooded}");
+        assert_eq!(excerpt("  "), "(empty body)");
+        assert_eq!(excerpt("short"), "short");
+        assert_eq!(
+            excerpt("a\r\nb"),
+            "a\\r\\nb",
+            "control characters must not break the log line they ride"
+        );
+    }
+
+    #[test]
+    fn a_refusal_carries_the_servers_bounded_words() {
+        let sentinel = "the server's stated reason";
+        let filler = "z".repeat(BODY_EXCERPT_BYTES);
         let scripted = [
             ("HTTP/1.1 200 OK", r#"{"status":"not_found"}"#.to_owned()),
             (
                 "HTTP/1.1 422 Unprocessable Entity",
-                format!(r#"{{"detail":"rejected: {sentinel}"}}"#),
+                format!(r#"{{"detail":"rejected: {sentinel}","echo":"{filler}THE-TAIL-MARKER"}}"#),
             ),
         ];
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("loopback binds");
@@ -1262,17 +1366,25 @@ mod tests {
         let item = RetainItem {
             episode_id: "ep-1",
             document_id: "doc",
-            content: sentinel,
+            content: "the episode text",
             timestamp: Utc::now(),
             context: "ctx",
             metadata: &metadata,
         };
         let refusal = client.retain("bank", &item).unwrap_err().to_string();
         assert!(
-            !refusal.contains(sentinel),
-            "a refusal must not echo the server's body: {refusal}"
+            refusal.contains(sentinel),
+            "the server's stated reason is the diagnosis and must reach the operator: {refusal}"
         );
-        assert!(refusal.contains("validation policy"), "{refusal}");
+        assert!(
+            refusal.contains("HTTP 422"),
+            "the status still names the refusal class: {refusal}"
+        );
+        assert!(
+            !refusal.contains("THE-TAIL-MARKER"),
+            "the excerpt bound must hold: {refusal}"
+        );
+        assert!(refusal.contains("[truncated"), "{refusal}");
         server.join().expect("the server saw both exchanges");
     }
 }
