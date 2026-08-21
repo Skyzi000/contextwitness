@@ -165,7 +165,10 @@ impl CaptureEngine {
             let target = if self.force_fallback {
                 Backend::Fallback
             } else {
-                state.target(now)
+                match state.target(now) {
+                    Some(target) => target,
+                    None => continue,
+                }
             };
             let mut result = match target {
                 Backend::Primary => self.dxgi.capture(&monitor.id),
@@ -173,7 +176,7 @@ impl CaptureEngine {
             };
             if !self.force_fallback {
                 let switched = state.record(target, outcome(&result), now);
-                if target == Backend::Primary && state.target(now) == Backend::Fallback {
+                if target == Backend::Primary && state.target(now) == Some(Backend::Fallback) {
                     result = self.wgc.capture(&monitor.id);
                     state.record(Backend::Fallback, outcome(&result), now);
                 }
@@ -238,7 +241,8 @@ impl CaptureEngine {
 /// can report that there was nothing to capture.
 fn outcome(result: &Result<Frame, CaptureError>) -> Outcome {
     match result {
-        Ok(_) | Err(CaptureError::Recoverable(Recoverable::NoNewFrame)) => Outcome::Answered,
+        Ok(_) => Outcome::Delivered,
+        Err(CaptureError::Recoverable(Recoverable::NoNewFrame)) => Outcome::Answered,
         Err(_) => Outcome::Failed,
     }
 }
