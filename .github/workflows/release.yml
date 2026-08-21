@@ -13,7 +13,7 @@ jobs:
     env:
       STAGE: contextwitness-${{ github.ref_name }}-windows-x86_64
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Check the tag matches the crate version
         shell: pwsh
         # The tag name is untrusted input: it reaches the script as an environment
@@ -23,10 +23,11 @@ jobs:
           if ("v$version" -ne $env:GITHUB_REF_NAME) {
             throw "tag $env:GITHUB_REF_NAME does not match Cargo.toml version $version"
           }
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master 2026-08-22
         with:
+          toolchain: stable
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       # Tag pushes do not trigger ci.yml, so the tagged tree is verified here before it is published.
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
@@ -41,7 +42,7 @@ jobs:
           New-Item -ItemType Directory $env:STAGE | Out-Null
           Copy-Item target/release/contextwitness.exe, README.md, LICENSE $env:STAGE
           Compress-Archive -Path $env:STAGE -DestinationPath "$env:STAGE.zip"
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           files: ${{ env.STAGE }}.zip
           fail_on_unmatched_files: true
