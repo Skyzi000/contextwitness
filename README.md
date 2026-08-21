@@ -18,7 +18,7 @@ Requires Windows 11 24H2 (build 26100) or later. Building requires the MSVC tool
 Either:
 
 - **Portable ZIP** — download `contextwitness-vX.Y.Z-windows-x86_64.zip` from [Releases](https://github.com/Skyzi000/contextwitness/releases), unzip anywhere, and run `contextwitness.exe` from a terminal.
-- **From source** — `cargo install --git https://github.com/Skyzi000/contextwitness` (needs the Rust MSVC toolchain).
+- **From source** — `cargo install --git https://github.com/Skyzi000/contextwitness cw-daemon` (needs the Rust MSVC toolchain).
 
 The binaries are unsigned open-source builds, so Windows SmartScreen may warn the first time you run one.
 
