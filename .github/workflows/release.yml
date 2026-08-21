@@ -16,10 +16,12 @@ jobs:
       - uses: actions/checkout@v5
       - name: Check the tag matches the crate version
         shell: pwsh
+        # The tag name is untrusted input: it reaches the script as an environment
+        # variable, never by expansion into the script source.
         run: |
           $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
-          if ("v$version" -ne "${{ github.ref_name }}") {
-            throw "tag ${{ github.ref_name }} does not match Cargo.toml version $version"
+          if ("v$version" -ne $env:GITHUB_REF_NAME) {
+            throw "tag $env:GITHUB_REF_NAME does not match Cargo.toml version $version"
           }
       - uses: dtolnay/rust-toolchain@stable
         with:
