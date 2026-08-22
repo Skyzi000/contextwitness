@@ -418,6 +418,76 @@ CREATE TABLE control_state (        -- current state, and the one that is author
     }
 
     #[test]
+    fn the_migration_clears_only_the_version_one_progress_note() {
+        let dir = tempdir().expect("the temporary database directory should be creatable");
+        let path = dir.path().join("db.sqlite3");
+        {
+            let conn = rusqlite::Connection::open(&path).expect("the raw database should open");
+            conn.execute_batch(CONNECTION_SETTINGS)
+                .expect("the connection settings should apply");
+            conn.execute_batch(VERSION_ONE_SCHEMA)
+                .expect("the frozen version-one schema should apply");
+            conn.execute_batch(
+                "INSERT INTO episodes (id, source, start_at, end_at, document_id, content, metadata_json, created_at) VALUES \
+                 ('01ARZ3NDEKTSV4RRFFQ69G5FAV', 'screen', '2026-08-01T12:00:00.000000000Z', '2026-08-01T12:30:00.000000000Z', 'screen-2026-08-01T12:00:00Z-30m', 'body', '{}', '2026-08-01T12:30:00.000000000Z'), \
+                 ('01BRZ3NDEKTSV4RRFFQ69G5FAV', 'screen', '2026-08-01T13:00:00.000000000Z', '2026-08-01T13:30:00.000000000Z', 'screen-2026-08-01T13:00:00Z-30m', 'body', '{}', '2026-08-01T13:30:00.000000000Z'), \
+                 ('01CRZ3NDEKTSV4RRFFQ69G5FAV', 'screen', '2026-08-01T14:00:00.000000000Z', '2026-08-01T14:30:00.000000000Z', 'screen-2026-08-01T14:00:00Z-30m', 'body', '{}', '2026-08-01T14:30:00.000000000Z'), \
+                 ('01DRZ3NDEKTSV4RRFFQ69G5FAV', 'screen', '2026-08-01T15:00:00.000000000Z', '2026-08-01T15:30:00.000000000Z', 'screen-2026-08-01T15:00:00Z-30m', 'body', '{}', '2026-08-01T15:30:00.000000000Z'); \
+                 INSERT INTO outbox (episode_id, state, attempts, next_attempt_at, last_error) VALUES \
+                 ('01ARZ3NDEKTSV4RRFFQ69G5FAV', 'pending', 1, '2026-08-01T13:00:00.000000000Z', 'hindsight is still processing the episode (operation op-1)'), \
+                 ('01BRZ3NDEKTSV4RRFFQ69G5FAV', 'pending', 1, '2026-08-01T14:00:00.000000000Z', 'hindsight failed the retain (operation op-2); the reason and a retry are on the server''s operations API, and this episode keeps watching for that retry'), \
+                 ('01CRZ3NDEKTSV4RRFFQ69G5FAV', 'failed', 1, NULL, 'hindsight retain failed with HTTP 500'), \
+                 ('01DRZ3NDEKTSV4RRFFQ69G5FAV', 'delivering', 1, NULL, 'hindsight is still processing the episode (operation op-4)');",
+            )
+            .expect("the version-one rows should seed");
+            conn.pragma_update(None, "application_id", APPLICATION_ID)
+                .expect("the ownership mark should write");
+            conn.pragma_update(None, "user_version", 1)
+                .expect("the version should write");
+        }
+
+        let conn = open(&path).expect("the version-one database should migrate forward");
+        let last_error = |id: &str| -> Option<String> {
+            conn.query_row(
+                "SELECT last_error FROM outbox WHERE episode_id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .expect("the seeded row should read")
+        };
+        assert_eq!(
+            last_error("01ARZ3NDEKTSV4RRFFQ69G5FAV"),
+            None,
+            "a version-one in-flight note must not survive as an error"
+        );
+        assert_eq!(
+            last_error("01DRZ3NDEKTSV4RRFFQ69G5FAV"),
+            None,
+            "a note parked mid-delivery must not survive as an error"
+        );
+        assert_eq!(
+            last_error("01BRZ3NDEKTSV4RRFFQ69G5FAV").as_deref(),
+            Some(
+                "hindsight failed the retain (operation op-2); the reason and a retry are on \
+                 the server's operations API, and this episode keeps watching for that retry"
+            ),
+            "a real failure must survive the migration"
+        );
+        assert_eq!(
+            last_error("01CRZ3NDEKTSV4RRFFQ69G5FAV").as_deref(),
+            Some("hindsight retain failed with HTTP 500"),
+            "a real failure must survive the migration"
+        );
+        let error = crate::outbox::newest_error(&conn)
+            .expect("readable")
+            .expect("two entries still carry errors");
+        assert_eq!(
+            error.entries, 2,
+            "cleared notes must leave the error count as well as the headline"
+        );
+    }
+
+    #[test]
     fn open_applies_the_sqlite_contract() {
         let dir = tempdir().expect("the temporary database directory should be creatable");
         let path = dir.path().join("db.sqlite3");
