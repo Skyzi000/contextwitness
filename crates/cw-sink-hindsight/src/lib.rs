@@ -182,7 +182,7 @@ impl fmt::Debug for Credentials {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("Credentials")
-            .field("api_url", &self.api_url)
+            .field("api_url", &display_api_url(&self.api_url))
             .field("token", &self.token.as_ref().map(|_| "<redacted>"))
             .finish()
     }
@@ -315,11 +315,12 @@ pub fn parse_api_url(text: &str) -> Result<Url, InvalidApiUrl> {
     }
     let mut url =
         Url::parse(text).map_err(|error| InvalidApiUrl(format!("not an absolute URL: {error}")))?;
+    // The scheme is not named back: a schemeless spelling like `alice:secret@host/api` parses
+    // with the username slot as its scheme, and these messages reach screens and logs.
     if !matches!(url.scheme(), "http" | "https") {
-        return Err(InvalidApiUrl(format!(
-            "the scheme is {}, not http or https",
-            url.scheme()
-        )));
+        return Err(InvalidApiUrl(
+            "the URL must start with http:// or https://".to_owned(),
+        ));
     }
     if url.host_str().is_none() {
         return Err(InvalidApiUrl("the URL names no host".to_owned()));
@@ -334,6 +335,22 @@ pub fn parse_api_url(text: &str) -> Result<Url, InvalidApiUrl> {
         url.set_path(&trimmed);
     }
     Ok(url)
+}
+
+/// The URL as logs and `status` may print it: parsed and stripped of any userinfo. That a
+/// credential spelled into the URL never reaches a screen is a rule about the call sites —
+/// every printed URL must route through here rather than the raw text.
+pub fn display_api_url(text: &str) -> String {
+    match parse_api_url(text) {
+        Ok(mut url) => {
+            url.set_username("")
+                .expect("parse_api_url admits only hosted http/https URLs");
+            url.set_password(None)
+                .expect("parse_api_url admits only hosted http/https URLs");
+            String::from(url)
+        }
+        Err(error) => format!("unusable: {error}"),
+    }
 }
 
 /// Refuse what the URL grammar drops rather than encodes: appended as a path segment, `.` and
@@ -480,8 +497,10 @@ impl HindsightClient {
         Ok((operation.status, report))
     }
 
-    /// The Authorization header travels only when there is a token, as in Hindsight's own
-    /// integrations.
+    /// Adds the Bearer form when a token is configured, as in Hindsight's own integrations. Not
+    /// the only way an Authorization header travels: reqwest turns URL userinfo into a Basic
+    /// header on its own, and appends rather than replaces, so a URL spelling credentials beside
+    /// a configured token sends both.
     fn authorize(&self, request: RequestBuilder) -> RequestBuilder {
         match &self.token {
             Some(token) => request.bearer_auth(token),
@@ -498,7 +517,7 @@ impl fmt::Debug for HindsightClient {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("HindsightClient")
-            .field("base_url", &self.base_url)
+            .field("base_url", &display_api_url(self.base_url.as_str()))
             .field("token", &self.token.as_ref().map(|_| "<redacted>"))
             .finish()
     }
@@ -714,8 +733,9 @@ fn operation_outcome(
         _ => Err(DeliveryError::Retryable {
             message: format!(
                 "hindsight retain failed: operation {operation_id} answered the unrecognized \
-                 status \"{}\"",
-                excerpt(status)
+                 status \"{}\"; the server said: {}",
+                excerpt(status),
+                excerpt(report)
             ),
             retry_after: None,
         }),
@@ -790,17 +810,19 @@ mod tests {
     #[test]
     fn debug_output_redacts_the_token() {
         let credentials = Credentials {
-            api_url: "http://localhost:0".to_owned(),
+            api_url: "http://alice:sesame@localhost:0".to_owned(),
             token: Some("the-secret-token".to_owned()),
         };
         let printed = format!("{credentials:?}");
         assert!(!printed.contains("the-secret-token"), "{printed}");
+        assert!(!printed.contains("sesame"), "{printed}");
         assert!(printed.contains("<redacted>"), "{printed}");
 
         let client =
             HindsightClient::new(credentials).expect("building the client makes no request");
         let printed = format!("{client:?}");
         assert!(!printed.contains("the-secret-token"), "{printed}");
+        assert!(!printed.contains("sesame"), "{printed}");
         assert!(printed.contains("<redacted>"), "{printed}");
     }
 
@@ -895,7 +917,7 @@ mod tests {
     }
 
     #[test]
-    fn the_authorization_header_travels_only_with_a_token() {
+    fn a_configured_token_travels_as_bearer() {
         let header = |token: Option<String>| {
             let client = HindsightClient::new(Credentials {
                 api_url: "http://localhost:0".to_owned(),
@@ -915,6 +937,32 @@ mod tests {
         assert_eq!(
             sent.to_str().expect("the header is ASCII"),
             "Bearer the-secret-token"
+        );
+
+        let client = HindsightClient::new(Credentials {
+            api_url: "http://alice:sesame@localhost:0".to_owned(),
+            token: Some("the-secret-token".to_owned()),
+        })
+        .expect("building the client makes no request");
+        let request = client
+            .authorize(client.http.get(client.base_url.as_str()))
+            .build()
+            .expect("a plain GET builds");
+        let values: Vec<_> = request
+            .headers()
+            .get_all(reqwest::header::AUTHORIZATION)
+            .iter()
+            .map(|value| value.to_str().expect("the header is ASCII").to_owned())
+            .collect();
+        assert_eq!(
+            values,
+            ["Basic YWxpY2U6c2VzYW1l", "Bearer the-secret-token"],
+            "reqwest turns URL userinfo into a Basic header beside the Bearer"
+        );
+        assert_eq!(
+            request.url().as_str(),
+            "http://localhost:0/",
+            "the URL a transport error would echo must carry no userinfo"
         );
     }
 
@@ -953,6 +1001,35 @@ mod tests {
                 .expect("the encoded path should parse")
                 .as_str(),
             "http://host/pre%20fix"
+        );
+    }
+
+    #[test]
+    fn a_credential_spelled_into_the_url_never_reaches_the_display_form() {
+        assert_eq!(
+            display_api_url("http://alice:secret@host:8000/api"),
+            "http://host:8000/api"
+        );
+        assert_eq!(display_api_url("http://alice@host/api"), "http://host/api");
+        assert_eq!(
+            display_api_url("http://:secret@host/api"),
+            "http://host/api"
+        );
+        assert_eq!(
+            display_api_url("ftp://host/x"),
+            "unusable: the URL must start with http:// or https://"
+        );
+        assert_eq!(
+            display_api_url("ftp://alice:secret@host/x"),
+            "unusable: the URL must start with http:// or https://"
+        );
+        assert_eq!(
+            display_api_url("alice:secret@host:8000/api"),
+            "unusable: the URL must start with http:// or https://"
+        );
+        assert_eq!(
+            display_api_url("http://alice:secret@host/api?x=1"),
+            "unusable: a query or fragment does not belong in a base URL"
         );
     }
 
@@ -1086,12 +1163,21 @@ mod tests {
                 unknown.to_string().contains("the-operation-id"),
                 "{unhandled}"
             );
+            assert!(
+                unknown.to_string().contains("the extractor's own account"),
+                "the server's account must ride the unknown-status report: {unknown}"
+            );
         }
-        let flooded = outcome(&"z".repeat(BODY_EXCERPT_BYTES * 4)).unwrap_err();
+        let flooded = operation_outcome(
+            &"z".repeat(BODY_EXCERPT_BYTES * 4),
+            "the-operation-id",
+            &"y".repeat(BODY_EXCERPT_BYTES * 4),
+        )
+        .unwrap_err();
         assert!(
-            flooded.to_string().len() < BODY_EXCERPT_BYTES * 2,
-            "an unrecognized status is server-controlled text and must stay bounded: \
-             {} bytes",
+            flooded.to_string().len() < BODY_EXCERPT_BYTES * 3,
+            "an unrecognized status and its report are server-controlled text and must stay \
+             bounded: {} bytes",
             flooded.to_string().len()
         );
         assert!(flooded.to_string().contains("[truncated]"), "{flooded}");

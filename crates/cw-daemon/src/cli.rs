@@ -392,14 +392,23 @@ fn status() -> Result<(), Failure> {
         },
     );
     field(
-        "last error",
+        "error",
         &last_error_line(cw_store::outbox::newest_error(&conn)),
     );
-    // The URL only: the token must not be readable over a shoulder.
+    // The URL only, stripped of any userinfo: neither the token nor a URL-spelled credential may
+    // be readable over a shoulder.
     field(
         "hindsight",
         &match cw_sink_hindsight::Credentials::load() {
-            Ok(Some(credentials)) => format!("delivering to {}", credentials.api_url()),
+            Ok(Some(credentials)) => {
+                match cw_sink_hindsight::parse_api_url(credentials.api_url()) {
+                    Ok(_) => format!(
+                        "delivering to {}",
+                        cw_sink_hindsight::display_api_url(credentials.api_url())
+                    ),
+                    Err(error) => format!("configured URL is unusable: {error}"),
+                }
+            }
             Ok(None) => "not configured; run `contextwitness setup`".to_owned(),
             Err(error) => format!("unreadable: {error}"),
         },
@@ -825,9 +834,9 @@ fn field(label: &str, value: &str) {
 /// and the database keep the whole text.
 const LAST_ERROR_DISPLAY_CHARS: usize = 200;
 
-/// The newest recorded delivery failure — the sink's messages name the HTTP status, the
-/// server's words and the operation id, and this line carries their first
-/// [`LAST_ERROR_DISPLAY_CHARS`] characters.
+/// The delivery failure carried by the newest affected episode — not necessarily the newest
+/// failure recorded. The sink's messages name the HTTP status, the server's words and the
+/// operation id, and this line carries their first [`LAST_ERROR_DISPLAY_CHARS`] characters.
 fn last_error_line(
     newest: Result<Option<cw_store::outbox::NewestError>, cw_store::StoreError>,
 ) -> String {
@@ -978,7 +987,7 @@ mod tests {
         };
         assert!(
             last_error_line(Ok(Some(crowded))).ends_with("(+2 more entries carry errors)"),
-            "the backlog behind the newest error must be visible"
+            "the backlog behind the newest affected episode's error must be visible"
         );
 
         let flooded = NewestError {

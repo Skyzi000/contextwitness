@@ -220,7 +220,7 @@ pub fn counts_by_state(conn: &rusqlite::Connection) -> Result<Vec<(String, i64)>
     Ok(counts)
 }
 
-/// The newest window still carrying a delivery error, for `contextwitness status`.
+/// The newest episode still carrying a delivery error, for `contextwitness status`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewestError {
     pub document_id: String,
@@ -230,7 +230,7 @@ pub struct NewestError {
     pub entries: i64,
 }
 
-/// The table records no error instant, so "newest" is the newest affected window, not
+/// The table records no error instant, so "newest" is the newest affected episode, not
 /// necessarily the last error written.
 pub fn newest_error(conn: &rusqlite::Connection) -> Result<Option<NewestError>, StoreError> {
     let mut statement = conn
@@ -326,7 +326,7 @@ mod tests {
     }
 
     #[test]
-    fn the_newest_windows_error_answers_for_the_backlog() {
+    fn the_newest_episodes_error_answers_for_the_backlog() {
         let dir = tempdir().expect("the temporary database directory should be creatable");
         let mut conn =
             db::open(&dir.path().join("db.sqlite3")).expect("the fresh database should initialize");
@@ -356,18 +356,18 @@ mod tests {
 
         mark_failed(
             &mut conn,
-            older,
-            start_at,
-            Retry::Backoff,
-            "the older refusal",
-        )
-        .expect("the failure should record");
-        mark_failed(
-            &mut conn,
             newer,
             start_at,
             Retry::Backoff,
             "the newer refusal",
+        )
+        .expect("the failure should record");
+        mark_failed(
+            &mut conn,
+            older,
+            start_at,
+            Retry::Backoff,
+            "the older refusal",
         )
         .expect("the failure should record");
         let error = newest_error(&conn)

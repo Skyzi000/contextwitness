@@ -1,5 +1,7 @@
 use chrono::TimeDelta;
-use cw_sink_hindsight::{Credentials, DeliveryError, HindsightClient, RetainItem, RetainOutcome};
+use cw_sink_hindsight::{
+    Credentials, DeliveryError, HindsightClient, RetainItem, RetainOutcome, display_api_url,
+};
 use cw_store::control::HealthKey;
 use cw_store::outbox::{self, Retry};
 use tracing::{debug, error, info, warn};
@@ -121,7 +123,7 @@ pub fn run(
             return;
         }
     };
-    info!(url = %credentials.api_url(), "delivering episodes to hindsight");
+    info!(url = %display_api_url(credentials.api_url()), "delivering episodes to hindsight");
     let client = match HindsightClient::new(credentials) {
         Ok(client) => client,
         Err(error) => {
