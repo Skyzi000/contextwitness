@@ -832,7 +832,7 @@ fn field(label: &str, value: &str) {
 /// and the database keep the whole text.
 const LAST_ERROR_DISPLAY_CHARS: usize = 200;
 
-/// The delivery failure carried by the newest affected episode — not necessarily the newest
+/// The delivery failure carried by the latest affected window — not necessarily the newest
 /// failure recorded. The sink's messages name the HTTP status, the server's words and the
 /// operation id, and this line carries their first [`LAST_ERROR_DISPLAY_CHARS`] characters.
 fn last_error_line(
@@ -985,7 +985,7 @@ mod tests {
         };
         assert!(
             last_error_line(Ok(Some(crowded))).ends_with("(+2 more entries carry errors)"),
-            "the backlog behind the newest affected episode's error must be visible"
+            "the backlog behind the latest affected window's error must be visible"
         );
 
         let flooded = NewestError {

@@ -29,7 +29,7 @@ const COUNT_BY_STATE: &str = "SELECT state, count(*) FROM outbox GROUP BY state 
 const NEWEST_ERROR: &str = "SELECT e.document_id, o.state, o.last_error, \
      (SELECT count(*) FROM outbox WHERE last_error IS NOT NULL) \
      FROM outbox o JOIN episodes e ON e.id = o.episode_id \
-     WHERE o.last_error IS NOT NULL ORDER BY o.episode_id DESC LIMIT 1";
+     WHERE o.last_error IS NOT NULL ORDER BY e.start_at DESC, e.id DESC LIMIT 1";
 
 /// An entry whose turn has come, carrying the episode snapshot the delivery worker sends.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -220,7 +220,7 @@ pub fn counts_by_state(conn: &rusqlite::Connection) -> Result<Vec<(String, i64)>
     Ok(counts)
 }
 
-/// The newest episode still carrying a delivery error, for `contextwitness status`.
+/// The latest affected window still carrying a delivery error, for `contextwitness status`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewestError {
     pub document_id: String,
@@ -230,8 +230,9 @@ pub struct NewestError {
     pub entries: i64,
 }
 
-/// The table records no error instant, so "newest" is the newest affected episode, not
-/// necessarily the last error written.
+/// The table records no error instant, so "newest" is the latest affected window, not necessarily
+/// the last error written. Ordered by window rather than by id: ids come from `Ulid::generate`,
+/// which does not order within a millisecond, and a catch-up pass closes several windows in one.
 pub fn newest_error(conn: &rusqlite::Connection) -> Result<Option<NewestError>, StoreError> {
     let mut statement = conn
         .prepare(NEWEST_ERROR)
@@ -437,6 +438,65 @@ mod tests {
         assert_eq!(error.state, "pending");
         assert_eq!(error.message, "the server said: the extractor gave out");
         assert_eq!(error.entries, 1);
+    }
+
+    #[test]
+    fn the_newest_window_answers_even_when_it_drew_the_smaller_id() {
+        let dir = tempdir().expect("the temporary database directory should be creatable");
+        let mut conn =
+            db::open(&dir.path().join("db.sqlite3")).expect("the fresh database should initialize");
+        let start_at = TimeZone::with_ymd_and_hms(&Utc, 2026, 8, 1, 12, 0, 0)
+            .single()
+            .expect("the test timestamp should be valid");
+        let newer = ulid::Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FAV").expect("a valid ulid");
+        let older = ulid::Ulid::from_string("01ARZ3NDEKTSV4RRFFQ69G5FBV").expect("a valid ulid");
+        assert_eq!(
+            newer.timestamp_ms(),
+            older.timestamp_ms(),
+            "the inversion must live in the random bits"
+        );
+        assert!(newer < older, "the newer window must hold the smaller id");
+        episodes::insert_with_outbox(
+            &mut conn,
+            older,
+            &test_episode(start_at, "screen-2026-08-01T12:00:00Z-30m"),
+            start_at,
+        )
+        .expect("the episode should register");
+        episodes::insert_with_outbox(
+            &mut conn,
+            newer,
+            &test_episode(
+                start_at + chrono::TimeDelta::hours(2),
+                "screen-2026-08-01T14:00:00Z-30m",
+            ),
+            start_at,
+        )
+        .expect("the episode should register");
+
+        mark_failed(
+            &mut conn,
+            older,
+            start_at,
+            Retry::Backoff,
+            "the older refusal",
+        )
+        .expect("the failure should record");
+        mark_failed(
+            &mut conn,
+            newer,
+            start_at,
+            Retry::Backoff,
+            "the newer refusal",
+        )
+        .expect("the failure should record");
+
+        let error = newest_error(&conn)
+            .expect("readable")
+            .expect("two entries carry errors");
+        assert_eq!(error.document_id, "screen-2026-08-01T14:00:00Z-30m");
+        assert_eq!(error.message, "the newer refusal");
+        assert_eq!(error.entries, 2);
     }
 
     fn note_and_error(
