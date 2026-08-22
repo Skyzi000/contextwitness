@@ -170,6 +170,7 @@ impl CaptureEngine {
                     None => continue,
                 }
             };
+            let mut used = target;
             let mut result = match target {
                 Backend::Primary => self.dxgi.capture(&monitor.id),
                 Backend::Fallback => self.wgc.capture(&monitor.id),
@@ -177,16 +178,17 @@ impl CaptureEngine {
             if !self.force_fallback {
                 let switched = state.record(target, outcome(&result), now);
                 if target == Backend::Primary && state.target(now) == Some(Backend::Fallback) {
+                    used = Backend::Fallback;
                     result = self.wgc.capture(&monitor.id);
                     state.record(Backend::Fallback, outcome(&result), now);
                 }
 
                 if let Some(backend) = switched {
-                    let name = match backend {
-                        Backend::Primary => "dxgi",
-                        Backend::Fallback => "wgc",
-                    };
-                    tracing::info!("capture backend for {} switched to {name}", monitor.id);
+                    tracing::info!(
+                        "capture backend for {} switched to {}",
+                        monitor.id,
+                        backend_name(backend)
+                    );
                     if backend == Backend::Primary {
                         drain_then_release(&mut result, |op| match op {
                             HoldOp::Drain => self.wgc.drain_existing(&monitor),
@@ -213,7 +215,9 @@ impl CaptureEngine {
                 Err(CaptureError::Recoverable(Recoverable::EnumerationFailed(message))) => {
                     enumeration_failed.get_or_insert(message);
                 }
-                Err(error) => self.report(&monitor.id, &error.to_string()),
+                Err(error) => {
+                    self.report(&monitor.id, used, &error.to_string());
+                }
             }
         }
         (
@@ -222,18 +226,28 @@ impl CaptureEngine {
         )
     }
 
-    /// The same failure repeating every tick is one line of news, not one line per tick.
-    fn report(&mut self, monitor_id: &str, message: &str) {
+    /// The same failure repeating every tick is one line of news, not one line per tick. The
+    /// backend name is part of the news: the primary's recovery probe and the fallback's re-open
+    /// fail on the same monitor, and only the name says which one is speaking.
+    fn report(&mut self, monitor_id: &str, backend: Backend, message: &str) -> bool {
+        let line = format!("[{}] {message}", backend_name(backend));
         if self
             .reported
             .get(monitor_id)
-            .is_some_and(|last| last == message)
+            .is_some_and(|last| last == &line)
         {
-            return;
+            return false;
         }
-        tracing::warn!("capture failed for {monitor_id}: {message}");
-        self.reported
-            .insert(monitor_id.to_owned(), message.to_owned());
+        tracing::warn!("capture failed for {monitor_id}: {line}");
+        self.reported.insert(monitor_id.to_owned(), line);
+        true
+    }
+}
+
+fn backend_name(backend: Backend) -> &'static str {
+    match backend {
+        Backend::Primary => "dxgi",
+        Backend::Fallback => "wgc",
     }
 }
 
@@ -423,6 +437,16 @@ mod tests {
     use std::cell::RefCell;
 
     use super::*;
+
+    #[test]
+    fn a_report_names_the_backend_that_failed() {
+        let mut engine = CaptureEngine::new();
+        assert!(engine.report("m", Backend::Primary, "boom"));
+        assert_eq!(engine.reported["m"], "[dxgi] boom");
+        assert!(!engine.report("m", Backend::Primary, "boom"));
+        assert!(engine.report("m", Backend::Fallback, "boom"));
+        assert_eq!(engine.reported["m"], "[wgc] boom");
+    }
 
     #[test]
     fn only_an_enumeration_with_every_monitor_refused_is_a_failure() {
