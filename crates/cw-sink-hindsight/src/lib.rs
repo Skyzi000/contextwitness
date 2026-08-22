@@ -298,12 +298,14 @@ struct RetainItemWire<'a> {
 #[error("{0}")]
 pub struct InvalidApiUrl(String);
 
-/// Parse a Hindsight API base URL: absolute, http or https, with a host, no query, no fragment,
-/// and — once surrounding whitespace is trimmed — no tab, carriage return or newline. The URL
-/// grammar strips those silently, so
-/// the parsed URL would name a different host or path than the one spelled. Repeated trailing
-/// slashes collapse here: the endpoint builder strips one, and any beyond it would ride into
-/// every request URL as an empty path segment.
+/// Parse a Hindsight API base URL: absolute, http or https, with a host, no username or
+/// password, no query, no fragment, and — once surrounding whitespace is trimmed — no tab,
+/// carriage return or newline. The URL grammar strips those silently, so
+/// the parsed URL would name a different host or path than the one spelled. Userinfo is
+/// refused because Hindsight authenticates with a Bearer token or not at all, and reqwest
+/// turns URL userinfo into a Basic Authorization header of its own, beside any configured
+/// Bearer. Repeated trailing slashes collapse here: the endpoint builder strips one, and any
+/// beyond it would ride into every request URL as an empty path segment.
 pub fn parse_api_url(text: &str) -> Result<Url, InvalidApiUrl> {
     let text = text.trim();
     if text.contains(['\t', '\r', '\n']) {
@@ -330,6 +332,12 @@ pub fn parse_api_url(text: &str) -> Result<Url, InvalidApiUrl> {
             "a query or fragment does not belong in a base URL".to_owned(),
         ));
     }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(InvalidApiUrl(
+            "a username or password does not belong in the URL; supply an API token instead"
+                .to_owned(),
+        ));
+    }
     if url.path().ends_with("//") {
         let trimmed = url.path().trim_end_matches('/').to_owned();
         url.set_path(&trimmed);
@@ -337,18 +345,12 @@ pub fn parse_api_url(text: &str) -> Result<Url, InvalidApiUrl> {
     Ok(url)
 }
 
-/// The URL as logs and `status` may print it: parsed and stripped of any userinfo. That a
-/// credential spelled into the URL never reaches a screen is a rule about the call sites —
-/// every printed URL must route through here rather than the raw text.
+/// The URL as logs and `status` may print it, or the refusal in place of it. That a credential
+/// spelled into the URL never reaches a screen is a rule about the call sites — every printed
+/// URL must route through here rather than the raw text.
 pub fn display_api_url(text: &str) -> String {
     match parse_api_url(text) {
-        Ok(mut url) => {
-            url.set_username("")
-                .expect("parse_api_url admits only hosted http/https URLs");
-            url.set_password(None)
-                .expect("parse_api_url admits only hosted http/https URLs");
-            String::from(url)
-        }
+        Ok(url) => String::from(url),
         Err(error) => format!("unusable: {error}"),
     }
 }
@@ -497,10 +499,7 @@ impl HindsightClient {
         Ok((operation.status, report))
     }
 
-    /// Adds the Bearer form when a token is configured, as in Hindsight's own integrations. Not
-    /// the only way an Authorization header travels: reqwest turns URL userinfo into a Basic
-    /// header on its own, and appends rather than replaces, so a URL spelling credentials beside
-    /// a configured token sends both.
+    /// Adds the Bearer form when a token is configured, as in Hindsight's own integrations.
     fn authorize(&self, request: RequestBuilder) -> RequestBuilder {
         match &self.token {
             Some(token) => request.bearer_auth(token),
@@ -818,11 +817,13 @@ mod tests {
         assert!(!printed.contains("sesame"), "{printed}");
         assert!(printed.contains("<redacted>"), "{printed}");
 
-        let client =
-            HindsightClient::new(credentials).expect("building the client makes no request");
+        let client = HindsightClient::new(Credentials {
+            api_url: "http://localhost:0".to_owned(),
+            token: Some("the-secret-token".to_owned()),
+        })
+        .expect("building the client makes no request");
         let printed = format!("{client:?}");
         assert!(!printed.contains("the-secret-token"), "{printed}");
-        assert!(!printed.contains("sesame"), "{printed}");
         assert!(printed.contains("<redacted>"), "{printed}");
     }
 
@@ -939,13 +940,24 @@ mod tests {
             "Bearer the-secret-token"
         );
 
-        let client = HindsightClient::new(Credentials {
+        let refused = HindsightClient::new(Credentials {
             api_url: "http://alice:sesame@localhost:0".to_owned(),
+            token: Some("the-secret-token".to_owned()),
+        })
+        .expect_err("a URL-spelled credential beside a token would send Basic and Bearer both");
+        assert!(!refused.to_string().contains("alice"), "{refused}");
+        assert!(!refused.to_string().contains("sesame"), "{refused}");
+    }
+
+    #[test]
+    fn reqwest_turns_url_userinfo_into_a_basic_header_beside_the_bearer() {
+        let client = HindsightClient::new(Credentials {
+            api_url: "http://localhost:0".to_owned(),
             token: Some("the-secret-token".to_owned()),
         })
         .expect("building the client makes no request");
         let request = client
-            .authorize(client.http.get(client.base_url.as_str()))
+            .authorize(client.http.get("http://alice:sesame@localhost:0/x"))
             .build()
             .expect("a plain GET builds");
         let values: Vec<_> = request
@@ -957,12 +969,7 @@ mod tests {
         assert_eq!(
             values,
             ["Basic YWxpY2U6c2VzYW1l", "Bearer the-secret-token"],
-            "reqwest turns URL userinfo into a Basic header beside the Bearer"
-        );
-        assert_eq!(
-            request.url().as_str(),
-            "http://localhost:0/",
-            "the URL a transport error would echo must carry no userinfo"
+            "the header pair that justifies refusing URL userinfo in `parse_api_url`"
         );
     }
 
@@ -1006,15 +1013,14 @@ mod tests {
 
     #[test]
     fn a_credential_spelled_into_the_url_never_reaches_the_display_form() {
+        const REFUSED: &str = "unusable: a username or password does not belong in the URL; supply an API token \
+             instead";
         assert_eq!(
             display_api_url("http://alice:secret@host:8000/api"),
-            "http://host:8000/api"
+            REFUSED
         );
-        assert_eq!(display_api_url("http://alice@host/api"), "http://host/api");
-        assert_eq!(
-            display_api_url("http://:secret@host/api"),
-            "http://host/api"
-        );
+        assert_eq!(display_api_url("http://alice@host/api"), REFUSED);
+        assert_eq!(display_api_url("http://:secret@host/api"), REFUSED);
         assert_eq!(
             display_api_url("ftp://host/x"),
             "unusable: the URL must start with http:// or https://"
@@ -1030,6 +1036,26 @@ mod tests {
         assert_eq!(
             display_api_url("http://alice:secret@host/api?x=1"),
             "unusable: a query or fragment does not belong in a base URL"
+        );
+    }
+
+    #[test]
+    fn a_credential_spelled_into_the_url_is_refused_before_it_can_travel() {
+        for spelled in [
+            "http://alice:sesame@host:8000/api",
+            "http://alice@host/api",
+            "http://:sesame@host/api",
+            "https://alice:sesame@host/api",
+        ] {
+            let refused = parse_api_url(spelled).expect_err("userinfo must not parse");
+            assert_eq!(
+                refused.to_string(),
+                "a username or password does not belong in the URL; supply an API token instead"
+            );
+        }
+        assert!(
+            parse_api_url("http://host:8000/api").is_ok(),
+            "an ordinary URL must stay accepted"
         );
     }
 

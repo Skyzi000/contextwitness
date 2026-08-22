@@ -395,8 +395,6 @@ fn status() -> Result<(), Failure> {
         "error",
         &last_error_line(cw_store::outbox::newest_error(&conn)),
     );
-    // The URL only, stripped of any userinfo: neither the token nor a URL-spelled credential may
-    // be readable over a shoulder.
     field(
         "hindsight",
         &match cw_sink_hindsight::Credentials::load() {
