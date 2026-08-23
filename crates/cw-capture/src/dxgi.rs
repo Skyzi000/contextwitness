@@ -131,14 +131,14 @@ impl Session {
             match format {
                 DxgiDuplicationFormat::Bgra8 | DxgiDuplicationFormat::Bgra8Srgb => {}
                 DxgiDuplicationFormat::Rgba8 | DxgiDuplicationFormat::Rgba8Srgb => {
-                    for pixel in bgra.chunks_exact_mut(4) {
+                    for pixel in bgra.as_chunks_mut::<4>().0 {
                         pixel.swap(0, 2);
                     }
                 }
                 // 10-bit and FP16 desktops need tone mapping to SDR 8-bit, which v1 does not do.
                 other => return Err(Recoverable::UnsupportedFormat(format!("{other:?}")).into()),
             }
-            for pixel in bgra.chunks_exact_mut(4) {
+            for pixel in bgra.as_chunks_mut::<4>().0 {
                 pixel[3] = 255;
             }
 

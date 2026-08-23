@@ -459,7 +459,7 @@ impl Sink {
             }
             self.context.Unmap(staging.texture(), 0);
         }
-        for pixel in bgra.chunks_exact_mut(4) {
+        for pixel in bgra.as_chunks_mut::<4>().0 {
             pixel[3] = 255;
         }
 

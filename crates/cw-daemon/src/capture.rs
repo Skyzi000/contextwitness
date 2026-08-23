@@ -376,14 +376,16 @@ fn mark_tick(
 
 fn bgra_to_rgba(bgra: &[u8]) -> Vec<u8> {
     let mut rgba = bgra.to_vec();
-    for pixel in rgba.chunks_exact_mut(4) {
+    for pixel in rgba.as_chunks_mut::<4>().0 {
         pixel.swap(0, 2);
     }
     rgba
 }
 
 fn bgra_to_rgb(bgra: &[u8]) -> Vec<u8> {
-    bgra.chunks_exact(4)
+    bgra.as_chunks::<4>()
+        .0
+        .iter()
         .flat_map(|pixel| [pixel[2], pixel[1], pixel[0]])
         .collect()
 }
