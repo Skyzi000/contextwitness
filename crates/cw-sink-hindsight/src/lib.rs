@@ -387,7 +387,7 @@ impl HindsightClient {
             .connect_timeout(CONNECT_TIMEOUT)
             .build()
             .map_err(|error| DeliveryError::Permanent {
-                message: format!("failed to build the HTTP client: {error}"),
+                message: format!("failed to build the HTTP client: {}", error_chain(&error)),
             })?;
         Ok(Self {
             http,
@@ -554,9 +554,33 @@ impl DeliveryError {
 
 fn transport(error: reqwest::Error) -> DeliveryError {
     DeliveryError::Retryable {
-        message: format!("hindsight request failed: {error}"),
+        message: transport_message(&error),
         retry_after: None,
     }
+}
+
+fn transport_message(error: &(dyn std::error::Error + 'static)) -> String {
+    format!("hindsight request failed: {}", error_chain(error))
+}
+
+/// `reqwest::Error`'s display stops at the failing step ("error sending request for url (…)",
+/// "builder error"); which step failed — refused, timed out, reset — is below it in `source()`.
+fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut chain = error.to_string();
+    // reqwest's blocking body reads hand back its own error re-wrapped in `io::Error`, so a
+    // layer can repeat its parent word for word.
+    let mut last = chain.clone();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        let rendered = cause.to_string();
+        if rendered != last {
+            chain.push_str(": ");
+            chain.push_str(&rendered);
+            last = rendered;
+        }
+        source = cause.source();
+    }
+    excerpt(&chain)
 }
 
 const RETAIN_OPERATION: &str = "retain";
@@ -571,7 +595,7 @@ fn accept(response: Response, operation: &str) -> Result<Response, DeliveryError
     let retry_after = retry_after(&response);
     let body = match read_prefix(response) {
         Ok(text) => excerpt(&text),
-        Err(error) => format!("(the body could not be read: {error})"),
+        Err(error) => format!("(the body could not be read: {})", error_chain(&error)),
     };
     let message =
         format!("hindsight {operation} failed with HTTP {status}; the server said: {body}");
@@ -596,10 +620,10 @@ fn read_prefix(response: Response) -> std::io::Result<String> {
     Ok(String::from_utf8_lossy(&prefix).into_owned())
 }
 
-/// The server's words, bounded and printable. A refusal can quote the submitted input back —
-/// for a retain that is a whole episode — so the excerpt keeps a megabyte out of every log
-/// line while the actual reason still reaches the operator; control characters are escaped so
-/// one log line stays one line.
+/// Text bound for one log line, bounded and printable. A refusal can quote the submitted input
+/// back — for a retain that is a whole episode — so the excerpt keeps a megabyte out of every
+/// log line while the actual reason still reaches the operator; control characters are escaped
+/// so one log line stays one line.
 fn excerpt(text: &str) -> String {
     // Decided before the trim: `read_prefix` stops one byte past the bound, and a trimmed
     // leading newline must not erase the marker that spare byte carries.
@@ -651,7 +675,10 @@ fn read_text(response: Response, operation: &str) -> Result<String, DeliveryErro
         .take(PARSED_BODY_CAP)
         .read_to_end(&mut body)
         .map_err(|error| DeliveryError::Retryable {
-            message: format!("hindsight {operation} answered an unreadable body: {error}"),
+            message: format!(
+                "hindsight {operation} answered an unreadable body: {}",
+                error_chain(&error)
+            ),
             retry_after: None,
         })?;
     Ok(String::from_utf8_lossy(&body).into_owned())
@@ -1498,5 +1525,147 @@ mod tests {
         );
         assert!(refusal.contains("[truncated"), "{refusal}");
         server.join().expect("the server saw both exchanges");
+    }
+
+    #[test]
+    fn a_transport_message_names_every_cause_bounded_and_printable() {
+        #[derive(Debug)]
+        struct Layer(String, Option<Box<Layer>>);
+        impl std::fmt::Display for Layer {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str(&self.0)
+            }
+        }
+        impl std::error::Error for Layer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                self.1
+                    .as_deref()
+                    .map(|cause| cause as &(dyn std::error::Error + 'static))
+            }
+        }
+        let root = Layer(
+            format!("os says\u{1f}no: {}", "z".repeat(BODY_EXCERPT_BYTES)),
+            None,
+        );
+        let error = Layer(
+            "error sending request".to_owned(),
+            Some(Box::new(Layer(
+                "connect refused".to_owned(),
+                Some(Box::new(Layer(
+                    "connect refused".to_owned(),
+                    Some(Box::new(root)),
+                ))),
+            ))),
+        );
+        let message = transport_message(&error);
+        assert!(
+            message.starts_with(
+                "hindsight request failed: error sending request: connect refused: os says\\u{1f}no: "
+            ),
+            "every cause below the top display must reach the operator, printable: {message}"
+        );
+        assert!(message.ends_with(" [truncated]"), "{message}");
+        assert!(
+            message.len()
+                <= "hindsight request failed: ".len() + BODY_EXCERPT_BYTES + " [truncated]".len(),
+            "{} bytes",
+            message.len()
+        );
+    }
+
+    #[test]
+    fn a_body_cut_mid_read_names_the_underlying_cause() {
+        let scripted = [
+            "HTTP/1.1 200 OK\r\ncontent-length: 50\r\nconnection: close\r\n\r\nhello",
+            "HTTP/1.1 422 Unprocessable Entity\r\ncontent-length: 50\r\nconnection: close\r\n\r\nhello",
+        ];
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("loopback binds");
+        let port = listener
+            .local_addr()
+            .expect("the socket has an address")
+            .port();
+        let server = std::thread::spawn(move || {
+            for response in scripted {
+                let (mut stream, _) = listener.accept().expect("the client connects");
+                let bound = Some(std::time::Duration::from_secs(10));
+                stream.set_read_timeout(bound).expect("the timeout applies");
+                stream
+                    .set_write_timeout(bound)
+                    .expect("the timeout applies");
+                read_request(&mut stream);
+                std::io::Write::write_all(&mut stream, response.as_bytes())
+                    .expect("the response writes");
+            }
+        });
+
+        let client = HindsightClient::new(Credentials {
+            api_url: format!("http://127.0.0.1:{port}"),
+            token: None,
+        })
+        .expect("building the client makes no request");
+        let metadata = RawValue::from_string(r#"{"k":"v"}"#.to_owned()).expect("valid JSON");
+        let item = RetainItem {
+            episode_id: "ep-1",
+            document_id: "doc",
+            content: "the episode text",
+            timestamp: Utc::now(),
+            context: "ctx",
+            metadata: &metadata,
+        };
+        let unreadable = client.retain("bank", &item).unwrap_err().to_string();
+        assert!(
+            unreadable.contains("answered an unreadable body"),
+            "{unreadable}"
+        );
+        assert!(
+            unreadable.contains("error reading a body"),
+            "the read failure's cause lives in source() and must reach the log: {unreadable}"
+        );
+        let refused = client.retain("bank", &item).unwrap_err().to_string();
+        assert!(
+            refused.contains("(the body could not be read: "),
+            "{refused}"
+        );
+        assert!(
+            refused.contains("error reading a body"),
+            "the refusal's unreadable body must still name its cause: {refused}"
+        );
+        server.join().expect("the server saw both exchanges");
+    }
+
+    #[test]
+    fn a_refused_connection_reports_the_operating_systems_cause() {
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("loopback binds");
+            listener
+                .local_addr()
+                .expect("the socket has an address")
+                .port()
+        };
+        let client = HindsightClient::new(Credentials {
+            api_url: format!("http://127.0.0.1:{port}"),
+            token: None,
+        })
+        .expect("building the client makes no request");
+        let metadata = RawValue::from_string(r#"{"k":"v"}"#.to_owned()).expect("valid JSON");
+        let item = RetainItem {
+            episode_id: "ep-1",
+            document_id: "doc",
+            content: "the episode text",
+            timestamp: Utc::now(),
+            context: "ctx",
+            metadata: &metadata,
+        };
+        let error = client.retain("bank", &item).unwrap_err();
+        assert!(
+            error.is_retryable(),
+            "an unreachable server is a retry, not a verdict"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("os error"),
+            "the top display stops at 'error sending request'; the refused/timed-out/reset \
+             cause lives in source() and must reach the log: {message}"
+        );
     }
 }
