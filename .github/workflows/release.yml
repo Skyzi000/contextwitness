@@ -40,7 +40,7 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory $env:STAGE | Out-Null
-          Copy-Item target/release/contextwitness.exe, README.md, LICENSE $env:STAGE
+          Copy-Item target/release/contextwitness.exe, README.md, README.ja.md, LICENSE $env:STAGE
           Compress-Archive -Path $env:STAGE -DestinationPath "$env:STAGE.zip"
       - uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
