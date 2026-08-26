@@ -1,5 +1,7 @@
 # ContextWitness
 
+English | [日本語](README.ja.md)
+
 ContextWitness is a Windows daemon that turns your screen activity into long-term, queryable memory. It captures every connected monitor on a fixed cadence, reads the frames with Windows OCR, groups what it saw into time-anchored episodes, and delivers them to a [Hindsight](https://github.com/vectorize-io/hindsight) memory bank — so an assistant wired to that bank can answer questions like "what was I working on Tuesday afternoon?".
 
 Requires Windows 11 24H2 (build 26100) or later. Building requires the MSVC toolchain. Delivering episodes to Hindsight requires Hindsight v0.8.6 or later.

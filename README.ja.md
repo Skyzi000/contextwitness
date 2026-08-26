@@ -1,0 +1,70 @@
+# ContextWitness
+
+[English](README.md) | 日本語
+
+ContextWitness は、画面上の活動を後から照会できる長期記憶へ変える Windows 常駐デーモンです。接続中の全モニターを一定間隔でキャプチャし、フレームを Windows OCR で読み取り、見えたものを時刻に紐づいたエピソードへまとめて、[Hindsight](https://github.com/vectorize-io/hindsight) のメモリバンクへ配送します — そのバンクにつないだアシスタントは「火曜の午後は何をしてた?」のような質問に答えられるようになります。
+
+Windows 11 24H2(ビルド 26100)以降が必要です。ビルドには MSVC ツールチェーンが必要です。エピソードを Hindsight へ配送するには Hindsight v0.8.6 以降が必要です。
+
+## v1 でできること
+
+- 全モニターを数秒ごとにキャプチャし(DXGI desktop duplication、モニター単位で Windows Graphics Capture へフォールバック)、実際に十分な量のピクセルが変化したときだけフレームを保存します。
+- 画面上のテキストを Windows OCR エンジンで抽出します。設定した言語のうちインストール済みエンジンが存在する最初のものを使います(既定は日本語→英語の順)。
+- キャプチャをエピソード窓(既定 5 分)へまとめ、時刻に紐づいた活動ログとして描画します。
+- すべてをまずローカルへ保存します: エピソードは SQLite に、フレームは WebP 画像として(保持は既定 14 日 / 50 GiB)。
+- 永続 outbox を通じてエピソードを Hindsight へ配送します: サーバが落ちていればエピソードは待機し、復帰後に配送されます。
+- トレイアイコン付きで常駐します。`pause`/`resume` はトレイからもコマンドラインからも。ログオン時の自動起動は任意です。
+
+## インストール
+
+いずれか:
+
+- **Portable ZIP** — [Releases](https://github.com/Skyzi000/contextwitness/releases) から `contextwitness-vX.Y.Z-windows-x86_64.zip` をダウンロードし、任意の場所へ展開して、ターミナルから `contextwitness.exe` を実行します。
+- **ソースから** — `cargo install --git https://github.com/Skyzi000/contextwitness cw-daemon`(Rust の MSVC ツールチェーンが必要)。
+
+バイナリは署名なしのオープンソースビルドのため、初回実行時に Windows SmartScreen が警告することがあります。
+
+## Quickstart
+
+```text
+contextwitness setup
+contextwitness run
+```
+
+`setup` は Hindsight API URL・API トークン(任意)・データディレクトリを尋ねて書き込みます。`run` はトレイアイコンを出してキャプチャを開始し、止められるまで動き続けます。その他のコマンド: `status`(このインストールが何をしているかの 1 画面サマリ)、`pause [30m|2h|...]`、`resume`、`autostart enable|disable`(ログオン時の自動起動)、`capture-once [--wgc]`(パイプライン確認用の手動キャプチャ 1 回。`pause` を無視します)。
+
+## 設定
+
+`%APPDATA%\ContextWitness\config.toml`。`setup` または `run` が最初に必要としたときに、以下の既定値で書き出されます:
+
+| キー | 既定値 | 意味 |
+| --- | --- | --- |
+| `capture.interval_secs` | `2` | キャプチャ試行の間隔秒数(1–30)。 |
+| `capture.change_pixel_threshold` | `8` | ピクセルごとの輝度差がこの値以下なら「変化なし」と数える(0–254)。 |
+| `capture.change_area_logical_pixels` | `600` | 変化した論理ピクセル数(表示スケーリング 100% 換算)がこれを超えたらフレームを保存して OCR する。 |
+| `capture.webp_quality` | `75` | WebP エンコード品質(0–100)。 |
+| `ocr.languages` | `["ja", "en"]` | OCR エンジンへ提示する言語(重要な順)。インストール済みエンジンがある最初のものが使われる(いずれにもインストール済みエンジンが無ければプロファイルの言語)。 |
+| `storage.data_dir` | `""` | データディレクトリ。空なら `%LOCALAPPDATA%\ContextWitness`、それ以外は絶対パス。 |
+| `storage.image_retention_days` | `14` | キャプチャ画像を保持する日数。 |
+| `storage.image_retention_max_gib` | `50` | キャプチャ画像全体の容量上限(GiB)。 |
+| `privacy.process_blacklist` | `[]` | キャプチャを無効化するプロセス名。 |
+| `hindsight.bank_id` | `"contextwitness"` | エピソードの配送先となる Hindsight バンク。デーモンはこのバンクの retain 設定(mission・抽出モード・チャンクサイズ)を書き込むので、ContextWitness 専用のバンクを与えること。 |
+| `hindsight.context_label` | `"screen capture"` | 全エピソードに添えて送られる context ラベル。 |
+| `episode.window_minutes` | `5` | エピソード窓の長さ(分、1–1440)。 |
+
+Hindsight の資格情報が `config.toml` に置かれることはありません。`setup` はそれらを `%USERPROFILE%\.hindsight\contextwitness.json` へ書き込みます。代わりに環境変数 `CONTEXTWITNESS_HINDSIGHT_URL` と `CONTEXTWITNESS_HINDSIGHT_TOKEN` でも配送を設定できます(URL 変数が設定されているときは環境変数を資格情報一式とみなし、ファイルは読みません。トークン変数だけの設定は、ファイル側の URL と黙って組み合わされるのではなく拒否されます)。
+
+## プライバシー
+
+ContextWitness は画面を記録します。実行する前に、それが何を意味するかを知っておいてください:
+
+- **既定ではすべてを収集します。** 接続中の全モニターがキャプチャされ、読み取れる画面上のテキストはすべて抽出・保存され、各エントリには前面ウィンドウのタイトルとプロセス名が記録されます。
+- **Hindsight への配送を除き、すべてはあなたのマシンに留まります。** エピソードのテキスト(ウィンドウタイトルとプロセス名を含む)とそのメタデータ(エピソードの時刻、モニター識別子、ローカル画像パス)は、あなたが設定した Hindsight サーバへ送られます。それ以外へは何も送信されません。キャプチャ画像そのものがアップロードされることはありません。
+- **`privacy.process_blacklist`** は、列挙したプロセス(実行ファイル名で照合、大文字小文字は区別しない)が前面にある間、*全*モニターのキャプチャをスキップします。blacklist が設定されているのに前面プロセスを判定できないときは、危険を冒さずその tick をスキップします。
+- **Pause** はキャプチャループを止めます: トレイメニューから、または `contextwitness pause 30m`(時間指定なしは `resume` まで)。
+- **Retention** は保存画像を経過日数と総容量で削除します。ローカルデータベースのエピソードテキストは無期限に保持されます — それこそがこのツールの築く記憶だからです。
+- **ログ** にキャプチャ内容は含まれません。ただし一つ例外があります: 配送診断はサーバが返したエラーテキストを引用するため、エピソードを拒否したサーバがそのエピソードを引用し返すことがあります — ウィンドウタイトルも、プロセス名も、OCR 原文も。`contextwitness status` は最新の影響エピソードが抱える配送エラーを再表示します。どちらも機微情報として扱ってください。
+
+## ライセンス
+
+[MIT](LICENSE)
