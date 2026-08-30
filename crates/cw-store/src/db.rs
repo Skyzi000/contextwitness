@@ -7,6 +7,7 @@ use crate::StoreError;
 const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0001_init.sql"),
     include_str!("../migrations/0002_outbox_last_note.sql"),
+    include_str!("../migrations/0003_image_budget_and_time_index.sql"),
 ];
 
 /// The schema version this build understands.
@@ -488,6 +489,45 @@ CREATE TABLE control_state (        -- current state, and the one that is author
     }
 
     #[test]
+    fn an_existing_version_two_database_seeds_the_image_budget_from_its_rows() {
+        let dir = tempdir().expect("the temporary database directory should be creatable");
+        let path = dir.path().join("db.sqlite3");
+        {
+            let conn = rusqlite::Connection::open(&path).expect("the raw database should open");
+            conn.execute_batch(CONNECTION_SETTINGS)
+                .expect("the connection settings should apply");
+            conn.execute_batch(VERSION_ONE_SCHEMA)
+                .expect("the frozen version-one schema should apply");
+            // Spelled out for the same reason the schema above is, and not read from `MIGRATIONS`.
+            conn.execute_batch("ALTER TABLE outbox ADD COLUMN last_note TEXT")
+                .expect("the frozen version-two column should apply");
+            conn.execute_batch(
+                "INSERT INTO observations (id, source, observed_at, schema_version, payload) VALUES \
+                 ('01ARZ3NDEKTSV4RRFFQ69G5FAV', 'screen', '2026-08-01T12:00:00.000000000Z', 1, '{}'), \
+                 ('01BRZ3NDEKTSV4RRFFQ69G5FAV', 'screen', '2026-08-01T13:00:00.000000000Z', 1, '{}'); \
+                 INSERT INTO images (observation_id, relative_path, byte_size, created_at) VALUES \
+                 ('01ARZ3NDEKTSV4RRFFQ69G5FAV', '2026/08/01/01ARZ3NDEKTSV4RRFFQ69G5FAV.webp', 700, '2026-08-01T12:00:00.000000000Z'), \
+                 ('01BRZ3NDEKTSV4RRFFQ69G5FAV', '2026/08/01/01BRZ3NDEKTSV4RRFFQ69G5FAV.webp', 30, '2026-08-01T13:00:00.000000000Z');",
+            )
+            .expect("the version-two rows should seed");
+            conn.pragma_update(None, "application_id", APPLICATION_ID)
+                .expect("the ownership mark should write");
+            conn.pragma_update(None, "user_version", 2)
+                .expect("the version should write");
+        }
+
+        let conn = open(&path).expect("the version-two database should migrate forward");
+        let version: i32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("the migrated schema version should be readable");
+        assert_eq!(version, SCHEMA_VERSION);
+        let total: i64 = conn
+            .query_one("SELECT total_bytes FROM image_budget", [], |row| row.get(0))
+            .expect("the seeded image budget should be readable");
+        assert_eq!(total, 730);
+    }
+
+    #[test]
     fn open_applies_the_sqlite_contract() {
         let dir = tempdir().expect("the temporary database directory should be creatable");
         let path = dir.path().join("db.sqlite3");
@@ -615,14 +655,14 @@ CREATE TABLE control_state (        -- current state, and the one that is author
     }
 
     #[test]
-    fn initial_migration_creates_every_table_and_index() {
+    fn initial_migration_creates_every_table_index_and_trigger() {
         let dir = tempdir().expect("the temporary database directory should be creatable");
         let path = dir.path().join("db.sqlite3");
         let conn = open(&path).expect("the fresh database should initialize");
         let mut statement = conn
             .prepare(
                 "SELECT name FROM sqlite_master \
-                 WHERE type IN ('table','index') \
+                 WHERE type IN ('table','index','trigger') \
                  AND name NOT LIKE 'sqlite_%' \
                  ORDER BY name",
             )
@@ -640,8 +680,14 @@ CREATE TABLE control_state (        -- current state, and the one that is author
                 "control_events",
                 "control_state",
                 "episodes",
+                "idx_images_time",
                 "idx_obs_time",
+                "image_budget",
+                "image_budget_no_delete",
                 "images",
+                "images_budget_delete",
+                "images_budget_insert",
+                "images_budget_update",
                 "observations",
                 "outbox",
             ],

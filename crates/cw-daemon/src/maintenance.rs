@@ -21,6 +21,7 @@ pub fn run(mut conn: rusqlite::Connection, paths: DataPaths, config: Config) -> 
                         over_budget = swept.over_budget,
                         freed_bytes = swept.freed_bytes,
                         skipped = swept.skipped,
+                        truncated = swept.truncated,
                         "retention sweep"
                     );
                 }
