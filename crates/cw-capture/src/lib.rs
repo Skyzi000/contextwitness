@@ -178,6 +178,14 @@ impl CaptureEngine {
             if !self.force_fallback {
                 let switched = state.record(target, outcome(&result), now);
                 if target == Backend::Primary && state.target(now) == Some(Backend::Fallback) {
+                    if switched.is_none()
+                        && let Err(error) = &result
+                    {
+                        let line = backend_line(target, &error.to_string());
+                        if state.probe_failure_is_news(&line, now) {
+                            tracing::warn!("recovery probe failed for {}: {line}", monitor.id);
+                        }
+                    }
                     used = Backend::Fallback;
                     result = self.wgc.capture(&monitor.id);
                     state.record(Backend::Fallback, outcome(&result), now);
@@ -230,7 +238,7 @@ impl CaptureEngine {
     /// backend name is part of the news: the primary's recovery probe and the fallback's re-open
     /// fail on the same monitor, and only the name says which one is speaking.
     fn report(&mut self, monitor_id: &str, backend: Backend, message: &str) -> bool {
-        let line = format!("[{}] {message}", backend_name(backend));
+        let line = backend_line(backend, message);
         if self
             .reported
             .get(monitor_id)
@@ -242,6 +250,10 @@ impl CaptureEngine {
         self.reported.insert(monitor_id.to_owned(), line);
         true
     }
+}
+
+fn backend_line(backend: Backend, message: &str) -> String {
+    format!("[{}] {message}", backend_name(backend))
 }
 
 fn backend_name(backend: Backend) -> &'static str {

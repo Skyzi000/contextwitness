@@ -13,6 +13,9 @@ const FIRST_PROBE_DELAY: Duration = Duration::from_secs(1);
 /// Upper bound of both widening waits: the primary's probe interval and the fallback's
 /// re-open wait.
 const MAX_PROBE_INTERVAL: Duration = Duration::from_secs(60);
+/// How long one spelling of a probe failure stays old news. The probe fires as often as every
+/// minute for as long as the fallback holds, so its failure is paced for a reader, not per tick.
+const PROBE_WARN_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Backend {
@@ -45,12 +48,14 @@ enum State {
 
 pub(crate) struct Failover {
     state: State,
+    warned: Option<(Instant, String)>,
 }
 
 impl Default for Failover {
     fn default() -> Self {
         Self {
             state: State::Primary { failures: 0 },
+            warned: None,
         }
     }
 }
@@ -161,13 +166,38 @@ impl Failover {
             }
         };
         self.state = next;
+        if switched == Some(Backend::Primary) {
+            self.warned = None;
+        }
         switched
+    }
+
+    /// Whether a probe failure spelled this way is news for this monitor: the first of an episode
+    /// is, a new spelling is, and otherwise one per `PROBE_WARN_INTERVAL`. The probe's own result
+    /// is discarded when the same tick falls back, so nothing downstream can report it.
+    pub(crate) fn probe_failure_is_news(&mut self, line: &str, now: Instant) -> bool {
+        if let Some((warned_at, warned)) = &self.warned
+            && warned == line
+            && now < *warned_at + PROBE_WARN_INTERVAL
+        {
+            return false;
+        }
+        self.warned = Some((now, line.to_owned()));
+        true
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const LOST: &str = "[dxgi] duplication access lost";
+    const DEVICE: &str = "[dxgi] graphics device error: removed";
+
+    /// Mirrors how `capture_all` composes the two calls at the overwrite branch.
+    fn warned(state: &mut Failover, switched: Option<Backend>, line: &str, now: Instant) -> bool {
+        switched.is_none() && state.probe_failure_is_news(line, now)
+    }
 
     fn failed_over(now: Instant) -> Failover {
         let mut state = Failover::default();
@@ -278,6 +308,89 @@ mod tests {
             state.target(start + Duration::from_secs(6)),
             Some(Backend::Fallback),
             "an idle answer must not grow the wait either"
+        );
+    }
+
+    #[test]
+    fn the_takeover_tick_is_no_probe_failure_and_leaves_the_first_real_one_its_news() {
+        let start = Instant::now();
+        let mut state = Failover::default();
+        for _ in 0..FAILOVER_AFTER - 1 {
+            state.record(Backend::Primary, Outcome::Failed, start);
+        }
+
+        let takeover = state.record(Backend::Primary, Outcome::Failed, start);
+        assert_eq!(takeover, Some(Backend::Fallback));
+        assert_eq!(
+            state.target(start),
+            Some(Backend::Fallback),
+            "the takeover tick enters the overwrite branch with no probe behind it"
+        );
+        assert!(!warned(&mut state, takeover, LOST, start));
+
+        state.record(Backend::Fallback, Outcome::Delivered, start);
+        let probe = start + FIRST_PROBE_DELAY;
+        assert_eq!(state.target(probe), Some(Backend::Primary));
+        let switched = state.record(Backend::Primary, Outcome::Failed, probe);
+        assert_eq!(switched, None, "a probe failure hands over nothing");
+        assert_eq!(
+            state.target(probe),
+            Some(Backend::Fallback),
+            "the same tick re-captures on the fallback, overwriting the probe's error"
+        );
+        assert!(
+            warned(&mut state, switched, LOST, probe),
+            "the takeover must not spend the episode's hour on the probe's behalf"
+        );
+    }
+
+    #[test]
+    fn the_same_probe_failure_within_the_hour_is_not_news_again() {
+        let start = Instant::now();
+        let mut state = failed_over(start);
+        assert!(state.probe_failure_is_news(LOST, start));
+        state.record(Backend::Fallback, Outcome::Delivered, start);
+        assert!(
+            !state.probe_failure_is_news(LOST, start + Duration::from_secs(1)),
+            "a working fallback must not make the probe's failure news every tick"
+        );
+        assert!(
+            !state
+                .probe_failure_is_news(LOST, start + PROBE_WARN_INTERVAL - Duration::from_secs(1))
+        );
+    }
+
+    #[test]
+    fn a_probe_failure_is_news_again_after_the_hour_and_whenever_its_text_changes() {
+        let start = Instant::now();
+        let mut state = failed_over(start);
+        assert!(state.probe_failure_is_news(LOST, start));
+        assert!(state.probe_failure_is_news(LOST, start + PROBE_WARN_INTERVAL));
+
+        let changed = start + PROBE_WARN_INTERVAL + Duration::from_secs(1);
+        assert!(state.probe_failure_is_news(DEVICE, changed));
+        assert!(
+            !state.probe_failure_is_news(DEVICE, changed + Duration::from_secs(1)),
+            "a new spelling must start its own hour, not skip the pacing"
+        );
+        assert!(state.probe_failure_is_news(DEVICE, changed + PROBE_WARN_INTERVAL));
+    }
+
+    #[test]
+    fn the_first_probe_failure_of_an_episode_is_news_on_a_fresh_state_and_after_a_recovery() {
+        let start = Instant::now();
+        assert!(Failover::default().probe_failure_is_news(LOST, start));
+
+        let mut state = failed_over(start);
+        assert!(state.probe_failure_is_news(LOST, start));
+        let recovered = start + FIRST_PROBE_DELAY;
+        assert_eq!(
+            state.record(Backend::Primary, Outcome::Answered, recovered),
+            Some(Backend::Primary)
+        );
+        assert!(
+            state.probe_failure_is_news(LOST, recovered + Duration::from_secs(1)),
+            "a new episode must not inherit the last one's suppression"
         );
     }
 
