@@ -150,11 +150,13 @@ fn save_registering(
         source,
     })?;
 
-    let (_temporary, mut file) = cw_core::atomic_file::create_temporary_beside(&destination)
-        .map_err(|source| StoreError::ImageIo {
-            path: destination.clone(),
-            source,
-        })?;
+    let (_temporary, mut file) = cw_core::atomic_file::create_undeletable_temporary_beside(
+        &destination,
+    )
+    .map_err(|source| StoreError::ImageIo {
+        path: destination.clone(),
+        source,
+    })?;
     let write_result =
         std::io::Write::write_all(&mut file, &encoded).and_then(|()| file.sync_all());
     if let Err(source) = write_result {
@@ -1529,6 +1531,104 @@ mod tests {
 
         assert_eq!(removed, 1);
         assert!(!leftover.exists());
+        assert!(saved.is_file());
+    }
+
+    #[test]
+    fn the_saver_holds_its_temporary_undeletable() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        const ERROR_SHARING_VIOLATION: i32 = 32;
+
+        let (dir, _conn, root) = database();
+        let taken_at = at(2026, 7, 30);
+        let database_path = dir.path().join("db.sqlite3");
+        let saving_root = root.clone();
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let stop_saving = std::sync::Arc::clone(&stop);
+        let saver = std::thread::spawn(move || {
+            let mut conn = db::open(&database_path).expect("the saver's connection should open");
+            let mut seed = 0u8;
+            while !stop_saving.load(Ordering::Relaxed) {
+                save_test_image(
+                    &mut conn,
+                    &saving_root,
+                    ulid::Ulid::generate(),
+                    taken_at,
+                    seed,
+                );
+                seed = seed.wrapping_add(1);
+            }
+        });
+
+        let leaf = root.join("2026").join("07").join("30");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut observed = 0usize;
+        let mut betrayed = None;
+        'poll: while observed == 0 && std::time::Instant::now() < deadline {
+            let Ok(entries) = std::fs::read_dir(&leaf) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                if !entry.file_name().to_string_lossy().contains(".tmp-") {
+                    continue;
+                }
+                let path = entry.path();
+                match cw_core::atomic_file::open_for_removal(&path) {
+                    // No save here fails, so nothing leaves residue: a temporary name that is
+                    // still there is one a live save is holding.
+                    Ok(_) => {
+                        betrayed = Some(format!("{} opened for removal", path.display()));
+                        break 'poll;
+                    }
+                    Err(source) if source.raw_os_error() == Some(ERROR_SHARING_VIOLATION) => {
+                        observed += 1;
+                    }
+                    Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(source) => {
+                        betrayed = Some(format!("{} answered {source:?}", path.display()));
+                        break 'poll;
+                    }
+                }
+            }
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        if let Err(panic) = saver.join() {
+            std::panic::resume_unwind(panic);
+        }
+
+        assert!(betrayed.is_none(), "{}", betrayed.unwrap_or_default());
+        assert!(
+            observed >= 1,
+            "the save loop never exposed a temporary to look at, so nothing was tested"
+        );
+    }
+
+    #[test]
+    fn a_temporary_a_live_save_holds_is_kept_and_collected_once_that_handle_closes() {
+        let (_dir, mut conn, root) = database();
+        let id = ulid::Ulid::generate();
+        let relative = save_test_image(&mut conn, &root, id, at(2026, 7, 30), 81);
+        let saved = root.join(relative);
+
+        let (temporary, file) = cw_core::atomic_file::create_undeletable_temporary_beside(&saved)
+            .expect("the live temporary should be reservable");
+
+        let removed =
+            sweep_orphan_files(&mut conn, &root).expect("the orphan sweep should succeed");
+
+        assert_eq!(removed, 0);
+        assert!(temporary.is_file());
+        assert!(saved.is_file());
+
+        drop(file);
+
+        let removed =
+            sweep_orphan_files(&mut conn, &root).expect("the orphan sweep should succeed");
+
+        assert_eq!(removed, 1);
+        assert!(!temporary.exists());
         assert!(saved.is_file());
     }
 

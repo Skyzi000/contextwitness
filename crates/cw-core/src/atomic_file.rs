@@ -13,6 +13,9 @@ const RENAMABLE_WRITE_ACCESS: u32 = 0x8000_0000 | 0x4000_0000 | 0x0001_0000;
 /// this is held. Unaffected are opening the file for reading or for writing with the sharing the
 /// standard library asks for, and renaming or removing it by name.
 const FULL_SHARE_MODE: u32 = 0x0000_0001 | 0x0000_0002 | 0x0000_0004;
+/// FILE_SHARE_READ | FILE_SHARE_WRITE — [`FULL_SHARE_MODE`] without FILE_SHARE_DELETE, so a
+/// newcomer asking for DELETE access is refused with a sharing violation while the handle lives.
+const UNDELETABLE_SHARE_MODE: u32 = 0x0000_0001 | 0x0000_0002;
 
 /// How many names are tried before giving up. Each attempt costs one failed `open`. Sixty-four
 /// leftovers from earlier runs — the process id in the name repeats — would exhaust it with nothing
@@ -30,6 +33,25 @@ const TEMPORARY_ATTEMPTS: u32 = 64;
 pub fn create_temporary_beside(
     destination: &std::path::Path,
 ) -> std::io::Result<(std::path::PathBuf, std::fs::File)> {
+    create_temporary_beside_sharing(destination, FULL_SHARE_MODE)
+}
+
+/// The same as [`create_temporary_beside`], except that while the returned handle lives no other
+/// handle can open the file with DELETE access, so an [`open_for_removal`] on it is refused with a
+/// sharing violation — the temporary while it is one, and the destination name from a
+/// [`rename_without_replacing`] until the handle closes. This handle's own DELETE right is
+/// untouched, and a handle closed without publishing — a crash — leaves the file open to removal
+/// again.
+pub fn create_undeletable_temporary_beside(
+    destination: &std::path::Path,
+) -> std::io::Result<(std::path::PathBuf, std::fs::File)> {
+    create_temporary_beside_sharing(destination, UNDELETABLE_SHARE_MODE)
+}
+
+fn create_temporary_beside_sharing(
+    destination: &std::path::Path,
+    share_mode: u32,
+) -> std::io::Result<(std::path::PathBuf, std::fs::File)> {
     use std::os::windows::fs::OpenOptionsExt;
 
     let mut last = std::io::Error::from(std::io::ErrorKind::AlreadyExists);
@@ -41,7 +63,7 @@ pub fn create_temporary_beside(
             .write(true)
             .create_new(true)
             .access_mode(RENAMABLE_WRITE_ACCESS)
-            .share_mode(FULL_SHARE_MODE)
+            .share_mode(share_mode)
             .open(&temporary)
         {
             Ok(file) => return Ok((temporary, file)),
@@ -345,6 +367,46 @@ mod tests {
             b"someone else's"
         );
         std::fs::remove_file(&destination).expect("the test file should be removable");
+    }
+
+    #[test]
+    fn a_live_undeletable_temporary_refuses_a_removal_open_and_frees_it_when_dropped() {
+        const ERROR_SHARING_VIOLATION: i32 = 32;
+
+        let destination = unique_temp_path("undeletable-temporary");
+        let (temporary, file) = create_undeletable_temporary_beside(&destination)
+            .expect("the temporary should be reservable");
+
+        let refused = open_for_removal(&temporary)
+            .expect_err("a live undeletable temporary must not open for removal");
+        assert_eq!(refused.raw_os_error(), Some(ERROR_SHARING_VIOLATION));
+
+        drop(file);
+
+        let file =
+            open_for_removal(&temporary).expect("a closed temporary should open for removal again");
+        delete_by_handle(&file).expect("the residue should be removable");
+        drop(file);
+        assert!(!temporary.exists());
+    }
+
+    #[test]
+    fn an_undeletable_temporary_still_renames_its_own_handle() {
+        let temp_dir = unique_temp_path("undeletable-temporary-rename");
+        std::fs::create_dir(&temp_dir).expect("the unique test directory should be creatable");
+        let destination = temp_dir.join("picture.webp");
+
+        let (temporary, file) = create_undeletable_temporary_beside(&destination)
+            .expect("the temporary should be reservable");
+        let renamed = rename_without_replacing(&file, &destination)
+            .expect("the publish should not fail on the handle's own share mode");
+        drop(file);
+
+        assert!(renamed, "the destination should have been free");
+        assert!(!temporary.exists());
+        assert!(destination.is_file());
+
+        std::fs::remove_dir_all(&temp_dir).expect("the test directory should be removable");
     }
 
     #[test]
