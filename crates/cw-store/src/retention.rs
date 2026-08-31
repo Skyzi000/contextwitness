@@ -1,3 +1,4 @@
+use crate::control_cursor::{head, load_cursor, store_cursor};
 use crate::{StoreError, images, timestamp};
 
 // `created_at` is compared as text, which is time order only for the spelling `timestamp::to_sql`
@@ -13,16 +14,11 @@ const SELECT_OLDEST_PAGE: &str = "SELECT created_at, observation_id, byte_size F
 const SELECT_HIGH_WATER: &str = "SELECT created_at, observation_id, byte_size FROM images \
      ORDER BY created_at DESC, observation_id DESC LIMIT 1";
 const SELECT_TOTAL_BYTES: &str = "SELECT total_bytes FROM image_budget WHERE id = 1";
-const SELECT_CURSOR: &str = "SELECT value FROM control_state WHERE key = ?1";
-const UPSERT_CURSOR: &str = "INSERT INTO control_state (key, value) VALUES (?1, ?2) \
-     ON CONFLICT(key) DO UPDATE SET value = excluded.value";
 
 /// The `control_state` key the expired pass's cursor is stored under.
 const EXPIRED_CURSOR: &str = "retention_expired_cursor";
 /// The `control_state` key the budget pass's cursor is stored under.
 const BUDGET_CURSOR: &str = "retention_budget_cursor";
-/// The spelling `timestamp::to_sql` writes cannot hold it.
-const CURSOR_SEPARATOR: char = '|';
 
 const BYTES_PER_GIB: u64 = 1 << 30;
 
@@ -42,6 +38,7 @@ pub struct Sweep {
     pub over_budget: usize,
     pub freed_bytes: u64,
     pub skipped: usize,
+    pub missing: usize,
     pub truncated: bool,
 }
 
@@ -83,7 +80,7 @@ pub fn sweep(
                 // Unconditionally: a row `delete_one` refuses must not be offered to every
                 // later page again.
                 cursor = (created_at.clone(), id.clone());
-                if delete_one(conn, root, id, *byte_size, &mut swept)? {
+                if delete_one(conn, root, id, *byte_size, &mut swept)?.is_some() {
                     swept.expired += 1;
                 }
             }
@@ -139,9 +136,17 @@ pub fn sweep(
             }
             // After the break: a fetched row this pass never examined stays ahead of the cursor.
             cursor = (created_at.clone(), id.clone());
-            if delete_one(conn, root, id, *byte_size, &mut swept)? {
+            if let Some(outcome) = delete_one(conn, root, id, *byte_size, &mut swept)? {
                 swept.over_budget += 1;
-                total = total.saturating_sub(*byte_size);
+                // Something else deleted the row, and this total was read before that: it charges
+                // for this row and for whatever else went with it, so subtracting one row's size
+                // leaves the pass deleting past the cap. What `image_budget` says now is what is
+                // actually stored.
+                total = if outcome == images::DeleteOutcome::NoRow {
+                    total_bytes(conn)?
+                } else {
+                    total.saturating_sub(*byte_size)
+                };
             }
         }
     }
@@ -159,63 +164,20 @@ pub fn sweep(
     Ok(swept)
 }
 
-fn head() -> (String, String) {
-    (String::new(), String::new())
-}
-
-/// The head is the empty spelling, and every other cursor carries both columns around one
-/// separator. Anything else in the row was written by something other than this program: reading it
-/// as the head costs one re-scan and can never skip a row.
-fn spell_cursor((created_at, id): &(String, String)) -> String {
-    if created_at.is_empty() {
-        String::new()
-    } else {
-        format!("{created_at}{CURSOR_SEPARATOR}{id}")
-    }
-}
-
-fn parse_cursor(value: &str) -> (String, String) {
-    match value.split_once(CURSOR_SEPARATOR) {
-        Some((created_at, id)) if !created_at.is_empty() => (created_at.to_owned(), id.to_owned()),
-        _ => head(),
-    }
-}
-
-fn load_cursor(conn: &rusqlite::Connection, key: &str) -> Result<(String, String), StoreError> {
-    let mut statement = conn
-        .prepare(SELECT_CURSOR)
-        .map_err(|source| StoreError::Sql { source })?;
-    let mut rows = statement
-        .query([key])
-        .map_err(|source| StoreError::Sql { source })?;
-    let Some(row) = rows.next().map_err(|source| StoreError::Sql { source })? else {
-        return Ok(head());
-    };
-    Ok(parse_cursor(&row.get::<_, String>(0).unwrap_or_default()))
-}
-
-fn store_cursor(
-    conn: &rusqlite::Connection,
-    key: &str,
-    cursor: &(String, String),
-) -> Result<(), StoreError> {
-    conn.execute(UPSERT_CURSOR, rusqlite::params![key, spell_cursor(cursor)])
-        .map(|_| ())
-        .map_err(|source| StoreError::Sql { source })
-}
-
 fn total_bytes(conn: &rusqlite::Connection) -> Result<i64, StoreError> {
     conn.query_one(SELECT_TOTAL_BYTES, [], |row| row.get(0))
         .map_err(|source| StoreError::Sql { source })
 }
 
+/// `None` when the row is still registered afterwards; otherwise what the goal state was reached
+/// by.
 fn delete_one(
     conn: &mut rusqlite::Connection,
     root: &std::path::Path,
     id: &str,
     byte_size: i64,
     swept: &mut Sweep,
-) -> Result<bool, StoreError> {
+) -> Result<Option<images::DeleteOutcome>, StoreError> {
     // `images::delete` looks a row up in the canonical spelling of the id, so a row holding any
     // other spelling would delete nothing and answer `Ok` — counted as freed while it still
     // charges its `byte_size` against the budget.
@@ -224,19 +186,22 @@ fn delete_one(
         .filter(|parsed| parsed.to_string() == id)
     else {
         swept.skipped += 1;
-        return Ok(false);
+        return Ok(None);
     };
 
     match images::delete(conn, root, parsed) {
-        Ok(()) => {
+        Ok(outcome) => {
+            if outcome == images::DeleteOutcome::MissingFile {
+                swept.missing += 1;
+            }
             swept.freed_bytes += u64::try_from(byte_size).unwrap_or(0);
-            Ok(true)
+            Ok(Some(outcome))
         }
         // One file the filesystem will not take back — or one row whose stored path cannot be read
         // back — must not decide whether every other expired image is deleted.
         Err(StoreError::ImageIo { .. } | StoreError::Encoding { .. }) => {
             swept.skipped += 1;
-            Ok(false)
+            Ok(None)
         }
         Err(other) => Err(other),
     }
@@ -365,6 +330,43 @@ mod tests {
             .expect("the image budget should be readable")
     }
 
+    /// A row with its file in place, so deleting it is a removal and not the missing-file case
+    /// every other planted row stands for.
+    fn save_registered(
+        conn: &mut rusqlite::Connection,
+        root: &std::path::Path,
+        index: u128,
+        created_at: DateTime<Utc>,
+    ) -> String {
+        let id = ulid::Ulid::from(index);
+        let spelled =
+            timestamp::to_sql(created_at).expect("the test timestamp should be spellable");
+        conn.execute(
+            "INSERT INTO observations (id, source, observed_at, schema_version, payload) \
+             VALUES (?1, 'screen', ?2, 1, '{}')",
+            rusqlite::params![id.to_string(), spelled],
+        )
+        .expect("the test observation should be storable");
+        let pixels = vec![7u8; 4 * 3 * 3];
+        images::save(conn, root, id, &pixels, 4, 3, 75.0, created_at)
+            .expect("the test image should be saved");
+        id.to_string()
+    }
+
+    /// A committed delete landing in the middle of a pass, standing in for the concurrent deleter a
+    /// single-threaded test cannot schedule: the trigger runs in the transaction that deletes
+    /// `after`.
+    fn delete_when_deleted(conn: &rusqlite::Connection, after: &str, taken: [&str; 2]) {
+        let [first, second] = taken;
+        conn.execute_batch(&format!(
+            "CREATE TRIGGER concurrent_deleter AFTER DELETE ON images \
+             WHEN old.observation_id = '{after}' BEGIN \
+               DELETE FROM images WHERE observation_id IN ('{first}', '{second}'); \
+             END"
+        ))
+        .expect("the concurrent-deleter trigger should be creatable");
+    }
+
     /// A committed save landing in the middle of a pass, standing in for the concurrent saver a
     /// single-threaded test cannot schedule: the trigger runs in the transaction that deletes
     /// `after`.
@@ -409,6 +411,7 @@ mod tests {
             Sweep {
                 expired: count,
                 freed_bytes: 100 * count as u64,
+                missing: count,
                 ..Sweep::default()
             }
         );
@@ -448,6 +451,7 @@ mod tests {
                 expired: 2 * PER_PAGE,
                 freed_bytes: 200 * PER_PAGE as u64,
                 skipped: 1,
+                missing: 2 * PER_PAGE,
                 ..Sweep::default()
             }
         );
@@ -478,6 +482,7 @@ mod tests {
             Sweep {
                 expired: PER_PAGE + 1,
                 freed_bytes: 100 * (PER_PAGE as u64 + 1),
+                missing: PER_PAGE + 1,
                 ..Sweep::default()
             }
         );
@@ -509,6 +514,7 @@ mod tests {
             Sweep {
                 over_budget: PER_PAGE + 1,
                 freed_bytes: (PER_PAGE as u64 + 1) * BYTES_PER_GIB,
+                missing: PER_PAGE + 1,
                 ..Sweep::default()
             }
         );
@@ -549,6 +555,7 @@ mod tests {
                 over_budget: PER_PAGE + 2,
                 freed_bytes: (PER_PAGE as u64 + 2) * BYTES_PER_GIB,
                 skipped: 1,
+                missing: PER_PAGE + 2,
                 ..Sweep::default()
             }
         );
@@ -556,6 +563,71 @@ mod tests {
         assert_eq!(left.len(), PER_PAGE);
         assert_eq!(left[0], planted[PER_PAGE - 1]);
         assert_eq!(budget(&conn), gib(PER_PAGE as i64));
+    }
+
+    #[test]
+    fn the_expired_pass_counts_only_the_rows_whose_file_was_already_gone_as_missing() {
+        let (_dir, mut conn, root) = store();
+        let start = now() - TimeDelta::days(30);
+        save_registered(&mut conn, &root, 1, start);
+        let gone = save_registered(&mut conn, &root, 2, start + TimeDelta::minutes(1));
+        std::fs::remove_file(root.join(images::relative_path(
+            ulid::Ulid::from(2u128),
+            start + TimeDelta::minutes(1),
+        )))
+        .expect("the second image should be removable without touching its row");
+        let stored = u64::try_from(budget(&conn)).expect("the test budget should fit u64");
+
+        let swept = sweep(&mut conn, &root, now(), 7, 1).expect("the sweep should run");
+
+        assert_eq!(
+            swept,
+            Sweep {
+                expired: 2,
+                freed_bytes: stored,
+                missing: 1,
+                ..Sweep::default()
+            }
+        );
+        assert!(registered(&conn).is_empty());
+        assert!(!root.join(&gone).exists());
+    }
+
+    #[test]
+    fn the_budget_pass_stops_at_the_cap_when_rows_ahead_of_it_go_with_the_one_it_deletes() {
+        let (_dir, mut conn, root) = store();
+        let start = now() - TimeDelta::days(30);
+        let planted = (0..2 * PER_PAGE)
+            .map(|step| {
+                register(
+                    &conn,
+                    100 + step as u128,
+                    start + TimeDelta::minutes(step as i64),
+                    gib(1),
+                )
+            })
+            .collect::<Vec<_>>();
+        // One row the pass reads next and one it would only reach on a later page: subtracting the
+        // size of the row it reaches leaves the total it carries still charging for the other.
+        delete_when_deleted(&conn, &planted[0], [&planted[1], &planted[4]]);
+
+        let swept =
+            sweep(&mut conn, &root, now(), KEEP_EVERYTHING, 3).expect("the sweep should run");
+
+        assert_eq!(
+            swept,
+            Sweep {
+                over_budget: 2,
+                freed_bytes: 2 * BYTES_PER_GIB,
+                missing: 1,
+                ..Sweep::default()
+            }
+        );
+        assert_eq!(
+            registered(&conn),
+            [planted[2].clone(), planted[3].clone(), planted[5].clone()]
+        );
+        assert_eq!(budget(&conn), gib(3));
     }
 
     #[test]
@@ -612,6 +684,7 @@ mod tests {
             Sweep {
                 over_budget: 2 * PER_PAGE,
                 freed_bytes: 2 * PER_PAGE as u64 * BYTES_PER_GIB,
+                missing: 2 * PER_PAGE,
                 ..Sweep::default()
             }
         );
@@ -651,6 +724,7 @@ mod tests {
             Sweep {
                 over_budget: 2 * PER_PAGE + 1,
                 freed_bytes: (2 * PER_PAGE as u64 + 1) * BYTES_PER_GIB,
+                missing: 2 * PER_PAGE + 1,
                 ..Sweep::default()
             }
         );
@@ -691,6 +765,7 @@ mod tests {
             Sweep {
                 over_budget: PER_PAGE,
                 freed_bytes: PER_PAGE as u64 * BYTES_PER_GIB,
+                missing: PER_PAGE,
                 ..Sweep::default()
             }
         );
@@ -720,6 +795,7 @@ mod tests {
             Sweep {
                 expired: reach,
                 freed_bytes: 100 * reach as u64,
+                missing: reach,
                 truncated: true,
                 ..Sweep::default()
             }
@@ -731,6 +807,7 @@ mod tests {
             Sweep {
                 expired: 1,
                 freed_bytes: 100,
+                missing: 1,
                 ..Sweep::default()
             }
         );
@@ -758,6 +835,7 @@ mod tests {
             Sweep {
                 over_budget: reach,
                 freed_bytes: reach as u64 * BYTES_PER_GIB,
+                missing: reach,
                 truncated: true,
                 ..Sweep::default()
             }
@@ -770,6 +848,7 @@ mod tests {
             Sweep {
                 over_budget: 1,
                 freed_bytes: BYTES_PER_GIB,
+                missing: 1,
                 ..Sweep::default()
             }
         );
@@ -806,6 +885,7 @@ mod tests {
             Sweep {
                 expired: 2,
                 freed_bytes: 200,
+                missing: 2,
                 ..Sweep::default()
             }
         );
@@ -854,6 +934,7 @@ mod tests {
             Sweep {
                 over_budget: 2,
                 freed_bytes: 2 * BYTES_PER_GIB,
+                missing: 2,
                 ..Sweep::default()
             }
         );
@@ -914,6 +995,7 @@ mod tests {
             Sweep {
                 over_budget: 2,
                 freed_bytes: 2 * BYTES_PER_GIB,
+                missing: 2,
                 ..Sweep::default()
             }
         );
@@ -955,6 +1037,7 @@ mod tests {
             Sweep {
                 expired: 2,
                 freed_bytes: 200,
+                missing: 2,
                 ..Sweep::default()
             }
         );
@@ -997,6 +1080,7 @@ mod tests {
             Sweep {
                 over_budget: 2,
                 freed_bytes: 2 * BYTES_PER_GIB,
+                missing: 2,
                 ..Sweep::default()
             }
         );
@@ -1024,6 +1108,7 @@ mod tests {
             Sweep {
                 over_budget: reach,
                 freed_bytes: reach as u64 * BYTES_PER_GIB,
+                missing: reach,
                 ..Sweep::default()
             }
         );
@@ -1038,6 +1123,7 @@ mod tests {
             Sweep {
                 over_budget: 3,
                 freed_bytes: 3 * BYTES_PER_GIB,
+                missing: 3,
                 ..Sweep::default()
             }
         );
@@ -1066,6 +1152,7 @@ mod tests {
             Sweep {
                 expired: reach,
                 freed_bytes: 100 * reach as u64,
+                missing: reach,
                 ..Sweep::default()
             }
         );
@@ -1092,6 +1179,7 @@ mod tests {
             Sweep {
                 expired: 2,
                 freed_bytes: 200,
+                missing: 2,
                 ..Sweep::default()
             }
         );
@@ -1118,6 +1206,7 @@ mod tests {
             Sweep {
                 over_budget: 2,
                 freed_bytes: 2 * BYTES_PER_GIB,
+                missing: 2,
                 ..Sweep::default()
             }
         );

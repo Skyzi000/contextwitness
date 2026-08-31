@@ -2,6 +2,7 @@
 //! Persistent storage functionality for ContextWitness.
 
 pub mod control;
+mod control_cursor;
 pub mod db;
 pub mod episodes;
 pub mod images;

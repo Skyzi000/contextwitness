@@ -1,5 +1,6 @@
 //! WebP image files and the database rows that record them.
 
+use crate::control_cursor::{Cursor, head, load_cursor, store_cursor};
 use crate::{StoreError, observations, timestamp};
 use chrono::Datelike;
 use std::collections::HashSet;
@@ -10,8 +11,50 @@ const COUNT_IMAGE_BY_ID: &str = "SELECT count(*) FROM images WHERE observation_i
 const SELECT_PATH_BY_ID: &str =
     "SELECT observation_id, relative_path, created_at FROM images WHERE observation_id = ?1";
 const DELETE_IMAGE: &str = "DELETE FROM images WHERE observation_id = ?1";
-const SELECT_IMAGE_ROWS: &str = "SELECT observation_id, relative_path, created_at FROM images ORDER BY created_at, observation_id";
 const SELECT_IMAGE_PATHS: &str = "SELECT observation_id, relative_path, created_at FROM images";
+// `created_at` is compared as text, which is time order only for the spelling `timestamp::to_sql`
+// writes.
+const SELECT_SCAN_PAGE: &str = "SELECT observation_id, relative_path, created_at FROM images \
+     WHERE (created_at, observation_id) > (?1, ?2) AND (created_at, observation_id) <= (?3, ?4) \
+     ORDER BY created_at, observation_id LIMIT ?5";
+const SELECT_SCAN_HIGH_WATER: &str = "SELECT created_at, observation_id FROM images \
+     ORDER BY created_at DESC, observation_id DESC LIMIT 1";
+
+/// The `control_state` key the row scan's cursor is stored under.
+const SCANNER_CURSOR: &str = "scanner_cursor";
+/// The `control_state` key the row scan's cycle mark is stored under.
+const SCANNER_HIGH_WATER: &str = "scanner_high_water";
+
+#[cfg(not(test))]
+const BATCH: i64 = 1000;
+#[cfg(test)]
+const BATCH: i64 = 3;
+
+#[cfg(not(test))]
+const MAX_PAGES: u32 = 100;
+#[cfg(test)]
+const MAX_PAGES: u32 = 4;
+
+/// What [`delete`] found under the id it was given.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteOutcome {
+    /// The row is gone and the file it named was unlinked.
+    Removed,
+    /// The row is gone and the image data was not there: the name empty, or the entry a link whose
+    /// target is gone.
+    MissingFile,
+    /// No row was registered under that id.
+    NoRow,
+}
+
+/// What one invocation of [`scan_orphan_rows`] saw.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RowScan {
+    pub examined: u64,
+    pub missing: Vec<String>,
+    pub undecodable: u64,
+    pub finished: bool,
+}
 
 /// Where an image for `id` taken at `at` is filed, relative to the image root.
 ///
@@ -246,8 +289,10 @@ fn save_registering(
 /// Remove an image and the row that registers it.
 ///
 /// This is an explicit request for one image, so it removes the row even when the file has already
-/// gone. Nothing that runs unasked may do that: [`orphan_rows`] reports a row whose file is gone
-/// and deletes nothing, and [`sweep_orphan_files`] removes a file only under the rule its own
+/// gone. The answer says which it was: the picture unlinked, the row removed for a picture that was
+/// not there any more, or no such row to begin with. Nothing that runs unasked may remove such a
+/// row: [`scan_orphan_rows`] reports a row whose file is gone and deletes nothing, and
+/// [`sweep_orphan_files`] removes a file only under the rule its own
 /// documentation gives, which states what that rule leaves out. Neither is allowed to decide a
 /// picture is expendable. The row is removed rather than marked, and that is deliberate; what goes
 /// on recording that there was a picture is the observation's payload, which keeps its path.
@@ -283,7 +328,7 @@ pub fn delete(
     conn: &mut rusqlite::Connection,
     root: &std::path::Path,
     id: ulid::Ulid,
-) -> Result<(), StoreError> {
+) -> Result<DeleteOutcome, StoreError> {
     let transaction = conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(|source| StoreError::Sql { source })?;
@@ -303,9 +348,12 @@ pub fn delete(
         transaction
             .commit()
             .map_err(|source| StoreError::Sql { source })?;
-        return Ok(());
+        return Ok(DeleteOutcome::NoRow);
     };
     let path = root.join(relative);
+    // Diagnosis only, and it decides nothing below.
+    let data_gone =
+        std::fs::metadata(&path).is_err_and(|source| source.kind() == std::io::ErrorKind::NotFound);
     let held = match cw_core::atomic_file::open_entry_for_removal(&path) {
         Ok(file) => Some(file),
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => None,
@@ -319,12 +367,17 @@ pub fn delete(
         .commit()
         .map_err(|source| StoreError::Sql { source })?;
 
-    if let Some(file) = held {
-        cw_core::atomic_file::delete_by_handle(&file)
-            .map_err(|source| StoreError::ImageIo { path, source })?;
-    }
+    let Some(file) = held else {
+        return Ok(DeleteOutcome::MissingFile);
+    };
+    cw_core::atomic_file::delete_by_handle(&file)
+        .map_err(|source| StoreError::ImageIo { path, source })?;
 
-    Ok(())
+    Ok(if data_gone {
+        DeleteOutcome::MissingFile
+    } else {
+        DeleteOutcome::Removed
+    })
 }
 
 /// A file is removed only when nothing registered names it, it still resolves to the name it was
@@ -497,37 +550,150 @@ fn sweep_collected_files(
     Ok(removed)
 }
 
-/// Report rows whose file is gone. Nothing is deleted.
-pub fn orphan_rows(
-    conn: &rusqlite::Connection,
+/// Report rows whose file is gone, a bounded stretch of the table per invocation. Nothing is
+/// deleted, and nothing is written but the two keys that carry the cycle.
+///
+/// A cycle starts by marking the newest key in the table and walks the index up to that mark; a row
+/// saved after the mark is left for the next cycle, and the mark lives in `control_state` beside the
+/// cursor, so a restart resumes under the same one. An invocation that runs out of pages answers
+/// `finished: false` and leaves the cursor where it stood; the one that drains the range returns
+/// both keys to the head, so the next cycle takes a fresh mark and re-offers every row — including
+/// the ones this cycle could not read back.
+pub fn scan_orphan_rows(
+    conn: &mut rusqlite::Connection,
     root: &std::path::Path,
-) -> Result<Vec<String>, StoreError> {
+) -> Result<RowScan, StoreError> {
+    let mut scan = RowScan::default();
+    let (mut cursor, mut high_water) = load_keys(conn)?;
+    if high_water == head() {
+        let Some(mark) = newest_key(conn)? else {
+            scan.finished = true;
+            return Ok(scan);
+        };
+        high_water = mark;
+    }
+
+    let mut finished = false;
+    for _ in 0..MAX_PAGES {
+        let batch = scan_page(
+            conn,
+            rusqlite::params![cursor.0, cursor.1, high_water.0, high_water.1, BATCH],
+        )?;
+        if batch.is_empty() {
+            finished = true;
+            break;
+        }
+        for (created_at, id, relative) in batch {
+            cursor = (created_at, id);
+            scan.examined += 1;
+            let relative = match relative {
+                Ok(relative) => relative,
+                // Stepped over, not propagated: a row no reader can spell would otherwise hold up
+                // every row behind it, on this cycle and on every one after it.
+                Err(StoreError::Encoding { .. } | StoreError::ImageIo { .. }) => {
+                    scan.undecodable += 1;
+                    continue;
+                }
+                Err(other) => return Err(other),
+            };
+            match std::fs::metadata(root.join(&relative)) {
+                Ok(metadata) if metadata.is_file() => {}
+                Ok(_) => scan.missing.push(relative),
+                Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                    scan.missing.push(relative);
+                }
+                Err(source) => {
+                    return Err(StoreError::ImageIo {
+                        path: root.join(relative),
+                        source,
+                    });
+                }
+            }
+        }
+    }
+    // The last permitted page can reach the mark without a further page running to find nothing
+    // above it.
+    if !finished {
+        finished = cursor == high_water;
+    }
+    if finished {
+        store_keys(conn, &head(), &head())?;
+    } else {
+        store_keys(conn, &cursor, &high_water)?;
+    }
+    scan.finished = finished;
+
+    Ok(scan)
+}
+
+/// One page of `(created_at, observation_id, the path the row validates to)`.
+type ScanPage = Vec<(String, String, Result<String, StoreError>)>;
+
+fn scan_page(
+    conn: &rusqlite::Connection,
+    params: impl rusqlite::Params,
+) -> Result<ScanPage, StoreError> {
     let mut statement = conn
-        .prepare(SELECT_IMAGE_ROWS)
+        .prepare(SELECT_SCAN_PAGE)
+        .map_err(|source| StoreError::Sql { source })?;
+    let mut rows = statement
+        .query(params)
+        .map_err(|source| StoreError::Sql { source })?;
+    let mut batch = Vec::new();
+
+    while let Some(row) = rows.next().map_err(|source| StoreError::Sql { source })? {
+        let id: String = row.get(0).map_err(|source| StoreError::Sql { source })?;
+        let created_at: String = row.get(2).map_err(|source| StoreError::Sql { source })?;
+        batch.push((created_at, id, image_path_from_row(row)));
+    }
+
+    Ok(batch)
+}
+
+fn newest_key(conn: &rusqlite::Connection) -> Result<Option<Cursor>, StoreError> {
+    let mut statement = conn
+        .prepare(SELECT_SCAN_HIGH_WATER)
         .map_err(|source| StoreError::Sql { source })?;
     let mut rows = statement
         .query([])
         .map_err(|source| StoreError::Sql { source })?;
-    let mut orphaned = Vec::new();
+    let Some(row) = rows.next().map_err(|source| StoreError::Sql { source })? else {
+        return Ok(None);
+    };
+    let key = (
+        row.get(0).map_err(|source| StoreError::Sql { source })?,
+        row.get(1).map_err(|source| StoreError::Sql { source })?,
+    );
+    Ok(Some(key))
+}
 
-    while let Some(row) = rows.next().map_err(|source| StoreError::Sql { source })? {
-        let relative = image_path_from_row(row)?;
-        match std::fs::metadata(root.join(&relative)) {
-            Ok(metadata) if metadata.is_file() => {}
-            Ok(_) => orphaned.push(relative),
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-                orphaned.push(relative);
-            }
-            Err(source) => {
-                return Err(StoreError::ImageIo {
-                    path: root.join(relative),
-                    source,
-                });
-            }
-        }
+/// The two keys are only ever written together, so a cursor without its mark — or a mark without
+/// its cursor — is a pair no invocation stored, and the cycle it belonged to cannot be resumed
+/// under a bound this reader can trust. Both are read as the head, which starts a fresh cycle.
+fn load_keys(conn: &rusqlite::Connection) -> Result<(Cursor, Cursor), StoreError> {
+    let cursor = load_cursor(conn, SCANNER_CURSOR)?;
+    let high_water = load_cursor(conn, SCANNER_HIGH_WATER)?;
+    if (cursor == head()) != (high_water == head()) {
+        return Ok((head(), head()));
     }
+    Ok((cursor, high_water))
+}
 
-    Ok(orphaned)
+/// In one transaction: an invocation that stored its cursor without its mark, or the other way
+/// round, would leave the pair `load_keys` refuses.
+fn store_keys(
+    conn: &mut rusqlite::Connection,
+    cursor: &Cursor,
+    high_water: &Cursor,
+) -> Result<(), StoreError> {
+    let transaction = conn
+        .transaction()
+        .map_err(|source| StoreError::Sql { source })?;
+    store_cursor(&transaction, SCANNER_CURSOR, cursor)?;
+    store_cursor(&transaction, SCANNER_HIGH_WATER, high_water)?;
+    transaction
+        .commit()
+        .map_err(|source| StoreError::Sql { source })
 }
 
 /// Discard the file `save` wrote, whichever name it answers to now.
@@ -687,15 +853,21 @@ fn decode_image_path(
 
 #[cfg(test)]
 mod tests {
-    use super::{delete, orphan_rows, save, sweep_collected_files, sweep_orphan_files};
+    use super::{
+        BATCH, DeleteOutcome, MAX_PAGES, RowScan, SCANNER_CURSOR, SCANNER_HIGH_WATER, delete, save,
+        scan_orphan_rows, sweep_collected_files, sweep_orphan_files,
+    };
     use crate::{StoreError, db, observations, timestamp};
-    use chrono::{DateTime, TimeZone, Utc};
+    use chrono::{DateTime, TimeDelta, TimeZone, Utc};
     use cw_core::model::{Observation, OcrStatus, ScreenPayload};
     use std::collections::HashSet;
     use tempfile::{TempDir, tempdir};
 
     const WIDTH: u32 = 4;
     const HEIGHT: u32 = 3;
+    const PER_PAGE: usize = BATCH as usize;
+    /// More rows than one invocation of the scan may read.
+    const REACH: usize = PER_PAGE * MAX_PAGES as usize;
 
     fn database() -> (TempDir, rusqlite::Connection, std::path::PathBuf) {
         let dir = tempdir().expect("the temporary image directory should be creatable");
@@ -786,6 +958,50 @@ mod tests {
         insert_observation(conn, id, taken_at);
         save(conn, root, id, &pixels(seed), WIDTH, HEIGHT, 75.0, taken_at)
             .expect("the synthetic image should be saved")
+    }
+
+    /// Registers a row with no file beside it, so a scan reports its name without a picture being
+    /// encoded per row.
+    fn register_row(conn: &rusqlite::Connection, index: u128, taken_at: DateTime<Utc>) -> String {
+        let id = ulid::Ulid::from(index);
+        insert_observation(conn, id, taken_at);
+        let relative = super::relative_path(id, taken_at);
+        conn.execute(
+            "INSERT INTO images (observation_id, relative_path, byte_size, created_at) \
+             VALUES (?1, ?2, 1, ?3)",
+            rusqlite::params![
+                id.to_string(),
+                relative,
+                timestamp::to_sql(taken_at).expect("the test timestamp should be spellable")
+            ],
+        )
+        .expect("the test image row should be storable");
+        relative
+    }
+
+    /// One row per minute from `start`, one more than a single invocation of the scan may read.
+    fn register_more_than_one_scan(
+        conn: &rusqlite::Connection,
+        start: DateTime<Utc>,
+    ) -> Vec<String> {
+        (0..=REACH)
+            .map(|step| {
+                register_row(
+                    conn,
+                    1 + step as u128,
+                    start + TimeDelta::minutes(step as i64),
+                )
+            })
+            .collect()
+    }
+
+    fn control_value(conn: &rusqlite::Connection, key: &str) -> String {
+        conn.query_row(
+            "SELECT value FROM control_state WHERE key = ?1",
+            [key],
+            |row| row.get(0),
+        )
+        .expect("the scan's control row should be readable")
     }
 
     #[test]
@@ -1213,8 +1429,9 @@ mod tests {
         let path = root.join(relative);
         let before = observation_row(&conn, &id.to_string());
 
-        delete(&mut conn, &root, id).expect("the image should be deleted");
+        let outcome = delete(&mut conn, &root, id).expect("the image should be deleted");
 
+        assert_eq!(outcome, DeleteOutcome::Removed);
         assert!(!path.exists());
         let count: i64 = conn
             .query_row(
@@ -1248,8 +1465,9 @@ mod tests {
         std::fs::remove_file(root.join(relative))
             .expect("the saved file should be removable without touching its row");
 
-        delete(&mut conn, &root, id).expect("the explicit deletion should succeed");
+        let outcome = delete(&mut conn, &root, id).expect("the explicit deletion should succeed");
 
+        assert_eq!(outcome, DeleteOutcome::MissingFile);
         let count: i64 = conn
             .query_row(
                 "SELECT count(*) FROM images WHERE observation_id = ?1",
@@ -1274,8 +1492,9 @@ mod tests {
             return;
         };
 
-        delete(&mut conn, &root, id).expect("the dangling symlink should be deleted");
+        let outcome = delete(&mut conn, &root, id).expect("the dangling symlink should be deleted");
 
+        assert_eq!(outcome, DeleteOutcome::MissingFile);
         let count: i64 = conn
             .query_row(
                 "SELECT count(*) FROM images WHERE observation_id = ?1",
@@ -1303,8 +1522,10 @@ mod tests {
             return;
         };
 
-        delete(&mut conn, &root, id).expect("the link standing at the name should be deleted");
+        let outcome =
+            delete(&mut conn, &root, id).expect("the link standing at the name should be deleted");
 
+        assert_eq!(outcome, DeleteOutcome::Removed);
         assert!(path.symlink_metadata().is_err());
         assert!(target.is_file());
     }
@@ -1372,8 +1593,6 @@ mod tests {
             delete(&mut conn, &root, id).expect_err("delete should refuse the malformed path"),
             sweep_orphan_files(&mut conn, &root)
                 .expect_err("the sweep should refuse the malformed path"),
-            orphan_rows(&conn, &root)
-                .expect_err("the orphan report should refuse the malformed path"),
         ];
 
         for error in errors {
@@ -1382,6 +1601,9 @@ mod tests {
                 other => panic!("expected Encoding, got {other:?}"),
             }
         }
+        let scan = scan_orphan_rows(&mut conn, &root).expect("the scan should step past the row");
+        assert_eq!(scan.undecodable, 1);
+        assert!(scan.missing.is_empty());
         assert!(path.is_file());
     }
 
@@ -1417,8 +1639,6 @@ mod tests {
                 .expect_err("delete should refuse the non-canonical timestamp"),
             sweep_orphan_files(&mut conn, &root)
                 .expect_err("the sweep should refuse the non-canonical timestamp"),
-            orphan_rows(&conn, &root)
-                .expect_err("the orphan report should refuse the non-canonical timestamp"),
         ];
 
         for error in errors {
@@ -1427,6 +1647,9 @@ mod tests {
                 other => panic!("expected Encoding, got {other:?}"),
             }
         }
+        let scan = scan_orphan_rows(&mut conn, &root).expect("the scan should step past the row");
+        assert_eq!(scan.undecodable, 1);
+        assert!(scan.missing.is_empty());
         assert!(path.is_file());
     }
 
@@ -1468,20 +1691,20 @@ mod tests {
 
         // `delete` answers the question asked: no row exists under the canonical id. Searching for
         // equivalent spellings would put an unindexed scan on the retention path.
-        delete(&mut conn, &root, id).expect("the canonical id should have nothing to delete");
+        assert_eq!(
+            delete(&mut conn, &root, id).expect("the canonical id should have nothing to delete"),
+            DeleteOutcome::NoRow
+        );
 
-        let errors = [
-            sweep_orphan_files(&mut conn, &root)
-                .expect_err("the sweep should refuse the non-canonical id"),
-            orphan_rows(&conn, &root)
-                .expect_err("the orphan report should refuse the non-canonical id"),
-        ];
-        for error in errors {
-            match error {
-                StoreError::Encoding { id: actual, .. } => assert_eq!(actual, stored_id),
-                other => panic!("expected Encoding for {stored_id}, got {other:?}"),
-            }
+        match sweep_orphan_files(&mut conn, &root)
+            .expect_err("the sweep should refuse the non-canonical id")
+        {
+            StoreError::Encoding { id: actual, .. } => assert_eq!(actual, stored_id),
+            other => panic!("expected Encoding for {stored_id}, got {other:?}"),
         }
+        let scan = scan_orphan_rows(&mut conn, &root).expect("the scan should step past the row");
+        assert_eq!(scan.undecodable, 1);
+        assert!(scan.missing.is_empty());
         assert!(path.is_file());
     }
 
@@ -1688,7 +1911,9 @@ mod tests {
         assert!(!left_behind.exists());
         assert!(root.join(second_relative).is_file());
         assert_eq!(
-            orphan_rows(&conn, &root).expect("orphan rows should be reportable"),
+            scan_orphan_rows(&mut conn, &root)
+                .expect("the scan should run")
+                .missing,
             [first_relative]
         );
     }
@@ -2145,7 +2370,7 @@ mod tests {
     }
 
     #[test]
-    fn orphan_rows_without_file_are_reported_and_kept() {
+    fn scanned_rows_without_file_are_reported_and_kept() {
         let (_dir, mut conn, root) = database();
         // Saved newest-first, so the promised order — the order the pictures were taken — cannot
         // be mistaken for the insertion order an unordered scan would answer with.
@@ -2158,9 +2383,17 @@ mod tests {
         std::fs::remove_file(root.join(&earlier_relative))
             .expect("the saved file should be removable without touching its row");
 
-        let rows = orphan_rows(&conn, &root).expect("orphan rows should be reportable");
+        let scan = scan_orphan_rows(&mut conn, &root).expect("the scan should run");
 
-        assert_eq!(rows, [earlier_relative, later_relative]);
+        assert_eq!(
+            scan,
+            RowScan {
+                examined: 2,
+                missing: vec![earlier_relative, later_relative],
+                undecodable: 0,
+                finished: true,
+            }
+        );
         let count: i64 = conn
             .query_row("SELECT count(*) FROM images", [], |row| row.get(0))
             .expect("the image count should be readable");
@@ -2181,8 +2414,9 @@ mod tests {
         };
 
         assert!(
-            orphan_rows(&conn, &root)
-                .expect("the report should succeed")
+            scan_orphan_rows(&mut conn, &root)
+                .expect("the scan should run")
+                .missing
                 .is_empty()
         );
     }
@@ -2197,9 +2431,197 @@ mod tests {
         std::fs::create_dir(&registered).expect("a directory should take the freed name");
 
         assert_eq!(
-            orphan_rows(&conn, &root).expect("the report should succeed"),
+            scan_orphan_rows(&mut conn, &root)
+                .expect("the scan should run")
+                .missing,
             vec![relative]
         );
+    }
+
+    #[test]
+    fn a_scan_of_an_empty_table_finishes_without_marking_anything() {
+        let (_dir, mut conn, root) = database();
+
+        let scan = scan_orphan_rows(&mut conn, &root).expect("the scan should run");
+
+        assert_eq!(
+            scan,
+            RowScan {
+                finished: true,
+                ..RowScan::default()
+            }
+        );
+        let stored: i64 = conn
+            .query_row("SELECT count(*) FROM control_state", [], |row| row.get(0))
+            .expect("the control rows should be countable");
+        assert_eq!(stored, 0);
+    }
+
+    #[test]
+    fn the_scan_resumes_under_its_mark_after_running_out_of_pages_and_a_reopen() {
+        let (dir, mut conn, root) = database();
+        let planted = register_more_than_one_scan(&conn, at(2026, 7, 1));
+
+        let first = scan_orphan_rows(&mut conn, &root).expect("the first scan should run");
+        assert_eq!(first.examined, REACH as u64);
+        assert_eq!(first.missing, planted[..REACH]);
+        assert!(!first.finished);
+
+        drop(conn);
+        let mut conn =
+            db::open(&dir.path().join("db.sqlite3")).expect("the store should reopen in place");
+
+        let second = scan_orphan_rows(&mut conn, &root).expect("the second scan should run");
+        assert_eq!(second.examined, 1);
+        assert_eq!(second.missing, planted[REACH..]);
+        assert!(second.finished);
+    }
+
+    #[test]
+    fn a_row_saved_above_the_mark_waits_for_the_cycle_after_it() {
+        let (_dir, mut conn, root) = database();
+        let planted = register_more_than_one_scan(&conn, at(2026, 7, 1));
+        assert!(
+            !scan_orphan_rows(&mut conn, &root)
+                .expect("the first scan should run")
+                .finished
+        );
+
+        let late = register_row(&conn, 500, at(2026, 8, 1));
+
+        let second = scan_orphan_rows(&mut conn, &root).expect("the second scan should run");
+        assert_eq!(second.missing, planted[REACH..]);
+        assert!(second.finished);
+
+        let third = scan_orphan_rows(&mut conn, &root).expect("the third scan should run");
+        let fourth = scan_orphan_rows(&mut conn, &root).expect("the fourth scan should run");
+        assert!(!third.missing.contains(&late));
+        assert!(fourth.missing.contains(&late));
+    }
+
+    #[test]
+    fn a_row_the_scan_cannot_read_back_is_counted_and_the_rows_behind_it_still_examined() {
+        let (_dir, mut conn, root) = database();
+        let start = at(2026, 7, 1);
+        // One row past the first page, so what carries the scan over the unreadable row is the
+        // cursor and not the page it happened to sit in.
+        let planted: Vec<String> = (0..=PER_PAGE)
+            .map(|step| {
+                register_row(
+                    &conn,
+                    1 + step as u128,
+                    start + TimeDelta::minutes(step as i64),
+                )
+            })
+            .collect();
+        conn.execute(
+            "UPDATE images SET relative_path = 'not a path this program would write' \
+             WHERE observation_id = ?1",
+            [ulid::Ulid::from(2u128).to_string()],
+        )
+        .expect("the planted path should be storable");
+
+        let scan = scan_orphan_rows(&mut conn, &root).expect("the scan should run");
+
+        assert_eq!(scan.examined, planted.len() as u64);
+        assert_eq!(scan.undecodable, 1);
+        assert_eq!(scan.missing, [&planted[..1], &planted[2..]].concat());
+        assert!(scan.finished);
+    }
+
+    #[test]
+    fn a_cursor_stored_without_its_mark_starts_the_cycle_over() {
+        let (_dir, mut conn, root) = database();
+        let start = at(2026, 7, 1);
+        let planted = register_more_than_one_scan(&conn, start);
+        // Past every row, so a scan that took this cursor for a resumable one would answer that
+        // there was nothing left to look at.
+        let spelled = format!(
+            "{}|{}",
+            timestamp::to_sql(start + TimeDelta::minutes(REACH as i64))
+                .expect("the test timestamp should be spellable"),
+            ulid::Ulid::from(1 + REACH as u128)
+        );
+        conn.execute(
+            "INSERT INTO control_state (key, value) VALUES (?1, ?2)",
+            rusqlite::params![SCANNER_CURSOR, spelled],
+        )
+        .expect("the half-stored cursor should be storable");
+
+        let scan = scan_orphan_rows(&mut conn, &root).expect("the scan should run");
+
+        assert_eq!(scan.examined, REACH as u64);
+        assert_eq!(scan.missing, planted[..REACH]);
+        assert!(!scan.finished);
+    }
+
+    #[test]
+    fn a_range_drained_by_the_last_permitted_page_is_finished() {
+        let (_dir, mut conn, root) = database();
+        let start = at(2026, 7, 1);
+        // Exactly one invocation's budget: no further page runs to find the range empty, so what
+        // ends the cycle is the cursor having reached the mark.
+        for step in 0..REACH {
+            register_row(
+                &conn,
+                1 + step as u128,
+                start + TimeDelta::minutes(step as i64),
+            );
+        }
+
+        let scan = scan_orphan_rows(&mut conn, &root).expect("the scan should run");
+
+        assert_eq!(scan.examined, REACH as u64);
+        assert!(scan.finished);
+        assert_eq!(control_value(&conn, SCANNER_CURSOR), "");
+        assert_eq!(control_value(&conn, SCANNER_HIGH_WATER), "");
+    }
+
+    #[test]
+    fn a_cycle_whose_mark_row_was_deleted_is_finished_by_its_empty_page() {
+        let (_dir, mut conn, root) = database();
+        let planted = register_more_than_one_scan(&conn, at(2026, 7, 1));
+        assert!(
+            !scan_orphan_rows(&mut conn, &root)
+                .expect("the first scan should run")
+                .finished
+        );
+        // The row the mark names, so the cursor can never reach it and only an empty page is left
+        // to say the range is drained.
+        conn.execute(
+            "DELETE FROM images WHERE relative_path = ?1",
+            [&planted[REACH]],
+        )
+        .expect("the marked row should be deletable");
+
+        let scan = scan_orphan_rows(&mut conn, &root).expect("the second scan should run");
+
+        assert_eq!(scan.examined, 0);
+        assert!(scan.finished);
+        assert_eq!(control_value(&conn, SCANNER_CURSOR), "");
+        assert_eq!(control_value(&conn, SCANNER_HIGH_WATER), "");
+    }
+
+    #[test]
+    fn the_scan_returns_both_keys_to_the_head_once_the_cycle_ends() {
+        let (_dir, mut conn, root) = database();
+        register_more_than_one_scan(&conn, at(2026, 7, 1));
+
+        assert!(
+            !scan_orphan_rows(&mut conn, &root)
+                .expect("the first scan should run")
+                .finished
+        );
+        assert!(!control_value(&conn, SCANNER_CURSOR).is_empty());
+        assert!(!control_value(&conn, SCANNER_HIGH_WATER).is_empty());
+
+        assert!(
+            scan_orphan_rows(&mut conn, &root)
+                .expect("the second scan should run")
+                .finished
+        );
+        assert_eq!(control_value(&conn, SCANNER_CURSOR), "");
+        assert_eq!(control_value(&conn, SCANNER_HIGH_WATER), "");
     }
 
     #[test]
