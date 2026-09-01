@@ -1,14 +1,17 @@
 use cw_core::config::{Config, DataPaths};
 use tracing::{error, info, warn};
 
-/// Plan Task 21's cadence for the retention sweep.
+/// Plan Task 21's hourly maintenance cadence.
 const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 /// The cadence taken instead while a pass has work it did not reach.
 const SHORT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Run retention and the image-row scan on this thread until the process ends: once now, then
-/// hourly, or every minute for as long as either has more to do than one pass may take.
+/// Run retention, the image-row scan and the orphan-file sweep on this thread until the process
+/// ends: once now, then hourly, or every minute for as long as either paged pass has more to do
+/// than one wake may take. The file sweep walks the whole image tree, so it keeps its hourly
+/// cadence through those catch-up wakes instead of re-walking every minute.
 pub fn run(mut conn: rusqlite::Connection, paths: DataPaths, config: Config) -> ! {
+    let mut sweep_due = std::time::Instant::now();
     loop {
         // A pass that failed shortens nothing: what it did not reach is unknown, and a wake every
         // minute would only repeat the failure.
@@ -57,6 +60,14 @@ pub fn run(mut conn: rusqlite::Connection, paths: DataPaths, config: Config) -> 
             }
             Err(error) => error!("scanning for missing image files failed: {error}"),
         }
+        if std::time::Instant::now() >= sweep_due {
+            match cw_store::images::sweep_orphan_files(&mut conn, &paths.images()) {
+                Ok(0) => {}
+                Ok(removed) => info!(removed, "collected unregistered image files"),
+                Err(error) => error!("sweeping orphan image files failed: {error}"),
+            }
+            sweep_due = std::time::Instant::now() + SWEEP_INTERVAL;
+        }
         std::thread::sleep(next_interval(scan_finished, retention_truncated));
     }
 }
@@ -66,18 +77,6 @@ fn next_interval(scan_finished: bool, retention_truncated: bool) -> std::time::D
         SWEEP_INTERVAL
     } else {
         SHORT_INTERVAL
-    }
-}
-
-/// Collect image files a previous run renamed into place but never registered. Still a startup
-/// pass, but no longer only by convention: the judgement and removal inside hold the store's write
-/// lock, so a saver in another process — a second session's daemon, a concurrent `capture-once` —
-/// cannot have a file taken between its rename and its commit.
-pub fn sweep_orphans(conn: &mut rusqlite::Connection, paths: &DataPaths) {
-    match cw_store::images::sweep_orphan_files(conn, &paths.images()) {
-        Ok(0) => {}
-        Ok(removed) => info!(removed, "collected unregistered image files"),
-        Err(error) => error!("sweeping orphan image files failed: {error}"),
     }
 }
 

@@ -11,7 +11,6 @@ const COUNT_IMAGE_BY_ID: &str = "SELECT count(*) FROM images WHERE observation_i
 const SELECT_PATH_BY_ID: &str =
     "SELECT observation_id, relative_path, created_at FROM images WHERE observation_id = ?1";
 const DELETE_IMAGE: &str = "DELETE FROM images WHERE observation_id = ?1";
-const SELECT_IMAGE_PATHS: &str = "SELECT observation_id, relative_path, created_at FROM images";
 // `created_at` is compared as text, which is time order only for the spelling `timestamp::to_sql`
 // writes.
 const SELECT_SCAN_PAGE: &str = "SELECT observation_id, relative_path, created_at FROM images \
@@ -34,6 +33,12 @@ const BATCH: i64 = 3;
 const MAX_PAGES: u32 = 100;
 #[cfg(test)]
 const MAX_PAGES: u32 = 4;
+
+/// How many candidates one sweep transaction judges and removes.
+#[cfg(not(test))]
+const SWEEP_BATCH: usize = 100;
+#[cfg(test)]
+const SWEEP_BATCH: usize = 2;
 
 /// What [`delete`] found under the id it was given.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,7 +104,7 @@ pub fn save(
 /// [`save`], with `observation` inserted into the same transaction as the image row.
 ///
 /// The two rows commit together or not at all. Committing the observation first leaves, on a crash
-/// in between, a row whose payload names an image that will never be written: the startup sweep
+/// in between, a row whose payload names an image that will never be written: the orphan sweep
 /// reconciles unregistered files and registered rows and has nothing to say about that path, so it
 /// stays and every episode carrying that observation carries the dead name with it. A crash before
 /// this commit leaves at most an unregistered file, which is what [`save`] leaves and what
@@ -323,7 +328,7 @@ fn save_registering(
 ///
 /// Empty day directories are left behind on purpose, because pruning one could race with [`save`]
 /// between creating that directory and opening its temporary file, while a few hundred empty
-/// entries a year cost nothing and only the startup sweep walks them.
+/// entries a year cost nothing and only the orphan sweep walks them.
 pub fn delete(
     conn: &mut rusqlite::Connection,
     root: &std::path::Path,
@@ -380,32 +385,20 @@ pub fn delete(
     })
 }
 
-/// A file is removed only when nothing registered names it, it still resolves to the name it was
-/// listed under, and it is not what one of the registered names reaches. That last question is put
-/// to the registered names no enumerated file spelled and not to every row; the comment inside says
-/// what that leaves out and what asking about all of them would cost. Reports how many removals the
-/// filesystem accepted; one held open elsewhere leaves when that handle closes. A registered name
-/// that is there and will not say which file it reaches stops the pass with nothing removed,
-/// because any candidate could be the file it reaches — so `Ok(0)` also means that, and not only
-/// that there was nothing to collect.
+/// Collect image files no row registers. Reports how many removals the filesystem accepted.
 ///
-/// The walk beneath the root enters real directories and takes real files only. An entry that is
-/// neither — a junction standing where a date directory should, which only something outside this
-/// store puts there, because [`save`] creates real directories — is not entered, and a file
-/// beneath it is out of this walk's reach.
+/// A file is removed unless a row spells its exact relative path, or it does not resolve to the
+/// name it was enumerated under, or the filesystem refuses. Manual symlinks, renames and database
+/// surgery inside the image tree are unsupported: the sweep may collect what such arrangements
+/// leave reachable, and [`scan_orphan_rows`] reports what they broke as missing rows.
 ///
-/// The judgement and the removals hold the store's write lock, which is the same lock [`save`]
-/// holds across its rename and its commit, so no pass can catch a save between the two: a file
-/// renamed into place is registered by the time this reads the rows, or the save that renamed it
-/// never committed and it is an orphan. A save running now waits for this pass, or this pass waits
-/// for it. Nothing outside the database is asked to arrange that, which is what a session-local
-/// mutex could never do for a second process sharing the same data directory.
-///
-/// What that costs is the lock's holding time: it is taken for the whole judgement and every
-/// unlink, so a backlog of real orphans holds it until they are gone, and a save that waits past
-/// `busy_timeout` — 5000ms — is answered `SQLITE_BUSY`. That save fails and says so, which is one
-/// capture lost with an error naming why, and it is what this order buys: what it closes is the
-/// same store losing a picture it had registered, silently, to a sweep in another process.
+/// The walk beneath the root enters real directories and takes real files only, and it runs outside
+/// the write lock. Each batch of candidates is judged and removed under one transaction holding
+/// that lock — the same lock [`save`] holds across its rename and its commit, so a file renamed
+/// into place is registered by the time its batch reads the rows, or the save that renamed it never
+/// committed. No hold spans more than one batch's judgement and unlinks — a hundred candidates —
+/// and none spans the walk; SQLite promises no order among waiters, so how long a contending save
+/// waits is not bounded here.
 pub fn sweep_orphan_files(
     conn: &mut rusqlite::Connection,
     root: &std::path::Path,
@@ -455,77 +448,47 @@ pub fn sweep_orphan_files(
             };
         }
     };
-    // Outside the transaction and before it: holding the write lock across the walk would stop
-    // every save for as long as the tree takes to read.
-    let mut files = Vec::new();
-    collect_files(&root, &mut files)?;
-    // This transaction writes nothing: what it is for is the lock, held from before the rows are
-    // read until after the last removal. `save` renames its file into place under the same lock and
-    // commits before releasing it, so this pass either sees the row and keeps the file, or the file
-    // was never registered by anything that committed.
-    let transaction = conn
-        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-        .map_err(|source| StoreError::Sql { source })?;
-    let registered = registered_paths(&transaction)?;
-    let removed = sweep_collected_files(&root, &registered, &files)?;
-    transaction
-        .commit()
-        .map_err(|source| StoreError::Sql { source })?;
+    let mut removed = 0;
+    let mut batch: Batch = Vec::with_capacity(SWEEP_BATCH);
+    for path in Walk::open(&root)? {
+        let path = path?;
+        batch.push((path_relative_to_root(&root, &path)?, path));
+        if batch.len() == SWEEP_BATCH {
+            removed += sweep_batch(conn, &batch)?;
+            batch.clear();
+        }
+    }
+    if !batch.is_empty() {
+        removed += sweep_batch(conn, &batch)?;
+    }
+
     Ok(removed)
 }
 
-/// `root` must be spelled the way `canonicalize` answers, and `files` must have been listed by
-/// walking that spelling: a candidate is required to resolve to the name it was listed under, and a
-/// root spelled any other way makes every listed name fail that on its first component. Resolving
-/// the root here would resolve it after the caller's walk, which is the window that separation
-/// exists to close.
-fn sweep_collected_files(
-    root: &std::path::Path,
-    registered: &HashSet<String>,
-    files: &[std::path::PathBuf],
-) -> Result<usize, StoreError> {
-    // Whether two spellings name one file is the filesystem's rule, not this program's: a byte
-    // comparison deletes a registered image on the case-insensitive directory this normally runs
-    // on. So every candidate is asked which file it reaches, against the registered names no
-    // enumerated file spelled. That leaves out a registered name that has become a link since it
-    // was enumerated; asking about all of them is a filesystem round trip per row on every startup.
-    let mut enumerated = Vec::with_capacity(files.len());
-    for path in files {
-        let relative = path_relative_to_root(root, path)?;
-        enumerated.push((path, relative));
-    }
-    if enumerated
-        .iter()
-        .all(|(_, relative)| registered.contains(relative))
-    {
-        return Ok(0);
-    }
+/// Candidates paired with the relative path they were enumerated under.
+type Batch = Vec<(String, std::path::PathBuf)>;
 
-    let spelled: HashSet<&str> = enumerated
-        .iter()
-        .map(|(_, relative)| relative.as_str())
-        .collect();
-    let mut unspelled_identities = HashSet::new();
-    for unspelled in registered
-        .iter()
-        .filter(|registered| !spelled.contains(registered.as_str()))
-    {
-        match std::fs::canonicalize(root.join(unspelled)) {
-            Ok(identity) => {
-                unspelled_identities.insert(identity);
-            }
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
-            // The name is there and will not say which file it reaches — a symlink pointing at
-            // itself answers `FilesystemLoop` — so any candidate might be that file.
-            Err(_) => return Ok(0),
-        }
-    }
+/// The paths must have been enumerated by walking `root` in the spelling `canonicalize` answers: a
+/// candidate is required to resolve to the name it was enumerated under, and a root spelled any
+/// other way makes every name fail that on its first component. Resolving the root here would
+/// resolve it after the walk, which is the window that separation exists to close.
+///
+/// Every read this batch makes precedes its first unlink, so a SQL failure before the unlinks
+/// leaves the batch with nothing removed. The transaction writes nothing, so a commit that fails
+/// after them loses nothing on the database side.
+fn sweep_batch(conn: &mut rusqlite::Connection, batch: &Batch) -> Result<usize, StoreError> {
+    let transaction = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|source| StoreError::Sql { source })?;
+    let registered = registered_in_batch(&transaction, batch)?;
     let mut removed = 0;
 
-    for (path, relative) in &enumerated {
+    for (relative, path) in batch {
         if registered.contains(relative) {
             continue;
         }
+        // Kept without a diagnostic: a live save holds its temporary undeletable, so every pass
+        // that races one comes through here.
         let Ok(file) = cw_core::atomic_file::open_for_removal(path) else {
             continue;
         };
@@ -534,8 +497,8 @@ fn sweep_collected_files(
         };
         // What stands under a name can be replaced between resolving it and acting on it, and
         // Windows follows a reparse point met partway along a path, so the question put here is
-        // what the open file calls itself. Every listed name is under the root by construction.
-        if identity.as_path() != path.as_path() || unspelled_identities.contains(&identity) {
+        // what the open file calls itself. Every enumerated name is under the root by construction.
+        if identity.as_path() != path.as_path() {
             continue;
         }
 
@@ -547,7 +510,34 @@ fn sweep_collected_files(
         }
     }
 
+    transaction
+        .commit()
+        .map_err(|source| StoreError::Sql { source })?;
     Ok(removed)
+}
+
+/// The relative paths of this batch that a row spells exactly. `relative_path` is TEXT under the
+/// default collation, so the comparison is byte for byte.
+fn registered_in_batch(
+    conn: &rusqlite::Connection,
+    batch: &Batch,
+) -> Result<HashSet<String>, StoreError> {
+    let placeholders = std::iter::repeat_n("?", batch.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut statement = conn
+        .prepare(&format!(
+            "SELECT relative_path FROM images WHERE relative_path IN ({placeholders})"
+        ))
+        .map_err(|source| StoreError::Sql { source })?;
+    let rows = statement
+        .query_map(
+            rusqlite::params_from_iter(batch.iter().map(|(relative, _)| relative)),
+            |row| row.get(0),
+        )
+        .map_err(|source| StoreError::Sql { source })?;
+    rows.collect::<rusqlite::Result<HashSet<String>>>()
+        .map_err(|source| StoreError::Sql { source })
 }
 
 /// Report rows whose file is gone, a bounded stretch of the table per invocation. Nothing is
@@ -701,84 +691,88 @@ fn store_keys(
 /// A discard that will not go is not reported. Every caller is already holding the error that says
 /// why the save did not happen, and answering with this one instead would leave the caller with no
 /// account of what it asked about. What a failed discard leaves behind is an unregistered file,
-/// which the startup sweep collects from where its walk reaches, once nothing refuses the removal.
+/// which the orphan sweep collects from where its walk reaches, once nothing refuses the removal.
 fn discard_written_file(file: &std::fs::File) {
     let _ = cw_core::atomic_file::delete_by_handle(file);
 }
 
-fn registered_paths(conn: &rusqlite::Connection) -> Result<HashSet<String>, StoreError> {
-    let mut statement = conn
-        .prepare(SELECT_IMAGE_PATHS)
-        .map_err(|source| StoreError::Sql { source })?;
-    let mut rows = statement
-        .query([])
-        .map_err(|source| StoreError::Sql { source })?;
-    let mut paths = HashSet::new();
-
-    while let Some(row) = rows.next().map_err(|source| StoreError::Sql { source })? {
-        paths.insert(image_path_from_row(row)?);
-    }
-
-    Ok(paths)
+/// A depth-first walk that holds one open `ReadDir` per level and nothing else. The whole listing
+/// is not kept, because this reads whatever is under the image root rather than only what this
+/// program wrote there, so neither its size nor its depth is this program's to assume; recursion
+/// would put those same `ReadDir`s — on Windows each holds a `WIN32_FIND_DATAW` by value — on the
+/// call stack, and running out of that aborts the process.
+///
+/// `root` arrives in the spelling `canonicalize` answered and the yielded paths inherit it, which
+/// is what the sweep's identity check is written against. Anything that fails below the root is
+/// passed over, and so is any single entry that cannot be answered about, wherever it sits: what
+/// was never yielded cannot become a candidate, so nothing is removed on a guess. Two failures at
+/// the root are reported instead, since either leaves the whole tree unseen — its listing not
+/// opening for any reason other than absence, and its listing stopping partway. Absence is not one
+/// of them, because a root that is not there has nothing under it to sweep.
+struct Walk {
+    root: std::path::PathBuf,
+    stack: Vec<std::fs::ReadDir>,
 }
 
-/// Walks with an explicit worklist. Recursion here would put one `ReadDir` per level on the stack —
-/// on Windows each holds a `WIN32_FIND_DATAW` by value — and this walk reads whatever is under the
-/// image root rather than only what this program wrote there, so its depth is not this program's
-/// to assume. Running out of stack aborts the process, and this runs at startup.
-///
-/// `root` arrives in the spelling `canonicalize` answered: the sweep's identity checks need that
-/// spelling and say so, nothing in this walk does, and the collected paths simply inherit it.
-/// Anything that fails below the root is passed over, and so is any single entry that cannot be
-/// answered about, wherever it sits: what was not collected never becomes a candidate, so nothing
-/// is removed on a guess. Two failures at the root are reported instead, since either leaves the
-/// whole candidate list unseen — its listing not opening for any reason other than absence, and
-/// its listing stopping partway. Absence is not one of them, because a root that is not there has
-/// nothing under it to sweep.
-fn collect_files(
-    root: &std::path::Path,
-    files: &mut Vec<std::path::PathBuf>,
-) -> Result<(), StoreError> {
-    let mut worklist: Vec<std::path::PathBuf> = vec![root.to_path_buf()];
-    while let Some(directory) = worklist.pop() {
-        let entries = match std::fs::read_dir(&directory) {
-            Ok(entries) => entries,
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(source) if directory == root => {
+impl Walk {
+    fn open(root: &std::path::Path) -> Result<Self, StoreError> {
+        let mut stack = Vec::new();
+        match std::fs::read_dir(root) {
+            Ok(entries) => stack.push(entries),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
                 return Err(StoreError::ImageIo {
-                    path: directory,
+                    path: root.to_path_buf(),
                     source,
                 });
             }
-            Err(_) => continue,
-        };
+        }
+        Ok(Self {
+            root: root.to_path_buf(),
+            stack,
+        })
+    }
+}
 
-        for entry in entries {
+impl Iterator for Walk {
+    type Item = Result<std::path::PathBuf, StoreError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let at_root = self.stack.len() == 1;
+            let Some(entry) = self.stack.last_mut()?.next() else {
+                self.stack.pop();
+                continue;
+            };
             let entry = match entry {
                 Ok(entry) => entry,
-                // Broken out of rather than skipped: `ReadDir` promises nothing about what follows
-                // an error, and one that keeps answering with it would never let this loop end.
-                Err(source) if directory == root => {
-                    return Err(StoreError::ImageIo {
-                        path: directory.clone(),
-                        source,
-                    });
+                // The level is abandoned rather than the entry skipped: `ReadDir` promises nothing
+                // about what follows an error, and one that keeps answering with it would never let
+                // this walk end.
+                Err(source) => {
+                    self.stack.pop();
+                    if at_root {
+                        return Some(Err(StoreError::ImageIo {
+                            path: self.root.clone(),
+                            source,
+                        }));
+                    }
+                    continue;
                 }
-                Err(_) => break,
             };
             let path = entry.path();
             let Ok(file_type) = entry.file_type() else {
                 continue;
             };
             if file_type.is_dir() {
-                worklist.push(path);
+                if let Ok(entries) = std::fs::read_dir(&path) {
+                    self.stack.push(entries);
+                }
             } else if file_type.is_file() {
-                files.push(path);
+                return Some(Ok(path));
             }
         }
     }
-
-    Ok(())
 }
 
 fn path_relative_to_root(
@@ -854,13 +848,12 @@ fn decode_image_path(
 #[cfg(test)]
 mod tests {
     use super::{
-        BATCH, DeleteOutcome, MAX_PAGES, RowScan, SCANNER_CURSOR, SCANNER_HIGH_WATER, delete, save,
-        scan_orphan_rows, sweep_collected_files, sweep_orphan_files,
+        BATCH, Batch, DeleteOutcome, MAX_PAGES, RowScan, SCANNER_CURSOR, SCANNER_HIGH_WATER, Walk,
+        delete, save, scan_orphan_rows, sweep_batch, sweep_orphan_files,
     };
     use crate::{StoreError, db, observations, timestamp};
     use chrono::{DateTime, TimeDelta, TimeZone, Utc};
     use cw_core::model::{Observation, OcrStatus, ScreenPayload};
-    use std::collections::HashSet;
     use tempfile::{TempDir, tempdir};
 
     const WIDTH: u32 = 4;
@@ -868,6 +861,19 @@ mod tests {
     const PER_PAGE: usize = BATCH as usize;
     /// More rows than one invocation of the scan may read.
     const REACH: usize = PER_PAGE * MAX_PAGES as usize;
+
+    /// The candidates a sweep of `root` would judge, in the order it enumerates them.
+    fn enumerate(root: &std::path::Path) -> Batch {
+        Walk::open(root)
+            .expect("the image tree should be walkable")
+            .map(|path| {
+                let path = path.expect("the image tree should be listable");
+                let relative = super::path_relative_to_root(root, &path)
+                    .expect("the candidate should be under the root");
+                (relative, path)
+            })
+            .collect()
+    }
 
     fn database() -> (TempDir, rusqlite::Connection, std::path::PathBuf) {
         let dir = tempdir().expect("the temporary image directory should be creatable");
@@ -1106,9 +1112,7 @@ mod tests {
 
         assert!(matches!(result, Err(StoreError::Sql { .. })), "{result:?}");
         drop(held);
-        let mut left_behind = Vec::new();
-        super::collect_files(&root, &mut left_behind)
-            .expect("the image tree should be collectable");
+        let left_behind = enumerate(&root);
         assert!(left_behind.is_empty(), "{left_behind:?}");
     }
 
@@ -1589,17 +1593,9 @@ mod tests {
         )
         .expect("the malformed image row should be inserted by hand");
 
-        let errors = [
-            delete(&mut conn, &root, id).expect_err("delete should refuse the malformed path"),
-            sweep_orphan_files(&mut conn, &root)
-                .expect_err("the sweep should refuse the malformed path"),
-        ];
-
-        for error in errors {
-            match error {
-                StoreError::Encoding { id: actual, .. } => assert_eq!(actual, id.to_string()),
-                other => panic!("expected Encoding, got {other:?}"),
-            }
+        match delete(&mut conn, &root, id).expect_err("delete should refuse the malformed path") {
+            StoreError::Encoding { id: actual, .. } => assert_eq!(actual, id.to_string()),
+            other => panic!("expected Encoding, got {other:?}"),
         }
         let scan = scan_orphan_rows(&mut conn, &root).expect("the scan should step past the row");
         assert_eq!(scan.undecodable, 1);
@@ -1634,18 +1630,11 @@ mod tests {
         )
         .expect("the non-canonical timestamp image row should be inserted by hand");
 
-        let errors = [
-            delete(&mut conn, &root, id)
-                .expect_err("delete should refuse the non-canonical timestamp"),
-            sweep_orphan_files(&mut conn, &root)
-                .expect_err("the sweep should refuse the non-canonical timestamp"),
-        ];
-
-        for error in errors {
-            match error {
-                StoreError::Encoding { id: actual, .. } => assert_eq!(actual, id.to_string()),
-                other => panic!("expected Encoding, got {other:?}"),
-            }
+        match delete(&mut conn, &root, id)
+            .expect_err("delete should refuse the non-canonical timestamp")
+        {
+            StoreError::Encoding { id: actual, .. } => assert_eq!(actual, id.to_string()),
+            other => panic!("expected Encoding, got {other:?}"),
         }
         let scan = scan_orphan_rows(&mut conn, &root).expect("the scan should step past the row");
         assert_eq!(scan.undecodable, 1);
@@ -1696,12 +1685,6 @@ mod tests {
             DeleteOutcome::NoRow
         );
 
-        match sweep_orphan_files(&mut conn, &root)
-            .expect_err("the sweep should refuse the non-canonical id")
-        {
-            StoreError::Encoding { id: actual, .. } => assert_eq!(actual, stored_id),
-            other => panic!("expected Encoding for {stored_id}, got {other:?}"),
-        }
         let scan = scan_orphan_rows(&mut conn, &root).expect("the scan should step past the row");
         assert_eq!(scan.undecodable, 1);
         assert!(scan.missing.is_empty());
@@ -1709,7 +1692,7 @@ mod tests {
     }
 
     #[test]
-    fn orphan_files_without_db_row_are_swept_on_startup() {
+    fn orphan_files_without_db_row_are_swept() {
         let (_dir, mut conn, root) = database();
         let id = ulid::Ulid::generate();
         let relative = save_test_image(&mut conn, &root, id, at(2026, 7, 30), 80);
@@ -1866,20 +1849,15 @@ mod tests {
             .expect("the hand-placed file should be writable");
 
         let resolved = std::fs::canonicalize(&root).expect("the image root should resolve");
-        let registered =
-            super::registered_paths(&conn).expect("the registered paths should be readable");
-        let mut files = Vec::new();
-        super::collect_files(&resolved, &mut files).expect("the image tree should be collectable");
-
-        // Both were ordinary files when they were listed, so the registered one is not among the
-        // names the sweep asks about; the orphan then becomes a link to it.
+        // Both were ordinary files when they were enumerated; the orphan then becomes a link to the
+        // registered one, which is the window the identity check exists to close.
+        let batch = enumerate(&resolved);
         std::fs::remove_file(&orphan).expect("the hand-placed file should be removable");
         let Ok(()) = std::os::windows::fs::symlink_file(&picture, &orphan) else {
             return;
         };
 
-        let removed = sweep_collected_files(&resolved, &registered, &files)
-            .expect("the sweep should succeed");
+        let removed = sweep_batch(&mut conn, &batch).expect("the sweep should succeed");
 
         assert_eq!(removed, 0);
         assert!(picture.is_file());
@@ -1919,103 +1897,8 @@ mod tests {
     }
 
     #[test]
-    fn a_registered_image_spelled_in_another_case_is_not_swept() {
-        let (_dir, mut conn, root) = database();
-        let id = ulid::Ulid::from_string("0000000000000128GGYHYYK08N")
-            .expect("the fixed image id should parse");
-        let relative = save_test_image(&mut conn, &root, id, at(2026, 7, 30), 81);
-        let differently_spelled = relative.to_ascii_lowercase();
-        assert_ne!(differently_spelled, relative);
-        // A directory flagged case-sensitive keeps the two spellings apart, so the premise — one
-        // file answering both — is absent and there is nothing to assert.
-        if !root.join(&differently_spelled).exists() {
-            return;
-        }
-        std::fs::rename(root.join(&relative), root.join(&differently_spelled))
-            .expect("the saved image should be renameable to another case");
-
-        let removed =
-            sweep_orphan_files(&mut conn, &root).expect("the orphan sweep should succeed");
-
-        assert_eq!(removed, 0);
-        let names: Vec<_> = std::fs::read_dir(
-            root.join(&differently_spelled)
-                .parent()
-                .expect("the differently-spelled image should have a day directory"),
-        )
-        .expect("the day directory should remain readable")
-        .map(|entry| {
-            entry
-                .expect("the day directory entry should be readable")
-                .file_name()
-        })
-        .collect();
-        let kept = std::path::Path::new(&differently_spelled)
-            .file_name()
-            .expect("the differently-spelled image should have a file name")
-            .to_os_string();
-        assert_eq!(names, [kept]);
-    }
-
-    #[test]
-    fn a_registered_image_reached_through_a_link_is_not_swept() {
-        let (_dir, mut conn, root) = database();
-        let id = ulid::Ulid::generate();
-        let relative = save_test_image(&mut conn, &root, id, at(2026, 7, 31), 82);
-        let path = root.join(relative);
-        let moved = path.with_file_name("moved-by-something-else.webp");
-        std::fs::rename(&path, &moved)
-            .expect("the saved image should be movable under another name");
-
-        let Ok(()) = std::os::windows::fs::symlink_file(&moved, &path) else {
-            return;
-        };
-
-        let removed =
-            sweep_orphan_files(&mut conn, &root).expect("the orphan sweep should succeed");
-
-        assert_eq!(removed, 0);
-        assert!(moved.exists());
-        assert!(
-            std::fs::metadata(&path)
-                .expect("the registered link should still reach the moved image")
-                .is_file()
-        );
-    }
-
-    #[test]
-    fn an_orphan_is_kept_while_a_registered_name_will_not_say_what_it_reaches() {
-        let (_dir, mut conn, root) = database();
-        let id = ulid::Ulid::generate();
-        let relative = save_test_image(&mut conn, &root, id, at(2026, 7, 30), 85);
-        let path = root.join(relative);
-        std::fs::remove_file(&path)
-            .expect("the saved file should be removable before replacement with a symlink");
-
-        let Ok(()) = std::os::windows::fs::symlink_file(&path, &path) else {
-            return;
-        };
-
-        let left_behind = root.join("2026/07/31/left-behind.webp");
-        std::fs::create_dir_all(
-            left_behind
-                .parent()
-                .expect("the hand-placed file should have a parent"),
-        )
-        .expect("the hand-placed file directory should be creatable");
-        std::fs::write(&left_behind, b"not registered")
-            .expect("the hand-placed file should be writable");
-
-        let removed =
-            sweep_orphan_files(&mut conn, &root).expect("the orphan sweep should succeed");
-
-        assert_eq!(removed, 0);
-        assert!(left_behind.is_file());
-    }
-
-    #[test]
     fn a_name_that_now_leads_outside_the_root_is_not_removed() {
-        let (dir, _conn, root) = database();
+        let (dir, mut conn, root) = database();
         let outside = dir.path().join("outside");
         std::fs::create_dir_all(&outside).expect("the outside directory should be creatable");
         let victim = outside.join("orphan.webp");
@@ -2030,8 +1913,11 @@ mod tests {
 
         let resolved = std::fs::canonicalize(&root).expect("the image root should resolve");
 
-        let enumerated = vec![resolved.join("2026").join("orphan.webp")];
-        let removed = super::sweep_collected_files(&resolved, &HashSet::new(), &enumerated)
+        let batch = vec![(
+            "2026/orphan.webp".to_owned(),
+            resolved.join("2026").join("orphan.webp"),
+        )];
+        let removed = sweep_batch(&mut conn, &batch)
             .expect("the sweep should succeed without removing anything");
 
         assert_eq!(removed, 0);
@@ -2040,7 +1926,7 @@ mod tests {
 
     #[test]
     fn a_root_replaced_after_the_walk_does_not_redirect_the_sweep() {
-        let (dir, _conn, root) = database();
+        let (dir, mut conn, root) = database();
         std::fs::create_dir_all(&root).expect("the image root should be creatable");
         let resolved = std::fs::canonicalize(&root).expect("the image root should resolve");
         let outside = dir.path().join("outside");
@@ -2055,8 +1941,9 @@ mod tests {
             return;
         }
 
-        let enumerated = vec![resolved.join("orphan.webp")];
-        let removed = super::sweep_collected_files(&resolved, &HashSet::new(), &enumerated)
+        // The batch is what the walk had already yielded when the root was replaced under it.
+        let batch = vec![("orphan.webp".to_owned(), resolved.join("orphan.webp"))];
+        let removed = sweep_batch(&mut conn, &batch)
             .expect("the sweep should succeed without removing anything");
 
         assert_eq!(removed, 0);
@@ -2303,8 +2190,6 @@ mod tests {
     #[test]
     fn an_orphan_that_will_not_go_does_not_stop_the_others() {
         let (_dir, mut conn, root) = database();
-        // The walk lists a directory's own files before it opens any directory under it, so the
-        // deeper file always comes after the refusal whichever way the root's listing was ordered.
         let deeper = root.join("2026");
         std::fs::create_dir_all(&deeper).expect("the deeper directory should be creatable");
         let stubborn = root.join("stubborn.webp");
@@ -2319,7 +2204,18 @@ mod tests {
         attributes.set_readonly(true);
         std::fs::set_permissions(&stubborn, attributes).expect("the attribute should be settable");
 
-        let removed = sweep_orphan_files(&mut conn, &root);
+        let resolved = std::fs::canonicalize(&root).expect("the image root should resolve");
+        // The refuser sits between the two collectible candidates, so a pass abandoned on a
+        // refused removal loses one of them under either iteration order.
+        let batch = vec![
+            ("beside.webp".to_owned(), resolved.join("beside.webp")),
+            ("stubborn.webp".to_owned(), resolved.join("stubborn.webp")),
+            (
+                "2026/below.webp".to_owned(),
+                resolved.join("2026").join("below.webp"),
+            ),
+        ];
+        let removed = sweep_batch(&mut conn, &batch);
 
         assert_eq!(
             removed.expect("one file that will not go must not fail the pass"),
@@ -2350,20 +2246,14 @@ mod tests {
         std::fs::write(&unregistered, b"not registered")
             .expect("the hand-placed file should be writable again");
         let resolved = std::fs::canonicalize(&root).expect("the image root should resolve");
-        let registered =
-            super::registered_paths(&conn).expect("the registered paths should be readable");
-        let mut files = Vec::new();
-        super::collect_files(&resolved, &mut files)
-            .expect("the image tree should be collectable for both startups");
+        let batch = enumerate(&resolved);
 
         assert_eq!(
-            sweep_collected_files(&resolved, &registered, &files)
-                .expect("the first startup sweep should succeed"),
+            sweep_batch(&mut conn, &batch).expect("the first pass over the batch should succeed"),
             1
         );
         assert_eq!(
-            sweep_collected_files(&resolved, &registered, &files)
-                .expect("the second startup sweep should succeed"),
+            sweep_batch(&mut conn, &batch).expect("the second pass over the batch should succeed"),
             0
         );
         assert!(saved.is_file());
@@ -2663,14 +2553,8 @@ mod tests {
             .expect("the original byte size should remain readable");
         assert_eq!(stored_byte_size, original_byte_size);
         assert!(!path.exists());
-        let mut files = Vec::new();
-        super::collect_files(&root, &mut files)
-            .expect("the image root should remain readable after the refusal");
-        assert!(!files.iter().any(|candidate| {
-            candidate
-                .file_name()
-                .is_some_and(|name| name.to_string_lossy().contains(".tmp-"))
-        }));
+        let files = enumerate(&root);
+        assert!(!files.iter().any(|(relative, _)| relative.contains(".tmp-")));
     }
 
     #[test]

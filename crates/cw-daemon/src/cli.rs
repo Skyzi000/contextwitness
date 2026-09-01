@@ -157,7 +157,6 @@ fn daemon() -> ! {
     }
 
     let mut conn = cw_store::db::open(&paths.database()).expect("opening the database failed");
-    maintenance::sweep_orphans(&mut conn, &paths);
     let mut cursor: episodes::Cursor = None;
     match episodes::close_due(
         &mut conn,
