@@ -48,7 +48,7 @@ contextwitness run
 | `storage.image_retention_days` | `14` | Days to keep captured images. |
 | `storage.image_retention_max_gib` | `50` | Total captured-image storage cap in GiB. |
 | `privacy.process_blacklist` | `[]` | Process names for which capture is disabled. |
-| `hindsight.bank_id` | `"contextwitness"` | Hindsight bank the episodes go to. The daemon writes this bank's retain settings (mission, extraction mode, chunk size), so give ContextWitness a bank of its own. |
+| `hindsight.bank_id` | `"contextwitness"` | Hindsight bank the episodes go to. Settings of a bank the list confirms as existing are left unchanged (changes made in Hindsight persist). When the bank is absent, ContextWitness sends a PUT with the initial retain settings (mission, extraction mode, chunk size); a bank another client creates concurrently after the check can still receive them. Still give ContextWitness a bank of its own. |
 | `hindsight.context_label` | `"screen capture"` | Context label sent with every episode. |
 | `episode.window_minutes` | `5` | Length of an episode window in minutes (1–1440). |
 

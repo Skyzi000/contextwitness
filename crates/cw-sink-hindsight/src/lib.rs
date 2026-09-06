@@ -23,9 +23,10 @@ const RETAIN_CHUNK_SIZE: u32 = 3000;
 // ponytail: fixed ceiling, promote to a config knob if real episodes ever approach it.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(600);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-/// A control exchange — the status GET, the bank upsert — carries no episode text, so it must
-/// not inherit the upload-sized [`HTTP_TIMEOUT`]: a server that stalls mid-exchange would hold
-/// the single delivery thread for 600 s, and at the bank upsert that gates every delivery.
+/// A control exchange — the status GET, the bank list and creation — carries no episode text,
+/// so it must not inherit the upload-sized [`HTTP_TIMEOUT`]: a server that stalls mid-exchange
+/// would hold the single delivery thread for 600 s, and at bank initialization that gates
+/// every delivery.
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
 /// How much of a server reply travels into an error message: the server's stated reason is the
 /// diagnosis and must reach the operator (owner ruling 2026-08-22), bounded so a refusal that
@@ -263,6 +264,19 @@ struct OperationWire {
     error_message: Option<String>,
 }
 
+const BANK_LIST_PAGE_SIZE: usize = 100;
+
+#[derive(serde::Deserialize)]
+struct BankListPage {
+    banks: Vec<BankListEntry>,
+    total: u64,
+}
+
+#[derive(serde::Deserialize)]
+struct BankListEntry {
+    bank_id: String,
+}
+
 /// `Processing` and `Failed` ask the caller to try [`retain`](HindsightClient::retain) again
 /// later: the fixed operation id lets that later call find the same operation and ask how it
 /// stands, without re-submitting the body.
@@ -412,10 +426,15 @@ impl HindsightClient {
         Ok(url)
     }
 
-    /// Upserts the bank with the fixed retain settings. The server creates a missing bank and
-    /// merges the settings into an existing one's config.
+    /// Applies the fixed retain settings only when the bank list reports it absent; a
+    /// bank that existed at the check is not rewritten. The PUT is an upsert with no
+    /// create-only form, so a bank another client creates between the check and the PUT
+    /// still receives the settings once.
     pub fn ensure_bank(&self, bank_id: &str) -> Result<(), DeliveryError> {
         vet_bank_id(bank_id)?;
+        if self.bank_exists(bank_id)? {
+            return Ok(());
+        }
         let url = self.endpoint(&["v1", "default", "banks", bank_id])?;
         let desired = json!({
             "retain_mission": RETAIN_MISSION,
@@ -424,9 +443,66 @@ impl HindsightClient {
         });
         accept(
             self.send(self.http.put(url).json(&desired).timeout(CONTROL_TIMEOUT))?,
-            UPSERT_BANK_OPERATION,
+            CREATE_BANK_OPERATION,
         )
         .map(drop)
+    }
+
+    /// The list's `q` matches by substring against the id and the name both, so only the
+    /// exact `bank_id` comparison decides. The list also reorders between requests
+    /// (last-write order), so absence is concluded only when one response covered its
+    /// stated `total`; anything less is an error, never absence. The walk is bounded by
+    /// the first response's `total`, so a list that grows mid-walk is not chased.
+    fn bank_exists(&self, bank_id: &str) -> Result<bool, DeliveryError> {
+        let mut offset: u64 = 0;
+        let mut requests: u64 = 0;
+        let mut first_total: Option<u64> = None;
+        loop {
+            let mut url = self.endpoint(&["v1", "default", "banks"])?;
+            {
+                let mut query = url.query_pairs_mut();
+                query
+                    .append_pair("q", bank_id)
+                    .append_pair("limit", &BANK_LIST_PAGE_SIZE.to_string())
+                    .append_pair("offset", &offset.to_string());
+            }
+            let response = accept(
+                self.send(self.http.get(url).timeout(CONTROL_TIMEOUT))?,
+                LIST_BANKS_OPERATION,
+            )?;
+            let text = read_strict_text(response, LIST_BANKS_OPERATION)?;
+            let page: BankListPage = parse_text(&text, LIST_BANKS_OPERATION)?;
+            requests += 1;
+            let total = *first_total.get_or_insert(page.total);
+            if page.banks.iter().any(|bank| bank.bank_id == bank_id) {
+                return Ok(true);
+            }
+            offset += page.banks.len() as u64;
+            if offset >= total {
+                if requests == 1 {
+                    return Ok(false);
+                }
+                return Err(DeliveryError::Retryable {
+                    message: format!(
+                        "hindsight {LIST_BANKS_OPERATION} for {bank_id:?} walked the {total} \
+                         banks the first response counted across {requests} reordered pages \
+                         without finding it, so whether the bank exists stayed undecidable"
+                    ),
+                    retry_after: None,
+                });
+            }
+            if page.banks.len() < BANK_LIST_PAGE_SIZE {
+                return Err(DeliveryError::Retryable {
+                    message: format!(
+                        "hindsight {LIST_BANKS_OPERATION} for {bank_id:?} answered {} banks, \
+                         short of the requested {BANK_LIST_PAGE_SIZE} and of the {total} the \
+                         first response counted, so whether the bank exists stayed undecidable",
+                        page.banks.len(),
+                    ),
+                    retry_after: None,
+                });
+            }
+        }
     }
 
     /// One delivery step for an episode, cheapest question first: ask how its fixed operation
@@ -584,7 +660,8 @@ fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
 }
 
 const RETAIN_OPERATION: &str = "retain";
-const UPSERT_BANK_OPERATION: &str = "upsert bank";
+const CREATE_BANK_OPERATION: &str = "create bank";
+const LIST_BANKS_OPERATION: &str = "list banks";
 const POLL_OPERATION: &str = "operation status";
 
 fn accept(response: Response, operation: &str) -> Result<Response, DeliveryError> {
@@ -682,6 +759,34 @@ fn read_text(response: Response, operation: &str) -> Result<String, DeliveryErro
             retry_after: None,
         })?;
     Ok(String::from_utf8_lossy(&body).into_owned())
+}
+
+/// Strict UTF-8, unlike [`read_text`]: a lossy read could morph a `bank_id` into a
+/// near-miss of the exact match, reading absence where the bank exists.
+fn read_strict_text(response: Response, operation: &str) -> Result<String, DeliveryError> {
+    use std::io::Read;
+    let mut body = Vec::new();
+    response
+        .take(PARSED_BODY_CAP)
+        .read_to_end(&mut body)
+        .map_err(|error| DeliveryError::Retryable {
+            message: format!(
+                "hindsight {operation} answered an unreadable body: {}",
+                error_chain(&error)
+            ),
+            retry_after: None,
+        })?;
+    match std::str::from_utf8(&body) {
+        Ok(text) => Ok(text.to_owned()),
+        Err(error) => Err(DeliveryError::Retryable {
+            message: format!(
+                "hindsight {operation} answered an undecodable body: {error}; the server said: \
+                 {}",
+                excerpt(&String::from_utf8_lossy(&body))
+            ),
+            retry_after: None,
+        }),
+    }
 }
 
 fn parse_text<T: serde::de::DeserializeOwned>(
@@ -797,9 +902,9 @@ fn fnv1a_128(text: &str) -> u128 {
 }
 
 /// Deployment faults, repairable while episodes wait; everything unlisted classifies
-/// Permanent. On the retain path [`exchange_fault`] overrides that verdict and the bank upsert
-/// backs off rather than condemns, so the split steers retry shape — never an episode's
-/// survival.
+/// Permanent. On the retain path [`exchange_fault`] overrides that verdict and bank
+/// initialization backs off rather than condemns, so the split steers retry shape — never an
+/// episode's survival.
 fn retryable_status(status: StatusCode) -> bool {
     status.is_server_error()
         || matches!(
@@ -1334,6 +1439,93 @@ mod tests {
         (asked, body)
     }
 
+    /// An answer, a raw-bytes answer, or a hang-up that reads the request and never answers.
+    enum Turn {
+        Answer { status_line: String, body: String },
+        AnswerBytes { status_line: String, body: Vec<u8> },
+        HangUp,
+    }
+
+    fn answer(status_line: &str, body: String) -> Turn {
+        Turn::Answer {
+            status_line: status_line.to_owned(),
+            body,
+        }
+    }
+
+    fn answer_bytes(status_line: &str, body: Vec<u8>) -> Turn {
+        Turn::AnswerBytes {
+            status_line: status_line.to_owned(),
+            body,
+        }
+    }
+
+    /// Answers each connection with the next [`Turn`] and sends every request seen once the
+    /// turns are spent.
+    fn scripted_server(
+        turns: Vec<Turn>,
+    ) -> (std::sync::mpsc::Receiver<Vec<(String, String)>>, u16) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("loopback binds");
+        let port = listener
+            .local_addr()
+            .expect("the socket has an address")
+            .port();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for turn in turns {
+                let (mut stream, _) = listener.accept().expect("the client connects");
+                let bound = Some(std::time::Duration::from_secs(10));
+                stream.set_read_timeout(bound).expect("the timeout applies");
+                stream
+                    .set_write_timeout(bound)
+                    .expect("the timeout applies");
+                requests.push(read_request(&mut stream));
+                let (status_line, body) = match turn {
+                    Turn::Answer { status_line, body } => (status_line, body.into_bytes()),
+                    Turn::AnswerBytes { status_line, body } => (status_line, body),
+                    Turn::HangUp => continue,
+                };
+                let mut response = format!(
+                    "{status_line}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                )
+                .into_bytes();
+                response.extend_from_slice(&body);
+                std::io::Write::write_all(&mut stream, &response).expect("the response writes");
+            }
+            let _ = sender.send(requests);
+        });
+        (receiver, port)
+    }
+
+    fn bank_client(port: u16) -> HindsightClient {
+        HindsightClient::new(Credentials {
+            api_url: format!("http://127.0.0.1:{port}"),
+            token: None,
+        })
+        .expect("building the client makes no request")
+    }
+
+    fn bank_list_page(banks: Vec<Value>, total: u64, offset: u64) -> String {
+        json!({"banks": banks, "total": total, "limit": 100, "offset": offset}).to_string()
+    }
+
+    fn bank_profile(bank_id: &str, name: &str) -> Value {
+        json!({"bank_id": bank_id, "name": name, "mission": "the owner's own mission"})
+    }
+
+    fn asked(requests: &[(String, String)]) -> Vec<&str> {
+        requests.iter().map(|(asked, _)| asked.as_str()).collect()
+    }
+
+    fn seen_requests(
+        seen: &std::sync::mpsc::Receiver<Vec<(String, String)>>,
+    ) -> Vec<(String, String)> {
+        seen.recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the server saw every scripted exchange")
+    }
+
     #[test]
     fn the_delivery_lifecycle_submits_the_body_once_and_then_only_asks() {
         let operation_id = retain_operation_id("bank", "ep-1");
@@ -1433,6 +1625,340 @@ mod tests {
             submitted.contains(r#""document_id":"doc-ep-1""#),
             "the wire document id must carry the episode id: bare wall-clock ids repeat across \
              installs sharing a bank, and replace mode would overwrite the other install: {submitted}"
+        );
+    }
+
+    #[test]
+    fn an_existing_bank_is_never_written_on_initialization_or_restart() {
+        let list = bank_list_page(
+            vec![
+                // Id and name both match the substring query; only the exact bank_id
+                // comparison tells it from the target.
+                bank_profile("shadow-bank", "the bank of someone else"),
+                bank_profile("bank", "the target"),
+            ],
+            2,
+            0,
+        );
+        let (seen, port) = scripted_server(vec![
+            answer("HTTP/1.1 200 OK", list.clone()),
+            answer("HTTP/1.1 200 OK", list),
+        ]);
+        bank_client(port)
+            .ensure_bank("bank")
+            .expect("a bank the list names exactly is ready as it stands");
+        // A fresh client stands in for a process restart.
+        bank_client(port)
+            .ensure_bank("bank")
+            .expect("a restart must find the same bank the same way");
+        assert_eq!(
+            asked(&seen_requests(&seen)),
+            [
+                "GET /v1/default/banks?q=bank&limit=100&offset=0",
+                "GET /v1/default/banks?q=bank&limit=100&offset=0",
+            ],
+            "an existing bank owes the read-only list check and nothing else, before or after \
+             a restart"
+        );
+    }
+
+    #[test]
+    fn a_missing_bank_is_created_once_with_exactly_the_three_settings() {
+        let (seen, port) = scripted_server(vec![
+            answer("HTTP/1.1 200 OK", bank_list_page(vec![], 0, 0)),
+            answer(
+                "HTTP/1.1 200 OK",
+                r#"{"bank_id":"bank","name":"the target"}"#.to_owned(),
+            ),
+            answer(
+                "HTTP/1.1 200 OK",
+                bank_list_page(
+                    vec![json!({
+                        "bank_id": "bank",
+                        "name": "the target",
+                        "mission": "the owner's own mission, changed after creation",
+                        "retain_chunk_size": 8000,
+                    })],
+                    1,
+                    0,
+                ),
+            ),
+        ]);
+        bank_client(port)
+            .ensure_bank("bank")
+            .expect("an absent bank is this client's to create");
+        bank_client(port)
+            .ensure_bank("bank")
+            .expect("the created bank now exists, whatever its settings are");
+        let requests = seen_requests(&seen);
+        assert_eq!(
+            asked(&requests),
+            [
+                "GET /v1/default/banks?q=bank&limit=100&offset=0",
+                "PUT /v1/default/banks/bank",
+                "GET /v1/default/banks?q=bank&limit=100&offset=0",
+            ],
+            "creation is one list check and one PUT; every later initialization only asks"
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&requests[1].1).expect("the PUT body is JSON"),
+            json!({
+                "retain_mission": RETAIN_MISSION,
+                "retain_extraction_mode": "concise",
+                "retain_chunk_size": 3000,
+            }),
+            "creation carries exactly the three fixed settings and nothing else"
+        );
+    }
+
+    #[test]
+    fn an_undecidable_bank_list_never_falls_back_to_creation() {
+        for (status_line, body) in [
+            (
+                "HTTP/1.1 401 Unauthorized",
+                r#"{"detail":"the server's own words"}"#,
+            ),
+            (
+                "HTTP/1.1 404 Not Found",
+                r#"{"detail":"the server's own words"}"#,
+            ),
+            (
+                "HTTP/1.1 500 Internal Server Error",
+                r#"{"detail":"the server's own words"}"#,
+            ),
+            ("HTTP/1.1 200 OK", r#"{"banks":"the server's own words"}"#),
+        ] {
+            let (seen, port) = scripted_server(vec![answer(status_line, body.to_owned())]);
+            let error = bank_client(port)
+                .ensure_bank("bank")
+                .expect_err("a list that cannot be read is not an absent bank");
+            assert!(error.is_retryable(), "{status_line}: {error}");
+            assert!(
+                error.to_string().contains(LIST_BANKS_OPERATION),
+                "{status_line}: the refusal must name the list exchange, not a creation that \
+                 followed it: {error}"
+            );
+            assert!(
+                error.to_string().contains("the server's own words"),
+                "{status_line}: the bounded server words are the diagnosis: {error}"
+            );
+            assert_eq!(
+                asked(&seen_requests(&seen)),
+                ["GET /v1/default/banks?q=bank&limit=100&offset=0"],
+                "{status_line}: an undecidable list must not lead into a settings write"
+            );
+        }
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("loopback binds");
+            listener
+                .local_addr()
+                .expect("the socket has an address")
+                .port()
+        };
+        let refused = bank_client(port)
+            .ensure_bank("bank")
+            .expect_err("a server that cannot be reached leaves the bank undecidable");
+        assert!(refused.is_retryable(), "{refused}");
+        assert!(
+            refused.to_string().contains("os error"),
+            "the refused connection's cause lives in source() and must reach the log: {refused}"
+        );
+    }
+
+    #[test]
+    fn a_lost_creation_answer_does_not_rewrite_settings_on_the_next_attempt() {
+        let (seen, port) = scripted_server(vec![
+            answer("HTTP/1.1 200 OK", bank_list_page(vec![], 0, 0)),
+            Turn::HangUp,
+            answer(
+                "HTTP/1.1 200 OK",
+                bank_list_page(vec![bank_profile("bank", "the target")], 1, 0),
+            ),
+        ]);
+        let lost = bank_client(port)
+            .ensure_bank("bank")
+            .expect_err("a lost answer leaves creation unconfirmed");
+        assert!(lost.is_retryable(), "{lost}");
+        bank_client(port)
+            .ensure_bank("bank")
+            .expect("the bank the lost exchange created is now simply present");
+        assert_eq!(
+            asked(&seen_requests(&seen)),
+            [
+                "GET /v1/default/banks?q=bank&limit=100&offset=0",
+                "PUT /v1/default/banks/bank",
+                "GET /v1/default/banks?q=bank&limit=100&offset=0",
+            ],
+            "the next attempt must re-ask the list, never re-send the settings: the server may \
+             have created the bank and its owner changed it"
+        );
+    }
+
+    #[test]
+    fn the_bank_list_is_followed_until_the_target_or_the_end() {
+        let filler: Vec<Value> = (0..100)
+            .map(|index| bank_profile(&format!("decoy-{index:03}"), "a decoy bank"))
+            .collect();
+        let (seen, port) = scripted_server(vec![
+            answer("HTTP/1.1 200 OK", bank_list_page(filler, 101, 0)),
+            answer(
+                "HTTP/1.1 200 OK",
+                bank_list_page(vec![bank_profile("bank", "the target")], 101, 100),
+            ),
+        ]);
+        bank_client(port)
+            .ensure_bank("bank")
+            .expect("the target sits on the second page");
+        assert_eq!(
+            asked(&seen_requests(&seen)),
+            [
+                "GET /v1/default/banks?q=bank&limit=100&offset=0",
+                "GET /v1/default/banks?q=bank&limit=100&offset=100",
+            ],
+            "a full page advances the offset; the found target ends the walk before any write"
+        );
+    }
+
+    #[test]
+    fn a_target_deep_in_the_list_is_still_found() {
+        let filler_page = |offset: u64| {
+            let filler: Vec<Value> = (0..100)
+                .map(|index| bank_profile(&format!("decoy-{offset:04}-{index:03}"), "a decoy bank"))
+                .collect();
+            bank_list_page(filler, 1101, offset)
+        };
+        let mut turns: Vec<Turn> = (0..10_u64)
+            .map(|page| answer("HTTP/1.1 200 OK", filler_page(page * 100)))
+            .collect();
+        turns.push(answer(
+            "HTTP/1.1 200 OK",
+            bank_list_page(vec![bank_profile("bank", "the target")], 1101, 1000),
+        ));
+        let (seen, port) = scripted_server(turns);
+        bank_client(port)
+            .ensure_bank("bank")
+            .expect("the target sits on the eleventh page");
+        let requests = seen_requests(&seen);
+        assert_eq!(
+            requests.len(),
+            11,
+            "the walk must follow the server's own total, so a page cap cannot strand an \
+             existing bank"
+        );
+        assert_eq!(
+            requests.last().expect("the walk reached the last page").0,
+            "GET /v1/default/banks?q=bank&limit=100&offset=1000"
+        );
+    }
+
+    #[test]
+    fn a_short_page_after_the_first_never_concludes_absent() {
+        let filler: Vec<Value> = (0..100)
+            .map(|index| bank_profile(&format!("decoy-{index:03}"), "a decoy bank"))
+            .collect();
+        let (seen, port) = scripted_server(vec![
+            answer("HTTP/1.1 200 OK", bank_list_page(filler, 101, 0)),
+            answer(
+                "HTTP/1.1 200 OK",
+                bank_list_page(
+                    vec![bank_profile("decoy-100", "the last decoy bank")],
+                    101,
+                    100,
+                ),
+            ),
+        ]);
+        let undecidable = bank_client(port)
+            .ensure_bank("bank")
+            .expect_err("a walk that never saw the bank cannot call it absent");
+        assert!(undecidable.is_retryable(), "{undecidable}");
+        assert!(
+            undecidable.to_string().contains(LIST_BANKS_OPERATION)
+                && undecidable.to_string().contains("undecidable"),
+            "{undecidable}"
+        );
+        assert_eq!(
+            asked(&seen_requests(&seen)),
+            [
+                "GET /v1/default/banks?q=bank&limit=100&offset=0",
+                "GET /v1/default/banks?q=bank&limit=100&offset=100",
+            ],
+            "the official list reorders by last write between requests, so a short late page \
+             proves neither presence nor absence and no settings write may follow"
+        );
+    }
+
+    #[test]
+    fn a_first_page_short_of_its_own_total_never_concludes_absent() {
+        let (seen, port) = scripted_server(vec![answer(
+            "HTTP/1.1 200 OK",
+            bank_list_page(vec![bank_profile("shadow-bank", "a kin decoy")], 2, 0),
+        )]);
+        let undecidable = bank_client(port)
+            .ensure_bank("bank")
+            .expect_err("a page that contradicts its own total cannot acquit a write");
+        assert!(undecidable.is_retryable(), "{undecidable}");
+        assert!(
+            undecidable.to_string().contains("undecidable"),
+            "{undecidable}"
+        );
+        assert_eq!(
+            asked(&seen_requests(&seen)),
+            ["GET /v1/default/banks?q=bank&limit=100&offset=0"],
+            "a first response that held fewer banks than it counted cannot prove absence"
+        );
+    }
+
+    #[test]
+    fn substring_kin_without_an_exact_match_still_counts_as_absent() {
+        let (seen, port) = scripted_server(vec![
+            answer(
+                "HTTP/1.1 200 OK",
+                bank_list_page(
+                    vec![
+                        bank_profile("bank-2", "kin"),
+                        bank_profile("shadow-bank", "kin"),
+                    ],
+                    2,
+                    0,
+                ),
+            ),
+            answer(
+                "HTTP/1.1 200 OK",
+                r#"{"bank_id":"bank","name":"the target"}"#.to_owned(),
+            ),
+        ]);
+        bank_client(port)
+            .ensure_bank("bank")
+            .expect("kin alone is not the bank, so creation is free to run");
+        assert_eq!(
+            asked(&seen_requests(&seen)),
+            [
+                "GET /v1/default/banks?q=bank&limit=100&offset=0",
+                "PUT /v1/default/banks/bank",
+            ],
+            "the exact bank_id alone decides; substring kin must not block creation"
+        );
+    }
+
+    #[test]
+    fn an_invalid_utf8_bank_list_is_undecodable_not_absent() {
+        let mut body = br#"{"banks":[{"bank_id":"ban"#.to_vec();
+        body.push(0xFF);
+        body.extend_from_slice(br#""}],"total":1,"limit":100,"offset":0}"#);
+        let (seen, port) = scripted_server(vec![answer_bytes("HTTP/1.1 200 OK", body)]);
+        let undecodable = bank_client(port)
+            .ensure_bank("bank")
+            .expect_err("bytes that cannot state a bank_id cannot acquit a write either");
+        assert!(undecodable.is_retryable(), "{undecodable}");
+        assert!(
+            undecodable.to_string().contains("undecodable"),
+            "{undecodable}"
+        );
+        assert_eq!(
+            asked(&seen_requests(&seen)),
+            ["GET /v1/default/banks?q=bank&limit=100&offset=0"],
+            "a bank_id the exact match could not read must not morph into a near-miss and \
+             license a settings write"
         );
     }
 

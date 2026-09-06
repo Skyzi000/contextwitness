@@ -48,7 +48,7 @@ contextwitness run
 | `storage.image_retention_days` | `14` | キャプチャ画像を保持する日数。 |
 | `storage.image_retention_max_gib` | `50` | キャプチャ画像全体の容量上限(GiB)。 |
 | `privacy.process_blacklist` | `[]` | キャプチャを無効化するプロセス名。 |
-| `hindsight.bank_id` | `"contextwitness"` | エピソードの配送先となる Hindsight バンク。デーモンはこのバンクの retain 設定(mission・抽出モード・チャンクサイズ)を書き込むので、ContextWitness 専用のバンクを与えること。 |
+| `hindsight.bank_id` | `"contextwitness"` | エピソードの配送先となる Hindsight バンク。一覧で存在を確認できた bank の設定は変更せず、Hindsight 側で変更した設定はそのまま残る。不在の場合は retain 初期設定(mission・抽出モード・チャンクサイズ)付きの PUT を送るが、確認後の同時作成には競合が残る。それでも ContextWitness 専用のバンクを与えること。 |
 | `hindsight.context_label` | `"screen capture"` | 全エピソードに添えて送られる context ラベル。 |
 | `episode.window_minutes` | `5` | エピソード窓の長さ(分、1–1440)。 |
 
