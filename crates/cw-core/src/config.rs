@@ -8,7 +8,7 @@ pub const DEFAULT_CONFIG_TOML: &str = r#"# ContextWitness configuration.
 
 [capture]
 # Seconds between capture attempts (1-30).
-interval_secs = 2
+interval_secs = 10
 # A pixel counts as changed when its grayscale value moves by more than this (0-254).
 change_pixel_threshold = 8
 # Store and OCR a frame once more than this many logical pixels changed.
@@ -92,7 +92,7 @@ pub struct CaptureConfig {
 impl Default for CaptureConfig {
     fn default() -> Self {
         Self {
-            interval_secs: 2,
+            interval_secs: 10,
             change_pixel_threshold: 8,
             change_area_logical_pixels: 600,
             webp_quality: 75,
@@ -495,7 +495,7 @@ mod tests {
     fn default_config_matches_design_doc() {
         let config = Config::default();
 
-        assert_eq!(config.capture.interval_secs, 2);
+        assert_eq!(config.capture.interval_secs, 10);
         assert_eq!(config.capture.change_pixel_threshold, 8);
         assert_eq!(config.capture.change_area_logical_pixels, 600);
         assert_eq!(config.capture.webp_quality, 75);

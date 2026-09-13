@@ -39,7 +39,7 @@ contextwitness run
 
 | キー | 既定値 | 意味 |
 | --- | --- | --- |
-| `capture.interval_secs` | `2` | キャプチャ試行の間隔秒数(1–30)。 |
+| `capture.interval_secs` | `10` | キャプチャ試行の間隔秒数(1–30)。 |
 | `capture.change_pixel_threshold` | `8` | ピクセルごとの輝度差がこの値以下なら「変化なし」と数える(0–254)。 |
 | `capture.change_area_logical_pixels` | `600` | 変化した論理ピクセル数(表示スケーリング 100% 換算)がこれを超えたらフレームを保存して OCR する。 |
 | `capture.webp_quality` | `75` | WebP エンコード品質(0–100)。 |

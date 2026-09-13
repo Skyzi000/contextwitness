@@ -39,7 +39,7 @@ contextwitness run
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `capture.interval_secs` | `2` | Seconds between capture attempts (1–30). |
+| `capture.interval_secs` | `10` | Seconds between capture attempts (1–30). |
 | `capture.change_pixel_threshold` | `8` | Per-pixel luma delta at or below which a pixel counts as unchanged (0–254). |
 | `capture.change_area_logical_pixels` | `600` | Store and OCR a frame once more than this many logical pixels (measured at 100% display scaling) changed. |
 | `capture.webp_quality` | `75` | WebP encoding quality (0–100). |
