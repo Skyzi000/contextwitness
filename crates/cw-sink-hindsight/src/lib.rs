@@ -12,10 +12,9 @@ use reqwest::{StatusCode, Url};
 use serde_json::value::RawValue;
 use serde_json::{Map, Value, json};
 
-/// Steers what Hindsight extracts from the episodes this daemon sends.
-const RETAIN_MISSION: &str = "Record the user's on-screen activity as a time-anchored activity log. Focus on what the user was actually doing: the applications in use, the documents and pages being viewed or edited, and the substance of on-screen text. Ignore boilerplate UI text such as menu labels, button captions, and window chrome. Prefer concrete, time-anchored statements over generalizations.";
-const RETAIN_EXTRACTION_MODE: &str = "concise";
-const RETAIN_CHUNK_SIZE: u32 = 3000;
+/// The `observations_mission` a new bank starts with: tells Hindsight's consolidation what the
+/// episode text is (OCR of screen captures) and what the display alone cannot establish.
+const OBSERVATIONS_MISSION: &str = "Sources are OCR text from screen captures, grouped into time windows. Entries carry a timestamp and, where known, the foreground application and window title; the foreground is shared across all monitors, so text from a background screen is not necessarily from that application. Consecutive identical captures are folded into one entry. OCR may misrecognize displayed text, and chunks may omit entry headers. The display alone does not establish that the user read, wrote, ran, or agreed with the text, even when the text may be the user's own. Keep the time, application, and window title exactly as they appear in the input, and do not invent them where they are missing. The same text observed again is not independent confirmation. Consolidate related screen records into observations about which applications, documents, pages, and topics were on screen and when; do not create a new observation for a repetition that adds nothing.";
 
 /// Bounds the whole exchange, request-body upload included, so the largest configurable episode
 /// over a slow link must fit within it; detecting a dead host promptly is [`CONNECT_TIMEOUT`]'s
@@ -426,24 +425,26 @@ impl HindsightClient {
         Ok(url)
     }
 
-    /// Applies the fixed retain settings only when the bank list reports it absent; a
-    /// bank that existed at the check is not rewritten. The PUT is an upsert with no
-    /// create-only form, so a bank another client creates between the check and the PUT
-    /// still receives the settings once.
+    /// Applies the initial settings only when the bank list reports it absent; a bank the list
+    /// confirmed as existing is never written. The PATCH both creates a missing bank and sets
+    /// its config, so a bank another client creates between the check and the PATCH still
+    /// receives the settings once.
     pub fn ensure_bank(&self, bank_id: &str) -> Result<(), DeliveryError> {
         vet_bank_id(bank_id)?;
         if self.bank_exists(bank_id)? {
             return Ok(());
         }
-        let url = self.endpoint(&["v1", "default", "banks", bank_id])?;
+        let url = self.endpoint(&["v1", "default", "banks", bank_id, "config"])?;
         let desired = json!({
-            "retain_mission": RETAIN_MISSION,
-            "retain_extraction_mode": RETAIN_EXTRACTION_MODE,
-            "retain_chunk_size": RETAIN_CHUNK_SIZE,
+            "updates": {
+                "retain_extraction_mode": "chunks",
+                "store_document_text": false,
+                "observations_mission": OBSERVATIONS_MISSION,
+            }
         });
         accept(
-            self.send(self.http.put(url).json(&desired).timeout(CONTROL_TIMEOUT))?,
-            CREATE_BANK_OPERATION,
+            self.send(self.http.patch(url).json(&desired).timeout(CONTROL_TIMEOUT))?,
+            INITIALIZE_BANK_OPERATION,
         )
         .map(drop)
     }
@@ -660,7 +661,7 @@ fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
 }
 
 const RETAIN_OPERATION: &str = "retain";
-const CREATE_BANK_OPERATION: &str = "create bank";
+const INITIALIZE_BANK_OPERATION: &str = "initialize bank";
 const LIST_BANKS_OPERATION: &str = "list banks";
 const POLL_OPERATION: &str = "operation status";
 
@@ -1663,12 +1664,12 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_bank_is_created_once_with_exactly_the_three_settings() {
+    fn a_missing_bank_is_initialized_once_with_exactly_the_three_settings() {
         let (seen, port) = scripted_server(vec![
             answer("HTTP/1.1 200 OK", bank_list_page(vec![], 0, 0)),
             answer(
                 "HTTP/1.1 200 OK",
-                r#"{"bank_id":"bank","name":"the target"}"#.to_owned(),
+                r#"{"bank_id":"bank","name":"the target","config":{}}"#.to_owned(),
             ),
             answer(
                 "HTTP/1.1 200 OK",
@@ -1676,7 +1677,7 @@ mod tests {
                     vec![json!({
                         "bank_id": "bank",
                         "name": "the target",
-                        "mission": "the owner's own mission, changed after creation",
+                        "mission": "the owner's own mission, changed after initialization",
                         "retain_chunk_size": 8000,
                     })],
                     1,
@@ -1686,28 +1687,32 @@ mod tests {
         ]);
         bank_client(port)
             .ensure_bank("bank")
-            .expect("an absent bank is this client's to create");
+            .expect("an absent bank is this client's to initialize");
         bank_client(port)
             .ensure_bank("bank")
-            .expect("the created bank now exists, whatever its settings are");
+            .expect("the initialized bank now exists, whatever its settings are");
         let requests = seen_requests(&seen);
         assert_eq!(
             asked(&requests),
             [
                 "GET /v1/default/banks?q=bank&limit=100&offset=0",
-                "PUT /v1/default/banks/bank",
+                "PATCH /v1/default/banks/bank/config",
                 "GET /v1/default/banks?q=bank&limit=100&offset=0",
             ],
-            "creation is one list check and one PUT; every later initialization only asks"
+            "initialization is one list check and one config PATCH; every later initialization \
+             only asks"
         );
         assert_eq!(
-            serde_json::from_str::<Value>(&requests[1].1).expect("the PUT body is JSON"),
+            serde_json::from_str::<Value>(&requests[1].1).expect("the PATCH body is JSON"),
             json!({
-                "retain_mission": RETAIN_MISSION,
-                "retain_extraction_mode": "concise",
-                "retain_chunk_size": 3000,
+                "updates": {
+                    "retain_extraction_mode": "chunks",
+                    "store_document_text": false,
+                    "observations_mission": OBSERVATIONS_MISSION,
+                }
             }),
-            "creation carries exactly the three fixed settings and nothing else"
+            "initialization carries exactly the three agreed settings inside `updates`, and \
+             nothing else: no PUT, no extra flags"
         );
     }
 
@@ -1766,7 +1771,7 @@ mod tests {
     }
 
     #[test]
-    fn a_lost_creation_answer_does_not_rewrite_settings_on_the_next_attempt() {
+    fn a_lost_initialization_answer_does_not_rewrite_settings_on_the_next_attempt() {
         let (seen, port) = scripted_server(vec![
             answer("HTTP/1.1 200 OK", bank_list_page(vec![], 0, 0)),
             Turn::HangUp,
@@ -1777,20 +1782,62 @@ mod tests {
         ]);
         let lost = bank_client(port)
             .ensure_bank("bank")
-            .expect_err("a lost answer leaves creation unconfirmed");
+            .expect_err("a lost answer leaves initialization unconfirmed");
         assert!(lost.is_retryable(), "{lost}");
         bank_client(port)
             .ensure_bank("bank")
-            .expect("the bank the lost exchange created is now simply present");
+            .expect("the bank the lost exchange initialized is now simply present");
         assert_eq!(
             asked(&seen_requests(&seen)),
             [
                 "GET /v1/default/banks?q=bank&limit=100&offset=0",
-                "PUT /v1/default/banks/bank",
+                "PATCH /v1/default/banks/bank/config",
                 "GET /v1/default/banks?q=bank&limit=100&offset=0",
             ],
             "the next attempt must re-ask the list, never re-send the settings: the server may \
-             have created the bank and its owner changed it"
+             have initialized the bank and its owner changed it"
+        );
+    }
+
+    #[test]
+    fn a_refused_initialization_is_an_error_and_a_later_attempt_can_still_succeed() {
+        let (seen, port) = scripted_server(vec![
+            answer("HTTP/1.1 200 OK", bank_list_page(vec![], 0, 0)),
+            answer(
+                "HTTP/1.1 403 Forbidden",
+                r#"{"detail":"the server's own words"}"#.to_owned(),
+            ),
+            answer("HTTP/1.1 200 OK", bank_list_page(vec![], 0, 0)),
+            answer(
+                "HTTP/1.1 200 OK",
+                r#"{"bank_id":"bank","config":{},"overrides":{}}"#.to_owned(),
+            ),
+        ]);
+        let refused = bank_client(port)
+            .ensure_bank("bank")
+            .expect_err("a refused PATCH is not a successful initialization");
+        assert!(refused.is_retryable(), "{refused}");
+        assert!(
+            refused.to_string().contains(INITIALIZE_BANK_OPERATION),
+            "the refusal must name the initialization exchange: {refused}"
+        );
+        assert!(
+            refused.to_string().contains("the server's own words"),
+            "the bounded server words are the diagnosis: {refused}"
+        );
+        bank_client(port)
+            .ensure_bank("bank")
+            .expect("a later initialization attempt can still succeed");
+        assert_eq!(
+            asked(&seen_requests(&seen)),
+            [
+                "GET /v1/default/banks?q=bank&limit=100&offset=0",
+                "PATCH /v1/default/banks/bank/config",
+                "GET /v1/default/banks?q=bank&limit=100&offset=0",
+                "PATCH /v1/default/banks/bank/config",
+            ],
+            "the refused initialization must reach BankGate's backoff and be retried as a whole: \
+             list check first, then the PATCH again"
         );
     }
 
@@ -1929,14 +1976,14 @@ mod tests {
         ]);
         bank_client(port)
             .ensure_bank("bank")
-            .expect("kin alone is not the bank, so creation is free to run");
+            .expect("kin alone is not the bank, so initialization is free to run");
         assert_eq!(
             asked(&seen_requests(&seen)),
             [
                 "GET /v1/default/banks?q=bank&limit=100&offset=0",
-                "PUT /v1/default/banks/bank",
+                "PATCH /v1/default/banks/bank/config",
             ],
-            "the exact bank_id alone decides; substring kin must not block creation"
+            "the exact bank_id alone decides; substring kin must not block initialization"
         );
     }
 

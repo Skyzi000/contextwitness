@@ -40,7 +40,7 @@ process_blacklist = []
 # Memory bank that receives episodes.
 bank_id = "contextwitness"
 # Context label sent with every episode.
-context_label = "screen capture"
+context_label = "Time-stamped OCR text of screen captures, with the foreground application and window title where known. May contain OCR errors; shows what was displayed, not what the user read, wrote, or did."
 
 [episode]
 # Observations are grouped into episodes of this length (1-1440).
@@ -164,7 +164,10 @@ impl Default for HindsightConfig {
     fn default() -> Self {
         Self {
             bank_id: "contextwitness".into(),
-            context_label: "screen capture".into(),
+            context_label: "Time-stamped OCR text of screen captures, with the foreground \
+                            application and window title where known. May contain OCR errors; \
+                            shows what was displayed, not what the user read, wrote, or did."
+                .into(),
         }
     }
 }
@@ -502,8 +505,26 @@ mod tests {
         assert_eq!(config.storage.image_retention_max_gib, 50);
         assert!(config.privacy.process_blacklist.is_empty());
         assert_eq!(config.hindsight.bank_id, "contextwitness");
-        assert_eq!(config.hindsight.context_label, "screen capture");
+        assert_eq!(
+            config.hindsight.context_label,
+            "Time-stamped OCR text of screen captures, with the foreground application and \
+             window title where known. May contain OCR errors; shows what was displayed, not \
+             what the user read, wrote, or did."
+        );
         assert_eq!(config.episode.window_minutes, 5);
+    }
+
+    #[test]
+    fn an_explicit_context_label_is_kept_verbatim() {
+        for explicit in ["screen capture", "my own label"] {
+            let config =
+                Config::from_toml_str(&format!("[hindsight]\ncontext_label = \"{explicit}\"\n"))
+                    .expect("an explicit context label should parse");
+            assert_eq!(
+                config.hindsight.context_label, explicit,
+                "an explicit value — the former default included — must not be rewritten"
+            );
+        }
     }
 
     #[test]
