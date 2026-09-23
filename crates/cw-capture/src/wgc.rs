@@ -440,8 +440,6 @@ impl Sink {
             return Err("staging texture missing after ensure".into());
         };
 
-        // Hand-rolled instead of `Frame::buffer`: that one hands back a slice into a mapping it
-        // has already released.
         let (width, height) = (desc.Width, desc.Height);
         let row = width as usize * 4;
         let mut bgra = vec![0u8; row * height as usize];

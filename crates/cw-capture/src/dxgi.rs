@@ -74,8 +74,6 @@ impl Capturer for DxgiCapturer {
 
 struct Session {
     duplication: DxgiDuplicationApi,
-    /// Owned across captures because the crate's own `buffer()` drops its staging texture while it
-    /// is still mapped and hands back a slice into it.
     staging: Option<StagingTexture>,
 }
 
@@ -135,7 +133,6 @@ impl Session {
                         pixel.swap(0, 2);
                     }
                 }
-                // 10-bit and FP16 desktops need tone mapping to SDR 8-bit, which v1 does not do.
                 other => return Err(Recoverable::UnsupportedFormat(format!("{other:?}")).into()),
             }
             for pixel in bgra.as_chunks_mut::<4>().0 {
