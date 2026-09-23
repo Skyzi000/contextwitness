@@ -32,6 +32,26 @@ const MAX_PAGES: u32 = 100;
 #[cfg(test)]
 const MAX_PAGES: u32 = 4;
 
+const WORK_SPAN: std::time::Duration = std::time::Duration::from_secs(1);
+const PAUSE: std::time::Duration = std::time::Duration::from_millis(250);
+
+struct Pacer {
+    since: std::time::Instant,
+}
+
+impl Pacer {
+    fn due(&self, now: std::time::Instant) -> bool {
+        now.saturating_duration_since(self.since) >= WORK_SPAN
+    }
+
+    fn pace(&mut self) {
+        if self.due(std::time::Instant::now()) {
+            std::thread::sleep(PAUSE);
+            self.since = std::time::Instant::now();
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Sweep {
     pub expired: usize,
@@ -57,6 +77,9 @@ pub fn sweep(
     max_gib: u64,
 ) -> Result<Sweep, StoreError> {
     let mut swept = Sweep::default();
+    let mut pacer = Pacer {
+        since: std::time::Instant::now(),
+    };
 
     // A cutoff `to_sql` refuses — a retention long enough to reach past year 0 — selects nothing
     // rather than failing the whole sweep.
@@ -80,7 +103,7 @@ pub fn sweep(
                 // Unconditionally: a row `delete_one` refuses must not be offered to every
                 // later page again.
                 cursor = (created_at.clone(), id.clone());
-                if delete_one(conn, root, id, *byte_size, &mut swept)?.is_some() {
+                if delete_one(conn, root, id, *byte_size, &mut swept, &mut pacer)?.is_some() {
                     swept.expired += 1;
                 }
             }
@@ -136,7 +159,7 @@ pub fn sweep(
             }
             // After the break: a fetched row this pass never examined stays ahead of the cursor.
             cursor = (created_at.clone(), id.clone());
-            if let Some(outcome) = delete_one(conn, root, id, *byte_size, &mut swept)? {
+            if let Some(outcome) = delete_one(conn, root, id, *byte_size, &mut swept, &mut pacer)? {
                 swept.over_budget += 1;
                 // Something else deleted the row, and this total was read before that: it charges
                 // for this row and for whatever else went with it, so subtracting one row's size
@@ -177,6 +200,7 @@ fn delete_one(
     id: &str,
     byte_size: i64,
     swept: &mut Sweep,
+    pacer: &mut Pacer,
 ) -> Result<Option<images::DeleteOutcome>, StoreError> {
     // `images::delete` looks a row up in the canonical spelling of the id, so a row holding any
     // other spelling would delete nothing and answer `Ok` — counted as freed while it still
@@ -189,7 +213,9 @@ fn delete_one(
         return Ok(None);
     };
 
-    match images::delete(conn, root, parsed) {
+    let deleted = images::delete(conn, root, parsed);
+    pacer.pace();
+    match deleted {
         Ok(outcome) => {
             if outcome == images::DeleteOutcome::MissingFile {
                 swept.missing += 1;
@@ -225,7 +251,10 @@ fn page(
 
 #[cfg(test)]
 mod tests {
-    use super::{BATCH, BUDGET_CURSOR, BYTES_PER_GIB, EXPIRED_CURSOR, MAX_PAGES, Sweep, sweep};
+    use super::{
+        BATCH, BUDGET_CURSOR, BYTES_PER_GIB, EXPIRED_CURSOR, MAX_PAGES, PAUSE, Pacer, Sweep,
+        WORK_SPAN, sweep,
+    };
     use crate::{db, images, timestamp};
     use chrono::{DateTime, TimeDelta, TimeZone, Utc};
     use tempfile::{TempDir, tempdir};
@@ -1272,5 +1301,19 @@ mod tests {
         .expect("the registered size should be changeable");
 
         assert_eq!(budget(&conn), 850);
+    }
+
+    #[test]
+    fn the_pacer_is_due_a_work_span_after_it_last_resumed() {
+        let tick = std::time::Duration::from_nanos(1);
+        let start = std::time::Instant::now();
+        let mut pacer = Pacer { since: start };
+        assert!(!pacer.due(start + WORK_SPAN - tick));
+        assert!(pacer.due(start + WORK_SPAN));
+
+        let before = std::time::Instant::now();
+        pacer.since = before - WORK_SPAN;
+        pacer.pace();
+        assert!(pacer.since >= before + PAUSE);
     }
 }
