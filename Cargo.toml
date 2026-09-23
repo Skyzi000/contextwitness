@@ -33,11 +33,11 @@ tracing-appender = "0.2"
 chrono = { version = "0.4", features = ["serde"] }
 ulid = { version = "3", features = ["serde"] }
 toml = "1"
-dirs = "6"
+dirs = "7"
 clap = { version = "4.6", features = ["derive"] }
 winreg = "0.56"
-tray-icon = "0.24"
-tao = "0.36"
+tray-icon = "0.25"
+tao = "0.37"
 windows = { version = "0.62", features = [
     "Win32_Globalization",
     "Win32_Storage_FileSystem",
