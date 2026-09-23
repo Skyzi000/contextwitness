@@ -129,8 +129,8 @@ impl Session {
             let mut packed = Vec::new();
             let mut bgra = buffer.as_nopadding_buffer(&mut packed).to_vec();
             match format {
-                DxgiDuplicationFormat::Bgra8 | DxgiDuplicationFormat::Bgra8Srgb => {}
-                DxgiDuplicationFormat::Rgba8 | DxgiDuplicationFormat::Rgba8Srgb => {
+                DxgiDuplicationFormat::Bgra8 => {}
+                DxgiDuplicationFormat::Rgba8 => {
                     for pixel in bgra.as_chunks_mut::<4>().0 {
                         pixel.swap(0, 2);
                     }
