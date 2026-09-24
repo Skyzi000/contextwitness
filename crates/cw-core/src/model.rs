@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+pub const CURRENT_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -12,7 +12,6 @@ pub enum OcrStatus {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ScreenPayload {
-    pub monitor_id: String,
     pub width: u32,
     pub height: u32,
     pub image_path: Option<String>,
@@ -100,7 +99,6 @@ mod tests {
 
     fn fully_populated_screen_payload() -> ScreenPayload {
         ScreenPayload {
-            monitor_id: "monitor-1".to_owned(),
             width: 1920,
             height: 1080,
             image_path: Some("screens/observation.png".to_owned()),
@@ -129,7 +127,7 @@ mod tests {
             .expect("screen payload should deserialize");
 
         assert_eq!(back, obs.payload);
-        assert_eq!(obs.schema_version, 1);
+        assert_eq!(obs.schema_version, 2);
     }
 
     #[test]
@@ -143,7 +141,7 @@ mod tests {
                 .expect("screen payload should serialize"),
         )
         .expect("payload JSON should spell as a string");
-        let golden = r#"{"foreground_process":"notepad.exe","foreground_window_title":"メモ帳","height":1080,"image_path":"screens/observation.png","monitor_id":"monitor-1","ocr_error":"non-fatal OCR warning","ocr_langs":["ja-JP","en-US"],"ocr_status":"succeeded","ocr_text":"テスト","width":1920}"#;
+        let golden = r#"{"foreground_process":"notepad.exe","foreground_window_title":"メモ帳","height":1080,"image_path":"screens/observation.png","ocr_error":"non-fatal OCR warning","ocr_langs":["ja-JP","en-US"],"ocr_status":"succeeded","ocr_text":"テスト","width":1920}"#;
 
         assert_eq!(json, golden);
         assert!(

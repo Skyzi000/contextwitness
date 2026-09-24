@@ -1,7 +1,5 @@
-//! Windows Graphics Capture fallback, on `windows-capture`.
+//! Windows Graphics Capture, on `windows-capture`.
 
-use std::collections::HashMap;
-use std::collections::hash_map::Entry;
 use std::time::{Duration, Instant};
 
 use windows::Win32::Graphics::Direct3D11::{
@@ -9,126 +7,37 @@ use windows::Win32::Graphics::Direct3D11::{
     ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
-use windows::Win32::Graphics::Gdi::HMONITOR;
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows_capture::capture::{CaptureControl, Context, GraphicsCaptureApiHandler};
 use windows_capture::d3d11::StagingTexture;
 use windows_capture::frame::Frame as WgcFrame;
 use windows_capture::graphics_capture_api::{GraphicsCaptureApi, InternalCaptureControl};
-use windows_capture::monitor::Monitor;
 use windows_capture::settings::{
     ColorFormat, CursorCaptureSettings, DirtyRegionSettings, DrawBorderSettings,
     MinimumUpdateIntervalSettings, SecondaryWindowSettings, Settings,
 };
+use windows_capture::window::Window;
 
-use crate::{
-    CaptureError, Capturer, Frame, MonitorInfo, Recoverable, STALE_SHOT_SECONDS, enumerate_monitors,
-};
+use crate::{CaptureError, Frame, Recoverable, STALE_SHOT_SECONDS};
 
 /// How long a fresh session may stay silent before it is called broken instead of idle.
 const FIRST_FRAME_GRACE: Duration = Duration::from_secs(5);
 
+const FIRST_FRAME_WAIT: Duration = Duration::from_secs(1);
+const FIRST_FRAME_POLL: Duration = Duration::from_millis(10);
+
 type Control = CaptureControl<Sink, <Sink as GraphicsCaptureApiHandler>::Error>;
-
-pub(crate) struct WgcCapturer {
-    known: Vec<(HMONITOR, MonitorInfo)>,
-    sessions: HashMap<String, Session>,
-    /// Skip reasons already warned about, held for `enumerate_monitors`'s deduplication.
-    skips: HashMap<isize, String>,
-    /// Delivery floor set by `discard_pending`; sessions opened after it refuse older stamps.
-    floor_100ns: i64,
-}
-
-impl WgcCapturer {
-    pub(crate) fn new() -> Self {
-        Self {
-            known: Vec::new(),
-            sessions: HashMap::new(),
-            skips: HashMap::new(),
-            floor_100ns: 0,
-        }
-    }
-
-    /// Drop a monitor's session.
-    pub(crate) fn release(&mut self, monitor_id: &str) {
-        self.sessions.remove(monitor_id);
-    }
-
-    /// Drop sessions for monitors that are gone. `monitors` does this too, but only when something
-    /// actually captures through this backend: were the last fallback monitor detached, nothing
-    /// would call in again and its capture thread and D3D device would outlive it by the life of
-    /// the process.
-    pub(crate) fn retain_monitors(&mut self, monitors: &[MonitorInfo]) {
-        self.sessions
-            .retain(|id, _| monitors.iter().any(|monitor| &monitor.id == id));
-    }
-
-    /// Drop every session and floor later deliveries above this instant. Destroying the sessions
-    /// disposes every held texture and queued frame; the floor covers what destruction cannot —
-    /// nothing documents that a fresh session's first compose postdates its creation, so the
-    /// boundary is enforced on the composition stamp instead of assumed of the pipeline.
-    pub(crate) fn discard_pending(&mut self) {
-        self.sessions.clear();
-        // Refusing every capture forever is the correct answer to a clock that cannot be read.
-        self.floor_100ns = qpc_now_100ns().unwrap_or(i64::MAX);
-    }
-
-    /// Pull the held frame from an existing session only — never through enumeration, where a
-    /// transient query failure takes the session and its hold down with it — opening nothing.
-    /// The session's own delivery bounds still judge the hold.
-    pub(crate) fn drain_existing(&mut self, monitor: &MonitorInfo) -> Option<Frame> {
-        let session = self.sessions.get_mut(&monitor.id)?;
-        session.capture(&monitor.id, monitor.dpi_scale).ok()
-    }
-}
-
-impl Capturer for WgcCapturer {
-    fn monitors(&mut self) -> Result<Vec<MonitorInfo>, CaptureError> {
-        self.known = enumerate_monitors(&mut self.skips)?;
-        let known = &self.known;
-        self.sessions
-            .retain(|id, _| known.iter().any(|(_, monitor)| &monitor.id == id));
-        Ok(self
-            .known
-            .iter()
-            .map(|(_, monitor)| monitor.clone())
-            .collect())
-    }
-
-    fn capture(&mut self, monitor_id: &str) -> Result<Frame, CaptureError> {
-        self.monitors()?;
-        let (handle, dpi_scale) = self
-            .known
-            .iter()
-            .find(|(_, monitor)| monitor.id == monitor_id)
-            .map(|(handle, monitor)| (*handle, monitor.dpi_scale))
-            .ok_or(Recoverable::MonitorGone)?;
-
-        let floor_100ns = self.floor_100ns;
-        let session = match self.sessions.entry(monitor_id.to_owned()) {
-            Entry::Occupied(occupied) => occupied.into_mut(),
-            Entry::Vacant(vacant) => vacant.insert(Session::open(handle, floor_100ns)?),
-        };
-
-        let captured = session.capture(monitor_id, dpi_scale);
-        if matches!(&captured, Err(error) if !matches!(error, CaptureError::Recoverable(Recoverable::NoNewFrame)))
-        {
-            self.sessions.remove(monitor_id);
-        }
-        captured
-    }
-}
 
 /// A live capture thread plus the sink it feeds; the sink is reached through the wrapper's
 /// callback mutex.
-struct Session {
+pub(crate) struct Session {
     control: Option<Control>,
     opened: Instant,
     delivered: bool,
 }
 
 impl Session {
-    fn open(handle: HMONITOR, floor_100ns: i64) -> Result<Self, CaptureError> {
+    pub(crate) fn open(hwnd: isize, floor_100ns: i64) -> Result<Self, CaptureError> {
         // Asking for a borderless capture where the OS does not support it costs the whole session.
         let border = if GraphicsCaptureApi::is_border_settings_supported().unwrap_or(false) {
             DrawBorderSettings::WithoutBorder
@@ -136,9 +45,7 @@ impl Session {
             DrawBorderSettings::Default
         };
         let settings = Settings::new(
-            Monitor::from_raw_hmonitor(handle.0),
-            // The duplication never composes the cursor; a fallback that did would change what
-            // the record means depending on which backend answered.
+            Window::from_raw_hwnd(hwnd as _),
             CursorCaptureSettings::WithoutCursor,
             border,
             SecondaryWindowSettings::Default,
@@ -160,7 +67,22 @@ impl Session {
         })
     }
 
-    fn capture(&mut self, monitor_id: &str, dpi_scale: f32) -> Result<Frame, CaptureError> {
+    pub(crate) fn first_frame(&mut self, dpi_scale: f32) -> Result<Frame, CaptureError> {
+        let started = Instant::now();
+        loop {
+            let captured = self.capture(dpi_scale);
+            if !matches!(
+                captured,
+                Err(CaptureError::Recoverable(Recoverable::NoNewFrame))
+            ) || started.elapsed() >= FIRST_FRAME_WAIT
+            {
+                return captured;
+            }
+            std::thread::sleep(FIRST_FRAME_POLL);
+        }
+    }
+
+    pub(crate) fn capture(&mut self, dpi_scale: f32) -> Result<Frame, CaptureError> {
         let Some(control) = self
             .control
             .as_ref()
@@ -177,7 +99,6 @@ impl Session {
             Pulled::Delivered(width, height, bgra, captured_at) => {
                 self.delivered = true;
                 Ok(Frame {
-                    monitor_id: monitor_id.to_owned(),
                     width,
                     height,
                     dpi_scale,
@@ -294,7 +215,7 @@ struct Sink {
 
 /// A reading of the counter `SystemRelativeTime` is stamped on, in the same 100-nanosecond
 /// units, so ages need no second clock and no conversion race.
-fn qpc_now_100ns() -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
+pub(crate) fn qpc_now_100ns() -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
     let (mut counter, mut frequency) = (0i64, 0i64);
     unsafe {
         QueryPerformanceCounter(&mut counter)?;
@@ -480,31 +401,6 @@ impl Sink {
 mod tests {
     use super::*;
 
-    #[test]
-    fn a_drain_reads_only_the_session_that_exists() {
-        let mut wgc = WgcCapturer::new();
-        let monitor = MonitorInfo {
-            id: "no-such-monitor".to_owned(),
-            width: 1,
-            height: 1,
-            dpi_scale: 1.0,
-            is_primary: false,
-        };
-        assert!(wgc.drain_existing(&monitor).is_none());
-        assert!(wgc.sessions.is_empty());
-
-        wgc.sessions.insert(
-            monitor.id.clone(),
-            Session {
-                control: None,
-                opened: Instant::now(),
-                delivered: false,
-            },
-        );
-        assert!(wgc.drain_existing(&monitor).is_none());
-        assert!(wgc.sessions.contains_key(&monitor.id));
-    }
-
     /// An arbitrary boot-relative composition instant, in `SystemRelativeTime`'s 100 ns ticks.
     const COMPOSED: i64 = 1_000 * HUNDRED_NS_PER_SECOND;
     const STALE_BOUND_100NS: i64 = STALE_SHOT_SECONDS as i64 * HUNDRED_NS_PER_SECOND;
@@ -611,7 +507,7 @@ mod tests {
     #[test]
     fn a_delivered_hold_gone_old_is_idle_not_stale() {
         // Stale tears the session down; a delivered hold aging out is an idle screen and must
-        // stay a quiet nothing, or every still monitor would churn its session at the bound.
+        // stay a quiet nothing, or every still window would churn its session at the bound.
         let (mut freshness, at, wall) = arrived();
         freshness.mark_delivered();
         assert_eq!(

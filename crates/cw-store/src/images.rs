@@ -930,7 +930,6 @@ mod tests {
     fn insert_observation(conn: &rusqlite::Connection, id: ulid::Ulid, observed_at: DateTime<Utc>) {
         let mut observation = Observation::new_screen(
             ScreenPayload {
-                monitor_id: "synthetic-monitor".to_owned(),
                 width: WIDTH,
                 height: HEIGHT,
                 image_path: None,

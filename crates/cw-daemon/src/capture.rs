@@ -1,11 +1,9 @@
-use std::collections::HashMap;
-
 use cw_core::change::{Thumbnail, frame_changed};
 use cw_core::config::{Config, DataPaths};
 use cw_core::model::{Observation, OcrStatus, ScreenPayload, SourcePayload};
 use cw_core::privacy::CaptureDecision;
 use cw_store::control::{ControlEvent, EventKind, HealthKey};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 /// `last_tick_at` is written at most this often (design §7): a stale mark only ever holds
 /// episode closure back, never moves it ahead.
@@ -20,10 +18,9 @@ pub fn run(
     config: Config,
 ) -> ! {
     let interval = std::time::Duration::from_secs(config.capture.interval_secs);
-    let mut previous: HashMap<String, Thumbnail> = HashMap::new();
+    let mut subject = Subject::default();
     let mut health_written: Option<std::time::Instant> = None;
-    let mut threshold_warned: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut save_failed: HashMap<String, SaveFailure> = HashMap::new();
+    let mut save_failed: Option<SaveFailure> = None;
     let mut last_failure: Option<String> = None;
 
     loop {
@@ -34,9 +31,8 @@ pub fn run(
             &mut conn,
             &paths,
             &config,
-            &mut previous,
+            &mut subject,
             &mut health_written,
-            &mut threshold_warned,
             &mut save_failed,
         ) {
             Ok(()) => last_failure = None,
@@ -44,6 +40,7 @@ pub fn run(
                 // Fail closed: the tick may have died before it judged the pause or the privacy
                 // gate, and failing open shows a screen the gate may have been refusing.
                 capture.discard_pending();
+                subject.aim(None);
                 // The same failure repeating every tick is one line of news, not one line per
                 // tick.
                 let message = error.to_string();
@@ -63,7 +60,6 @@ pub fn run(
 /// it. The recognized text is deliberately not here: neither destination is a place screen content
 /// goes, and only its length is reported.
 pub(crate) struct Stored {
-    pub monitor_id: String,
     pub width: u32,
     pub height: u32,
     pub ocr_status: OcrStatus,
@@ -79,10 +75,9 @@ fn tick(
     conn: &mut rusqlite::Connection,
     paths: &DataPaths,
     config: &Config,
-    previous: &mut HashMap<String, Thumbnail>,
+    subject: &mut Subject,
     health_written: &mut Option<std::time::Instant>,
-    threshold_warned: &mut std::collections::HashSet<String>,
-    save_failed: &mut HashMap<String, SaveFailure>,
+    save_failed: &mut Option<SaveFailure>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let started = chrono::Utc::now();
 
@@ -93,57 +88,26 @@ fn tick(
         };
         if paused {
             capture.discard_pending();
+            subject.aim(None);
             mark_tick(conn, health_written, started)?;
             debug!("capture is paused");
             return Ok(());
         }
     }
 
-    if let Ok(monitors) = capture.monitors() {
-        previous.retain(|id, _| monitors.iter().any(|monitor| &monitor.id == id));
-        threshold_warned.retain(|id| monitors.iter().any(|monitor| &monitor.id == id));
-        save_failed.retain(|id, _| monitors.iter().any(|monitor| &monitor.id == id));
-        for monitor in &monitors {
-            if !cw_core::change::change_threshold_is_reachable(
-                monitor.width,
-                monitor.height,
-                monitor.dpi_scale,
-                &config.capture,
-            ) && threshold_warned.insert(monitor.id.clone())
-            {
-                error!(
-                    monitor = %monitor.id,
-                    "this monitor ({}x{} at {}x scale) tops out at {:.0} changed logical pixels, \
-                     under capture.change_area_logical_pixels: no pixel change can cross it until \
-                     the threshold is lowered",
-                    monitor.width,
-                    monitor.height,
-                    monitor.dpi_scale,
-                    cw_core::change::max_logical_pixels(
-                        monitor.width,
-                        monitor.height,
-                        monitor.dpi_scale
-                    )
-                );
-            }
-        }
-    }
-
-    let mut stored = Vec::new();
+    let mut stored = None;
     let outcome = pass(
         capture,
         ocr,
         conn,
         paths,
         config,
-        previous,
+        subject,
         save_failed,
-        None,
         &mut stored,
     );
-    report_then_finish(outcome, &stored, |frame| {
+    report_then_finish(outcome, stored.as_ref(), |frame| {
         info!(
-            monitor = %frame.monitor_id,
             width = frame.width,
             height = frame.height,
             ocr = ?frame.ocr_status,
@@ -160,14 +124,12 @@ fn tick(
     Ok(())
 }
 
-/// Capture every monitor once: the privacy gate, change detection against `previous`, OCR, and the
-/// observation and image rows for whatever changed. The pause is not consulted here — `tick` owns
-/// that, and `capture-once` is a user asking for this pass in particular. `only` narrows the pass
-/// to those monitor ids: `capture-once`'s retries ask again about the monitors that have not
-/// answered, and a monitor that already has must not gain a second frame from the same invocation.
-/// `save_failed` holds the last save failure reported per monitor, so a failure that repeats is
-/// only news the first time. `stored` receives each frame as it lands, so an error return leaves
-/// the report of the stores in the caller's hands rather than taking it down with the pass.
+/// Capture the foreground window once: the privacy gate, change detection against `subject`'s
+/// baseline, OCR, and the observation and image rows if it changed. The pause is not consulted
+/// here — `tick` owns that, and `capture-once` is a user asking for this pass in particular.
+/// `save_failed` holds the last save failure reported, so a failure that repeats is only news the
+/// first time. `stored` receives the frame as it lands, so an error return leaves the report of
+/// the store in the caller's hands rather than taking it down with the pass.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn pass(
     capture: &mut cw_capture::CaptureEngine,
@@ -175,10 +137,9 @@ pub(crate) fn pass(
     conn: &mut rusqlite::Connection,
     paths: &DataPaths,
     config: &Config,
-    previous: &mut HashMap<String, Thumbnail>,
-    save_failed: &mut HashMap<String, SaveFailure>,
-    only: Option<&std::collections::HashSet<String>>,
-    stored: &mut Vec<Stored>,
+    subject: &mut Subject,
+    save_failed: &mut Option<SaveFailure>,
+    stored: &mut Option<Stored>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let foreground = cw_capture::foreground();
     let skip_detail = match cw_core::privacy::decide_capture(
@@ -192,6 +153,7 @@ pub(crate) fn pass(
     if let Some(detail) = skip_detail {
         // Before the audit write: the discard cannot fail and the write can.
         capture.discard_pending();
+        subject.aim(None);
         cw_store::control::record_event(
             conn,
             &ControlEvent {
@@ -206,118 +168,95 @@ pub(crate) fn pass(
         return Ok(());
     }
 
-    let mut changed = Vec::new();
-    let (frames, capture_failed) = capture.capture_all();
-    for frame in frames {
-        if only.is_some_and(|wanted| !wanted.contains(&frame.monitor_id)) {
-            continue;
+    let Some(target) = foreground.target else {
+        capture.release();
+        subject.aim(None);
+        return Ok(());
+    };
+    subject.aim(Some(target));
+    let frame = match capture.capture(target) {
+        Ok(frame) => {
+            subject.delivered();
+            frame
         }
-        let rgba = bgra_to_rgba(&frame.bgra);
-        let thumbnail = Thumbnail::from_rgba(&rgba, frame.width, frame.height, frame.dpi_scale)?;
-        if frame_changed(previous.get(&frame.monitor_id), &thumbnail, &config.capture) {
-            changed.push((frame, thumbnail));
+        Err(error) => {
+            if subject.failed(&error) {
+                warn!("capture failed: {error}");
+            }
+            return Ok(());
         }
+    };
+
+    let rgba = bgra_to_rgba(&frame.bgra);
+    let thumbnail = Thumbnail::from_rgba(&rgba, frame.width, frame.height, frame.dpi_scale)?;
+    if !frame_changed(subject.baseline.as_ref(), &thumbnail, &config.capture) {
+        return Ok(());
     }
 
-    // `recognize` initializes the Windows Runtime on whichever thread calls it.
-    let outcomes: Vec<_> = std::thread::scope(|scope| {
-        let mut handles = Vec::new();
-        for (frame, _) in &changed {
-            handles.push(scope.spawn(move || {
-                ocr.recognize(
-                    &frame.bgra,
-                    frame.width,
-                    frame.height,
-                    &config.ocr.languages,
-                )
-            }));
+    let ocr = ocr.recognize(
+        &frame.bgra,
+        frame.width,
+        frame.height,
+        &config.ocr.languages,
+    );
+    let captured_at = frame.captured_at;
+    let text_chars = ocr.text.as_deref().map_or(0, |text| text.chars().count());
+    let payload = ScreenPayload {
+        width: frame.width,
+        height: frame.height,
+        image_path: None,
+        ocr_status: ocr.status.clone(),
+        ocr_error: ocr.error,
+        ocr_text: ocr.text,
+        ocr_langs: ocr.langs,
+        foreground_process: foreground.process,
+        foreground_window_title: foreground.title,
+    };
+    let mut observation = Observation::new_screen(payload, captured_at);
+    // The `images/` prefix is the payload's spelling only: delivered paths are
+    // data_dir-relative, the images table keys on the path relative to the images root.
+    if let SourcePayload::Screen(payload) = &mut observation.payload {
+        payload.image_path = Some(format!(
+            "images/{}",
+            cw_store::images::relative_path(observation.id, captured_at)
+        ));
+    }
+    let rgb = bgra_to_rgb(&frame.bgra);
+    let relative_path = match cw_store::images::save_with_observation(
+        conn,
+        &paths.images(),
+        &observation,
+        &rgb,
+        frame.width,
+        frame.height,
+        f32::from(config.capture.webp_quality),
+        captured_at,
+    ) {
+        Ok(stored) => {
+            *save_failed = None;
+            stored
         }
-        handles
-            .into_iter()
-            .map(|handle| handle.join().expect("recognize does not panic"))
-            .collect()
+        Err(error) => {
+            let key = save_failure_key(&error);
+            if save_failed.as_ref().is_none_or(|last| last.key != key) {
+                error!("failed to store frame: {error}");
+                *save_failed = Some(SaveFailure {
+                    key,
+                    message: error.to_string(),
+                });
+            }
+            return Ok(());
+        }
+    };
+    subject.baseline = Some(thumbnail);
+    *stored = Some(Stored {
+        width: frame.width,
+        height: frame.height,
+        ocr_status: ocr.status,
+        text_chars,
+        relative_path,
     });
-
-    let mut stored_at = None;
-    for ((frame, thumbnail), ocr) in changed.into_iter().zip(outcomes) {
-        let captured_at = frame.captured_at;
-        let text_chars = ocr.text.as_deref().map_or(0, |text| text.chars().count());
-        let payload = ScreenPayload {
-            monitor_id: frame.monitor_id.clone(),
-            width: frame.width,
-            height: frame.height,
-            image_path: None,
-            ocr_status: ocr.status.clone(),
-            ocr_error: ocr.error,
-            ocr_text: ocr.text,
-            ocr_langs: ocr.langs,
-            foreground_process: foreground.process.clone(),
-            foreground_window_title: foreground.title.clone(),
-        };
-        let mut observation = Observation::new_screen(payload, captured_at);
-        // The `images/` prefix is the payload's spelling only: delivered paths are
-        // data_dir-relative, the images table keys on the path relative to the images root.
-        if let SourcePayload::Screen(payload) = &mut observation.payload {
-            payload.image_path = Some(format!(
-                "images/{}",
-                cw_store::images::relative_path(observation.id, captured_at)
-            ));
-        }
-        let rgb = bgra_to_rgb(&frame.bgra);
-        let relative_path = match cw_store::images::save_with_observation(
-            conn,
-            &paths.images(),
-            &observation,
-            &rgb,
-            frame.width,
-            frame.height,
-            f32::from(config.capture.webp_quality),
-            captured_at,
-        ) {
-            Ok(stored) => {
-                save_failed.remove(&frame.monitor_id);
-                stored
-            }
-            // Isolated to the one monitor rather than ending the pass: a frame wider than WebP's
-            // 16,383px limit would starve every monitor behind it in the enumeration.
-            Err(error) => {
-                let key = save_failure_key(&error);
-                if save_failed
-                    .get(&frame.monitor_id)
-                    .is_none_or(|last| last.key != key)
-                {
-                    error!(monitor = %frame.monitor_id, "failed to store frame: {error}");
-                    save_failed.insert(
-                        frame.monitor_id.clone(),
-                        SaveFailure {
-                            key,
-                            message: error.to_string(),
-                        },
-                    );
-                }
-                continue;
-            }
-        };
-        previous.insert(frame.monitor_id.clone(), thumbnail);
-        stored_at = stored_at.max(Some(captured_at));
-        stored.push(Stored {
-            monitor_id: frame.monitor_id,
-            width: frame.width,
-            height: frame.height,
-            ocr_status: ocr.status,
-            text_chars,
-            relative_path,
-        });
-    }
-    // Advanced, not set: a fallback frame carries a composition stamp up to thirty seconds old,
-    // so this pass's newest stamp can still sit behind an earlier pass's mark.
-    if let Some(at) = stored_at {
-        cw_store::control::advance_health(conn, HealthKey::LastCapture, at)?;
-    }
-    // After the stores: the enumeration failure fails the pass, not the frames it arrived with.
-    if let Some(error) = capture_failed {
-        return Err(error.into());
-    }
+    cw_store::control::advance_health(conn, HealthKey::LastCapture, captured_at)?;
 
     Ok(())
 }
@@ -326,20 +265,61 @@ pub(crate) fn pass(
 /// take the report of its stores down with it.
 pub(crate) fn report_then_finish(
     outcome: Result<(), Box<dyn std::error::Error>>,
-    stored: &[Stored],
-    mut report: impl FnMut(&Stored),
+    stored: Option<&Stored>,
+    report: impl FnOnce(&Stored),
 ) -> Result<(), Box<dyn std::error::Error>> {
-    for frame in stored {
+    if let Some(frame) = stored {
         report(frame);
     }
     outcome
 }
 
-/// A monitor's standing save failure: the spelling repeats are judged by, and the full message
+/// The standing save failure: the spelling repeats are judged by, and the full message
 /// of the first failure that spelled it, for `capture-once`'s summary.
 pub(crate) struct SaveFailure {
     pub key: String,
     pub message: String,
+}
+
+#[derive(Default)]
+pub(crate) struct Subject {
+    target: Option<cw_capture::Target>,
+    baseline: Option<Thumbnail>,
+    reported: Option<String>,
+}
+
+impl Subject {
+    pub(crate) fn aim(&mut self, target: Option<cw_capture::Target>) {
+        if self.target != target {
+            *self = Self {
+                target,
+                ..Self::default()
+            };
+        }
+    }
+
+    fn failed(&mut self, error: &cw_capture::CaptureError) -> bool {
+        if matches!(
+            error,
+            cw_capture::CaptureError::Recoverable(cw_capture::Recoverable::NoNewFrame)
+        ) {
+            return false;
+        }
+        let line = error.to_string();
+        if self.reported.as_ref() == Some(&line) {
+            return false;
+        }
+        self.reported = Some(line);
+        true
+    }
+
+    fn delivered(&mut self) {
+        self.reported = None;
+    }
+
+    pub(crate) fn failure(&self) -> Option<&str> {
+        self.reported.as_deref()
+    }
 }
 
 /// The spelling `save_failed` deduplicates on. Several store errors name the freshly minted
@@ -392,12 +372,13 @@ fn bgra_to_rgb(bgra: &[u8]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Stored, report_then_finish, save_failure_key};
+    use super::{Stored, Subject, report_then_finish, save_failure_key};
+    use cw_capture::{CaptureError, Recoverable, Target};
+    use cw_core::change::Thumbnail;
     use cw_store::StoreError;
 
-    fn stored_frame(monitor_id: &str) -> Stored {
+    fn stored_frame() -> Stored {
         Stored {
-            monitor_id: monitor_id.to_owned(),
             width: 1,
             height: 1,
             ocr_status: cw_core::model::OcrStatus::NoText,
@@ -408,14 +389,81 @@ mod tests {
 
     #[test]
     fn a_failing_pass_still_reports_every_stored_frame() {
-        let stored = vec![stored_frame("a"), stored_frame("b")];
-        let mut reported = Vec::new();
-        let outcome = report_then_finish(Err("enumeration refused".into()), &stored, |frame| {
-            reported.push(frame.monitor_id.clone());
+        let stored = stored_frame();
+        let mut reported = 0;
+        let outcome = report_then_finish(Err("refused".into()), Some(&stored), |_| {
+            reported += 1;
         });
-        assert_eq!(reported, ["a", "b"]);
-        assert_eq!(outcome.unwrap_err().to_string(), "enumeration refused");
-        assert!(report_then_finish(Ok(()), &stored, |_| {}).is_ok());
+        assert_eq!(reported, 1);
+        assert_eq!(outcome.unwrap_err().to_string(), "refused");
+        assert!(report_then_finish(Ok(()), Some(&stored), |_| {}).is_ok());
+    }
+
+    fn target(hwnd: isize, pid: u32) -> Target {
+        Target { hwnd, pid }
+    }
+
+    fn access_lost() -> CaptureError {
+        Recoverable::AccessLost.into()
+    }
+
+    fn aimed_with_history(at: Target) -> Subject {
+        let mut subject = Subject::default();
+        subject.aim(Some(at));
+        subject.baseline = Some(
+            Thumbnail::from_rgba(&[0, 0, 0, 255], 1, 1, 1.0)
+                .expect("a one-pixel frame should build a thumbnail"),
+        );
+        assert!(subject.failed(&access_lost()));
+        subject
+    }
+
+    fn switched(subject: &Subject) -> bool {
+        subject.baseline.is_none() && subject.reported.is_none()
+    }
+
+    #[test]
+    fn the_same_target_keeps_the_baseline() {
+        let mut subject = aimed_with_history(target(1, 10));
+        subject.aim(Some(target(1, 10)));
+        assert!(subject.baseline.is_some());
+        assert!(subject.reported.is_some());
+    }
+
+    #[test]
+    fn a_different_target_drops_the_baseline() {
+        let mut subject = aimed_with_history(target(1, 10));
+        subject.aim(Some(target(2, 10)));
+        assert!(switched(&subject));
+    }
+
+    #[test]
+    fn a_tick_without_a_target_makes_the_next_one_a_switch() {
+        let mut subject = aimed_with_history(target(1, 10));
+        subject.aim(None);
+        subject.aim(Some(target(1, 10)));
+        assert!(switched(&subject));
+    }
+
+    #[test]
+    fn the_same_hwnd_under_another_pid_is_a_switch() {
+        let mut subject = aimed_with_history(target(1, 10));
+        subject.aim(Some(target(1, 11)));
+        assert!(switched(&subject));
+    }
+
+    #[test]
+    fn a_repeated_failure_is_news_once_and_no_new_frame_keeps_the_history() {
+        let mut subject = aimed_with_history(target(1, 10));
+        assert!(!subject.failed(&access_lost()));
+        assert!(!subject.failed(&Recoverable::NoNewFrame.into()));
+        assert!(!subject.failed(&access_lost()));
+
+        subject.delivered();
+        assert!(subject.failed(&access_lost()));
+
+        subject.aim(Some(target(2, 10)));
+        assert!(subject.failed(&access_lost()));
     }
 
     #[test]

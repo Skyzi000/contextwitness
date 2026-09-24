@@ -37,8 +37,6 @@ pub struct EpisodeMetadata {
     pub episode_start: String,
     /// Window end, RFC 3339 UTC.
     pub episode_end: String,
-    /// Monitors that contributed an entry, in render order, as a JSON array string.
-    pub monitors: String,
     /// Number of entries in `content` after folding, in decimal.
     pub entry_count: String,
     /// Relative image paths of the rendered entries, in render order, as a JSON array string.
@@ -107,27 +105,12 @@ pub fn build_episode(
         })
         .collect();
 
-    entries.sort_unstable_by(
-        |(left_observation, left_screen), (right_observation, right_screen)| {
-            left_screen
-                .monitor_id
-                .cmp(&right_screen.monitor_id)
-                .then_with(|| {
-                    left_observation
-                        .observed_at
-                        .cmp(&right_observation.observed_at)
-                })
-                .then_with(|| left_observation.id.cmp(&right_observation.id))
-        },
-    );
+    entries.sort_unstable_by_key(|(observation, _)| (observation.observed_at, observation.id));
     entries.dedup_by(|current, previous| {
-        // The monitor's size, the image path and the OCR languages are deliberately not compared:
-        // the size renders only where the monitor changes, which a folded entry never does.
         let current = current.1;
         let previous = previous.1;
 
-        current.monitor_id == previous.monitor_id
-            && current.foreground_process == previous.foreground_process
+        current.foreground_process == previous.foreground_process
             && current.foreground_window_title == previous.foreground_window_title
             && current.ocr_status == previous.ocr_status
             && current.ocr_error == previous.ocr_error
@@ -147,27 +130,14 @@ pub fn build_episode(
     let mut lines = vec![format!(
         "[{rendered_start} - {rendered_end}] Screen episode"
     )];
-    let mut monitors = Vec::new();
     let mut image_paths = Vec::new();
-    let mut current_monitor = None;
 
     for (observation, screen) in &entries {
-        if current_monitor != Some(screen.monitor_id.as_str()) {
-            lines.push(format!(
-                "Monitor {} ({}x{}):",
-                screen.monitor_id, screen.width, screen.height
-            ));
-            monitors.push(screen.monitor_id.clone());
-            current_monitor = Some(screen.monitor_id.as_str());
-        }
-
-        let mut entry_line = format!(
-            "  {}",
-            observation
-                .observed_at
-                .with_timezone(&render_offset)
-                .format("%H:%M:%S")
-        );
+        let mut entry_line = observation
+            .observed_at
+            .with_timezone(&render_offset)
+            .format("%H:%M:%S")
+            .to_string();
         if let Some(process) = &screen.foreground_process {
             entry_line.push_str(" [");
             entry_line.push_str(process);
@@ -193,15 +163,15 @@ pub fn build_episode(
                         if line.is_empty() {
                             String::new()
                         } else {
-                            format!("    {line}")
+                            format!("  {line}")
                         }
                     }));
                 }
             }
             crate::model::OcrStatus::NoText => {}
             crate::model::OcrStatus::Failed => match &screen.ocr_error {
-                Some(error) => lines.push(format!("    [OCR failed: {error}]")),
-                None => lines.push("    [OCR failed]".to_owned()),
+                Some(error) => lines.push(format!("  [OCR failed: {error}]")),
+                None => lines.push("  [OCR failed]".to_owned()),
             },
         }
 
@@ -222,7 +192,6 @@ pub fn build_episode(
         metadata: EpisodeMetadata {
             episode_start,
             episode_end,
-            monitors: serde_json::to_string(&monitors).expect("a list of strings must serialise"),
             entry_count: entries.len().to_string(),
             image_paths: serde_json::to_string(&image_paths)
                 .expect("a list of strings must serialise"),
@@ -244,13 +213,8 @@ mod tests {
             .with_timezone(&Utc)
     }
 
-    fn screen_payload(
-        monitor_id: &str,
-        ocr_status: OcrStatus,
-        ocr_text: Option<&str>,
-    ) -> ScreenPayload {
+    fn screen_payload(ocr_status: OcrStatus, ocr_text: Option<&str>) -> ScreenPayload {
         ScreenPayload {
-            monitor_id: monitor_id.to_owned(),
             width: 1920,
             height: 1080,
             image_path: None,
@@ -284,7 +248,7 @@ mod tests {
                     image_path: Some("images/a.webp".to_owned()),
                     foreground_process: Some("firefox.exe".to_owned()),
                     foreground_window_title: Some("Example Page".to_owned()),
-                    ..screen_payload("DISPLAY1", OcrStatus::Succeeded, Some("line one\nline two"))
+                    ..screen_payload(OcrStatus::Succeeded, Some("line one\nline two"))
                 },
             ),
             observation(
@@ -296,7 +260,7 @@ mod tests {
                     image_path: Some("images/b.webp".to_owned()),
                     foreground_process: Some("firefox.exe".to_owned()),
                     foreground_window_title: Some("Example Page".to_owned()),
-                    ..screen_payload("DISPLAY1", OcrStatus::Succeeded, Some("line one\nline two"))
+                    ..screen_payload(OcrStatus::Succeeded, Some("line one\nline two"))
                 },
             ),
             observation(
@@ -308,7 +272,7 @@ mod tests {
                     image_path: Some("images/c.webp".to_owned()),
                     foreground_process: Some("Code.exe".to_owned()),
                     foreground_window_title: Some("contextwitness - Visual Studio Code".to_owned()),
-                    ..screen_payload("DISPLAY1", OcrStatus::Succeeded, Some("fn main() {}"))
+                    ..screen_payload(OcrStatus::Succeeded, Some("fn main() {}"))
                 },
             ),
             observation(
@@ -320,7 +284,7 @@ mod tests {
                     ocr_error: Some("engine unavailable".to_owned()),
                     foreground_process: Some("Code.exe".to_owned()),
                     foreground_window_title: Some("contextwitness - Visual Studio Code".to_owned()),
-                    ..screen_payload("DISPLAY1", OcrStatus::Failed, None)
+                    ..screen_payload(OcrStatus::Failed, None)
                 },
             ),
             observation(
@@ -328,7 +292,7 @@ mod tests {
                 "2026-07-24T16:00:30Z",
                 ScreenPayload {
                     image_path: Some("images/e.webp".to_owned()),
-                    ..screen_payload("DISPLAY2", OcrStatus::NoText, None)
+                    ..screen_payload(OcrStatus::NoText, None)
                 },
             ),
         ]
@@ -361,8 +325,8 @@ mod tests {
         let ordered = golden_observations();
         let mut reversed_and_interleaved = ordered.clone();
         reversed_and_interleaved.reverse();
-        let display2 = reversed_and_interleaved.remove(0);
-        reversed_and_interleaved.insert(2, display2);
+        let moved = reversed_and_interleaved.remove(0);
+        reversed_and_interleaved.insert(2, moved);
         let start = timestamp("2026-07-24T16:00:00Z");
         let offset = FixedOffset::east_opt(9 * 3600).expect("test offset should be valid");
 
@@ -381,7 +345,7 @@ mod tests {
             "2026-07-24T16:00:02Z",
             ScreenPayload {
                 foreground_window_title: Some("Alpha".to_owned()),
-                ..screen_payload("DISPLAY1", OcrStatus::NoText, None)
+                ..screen_payload(OcrStatus::NoText, None)
             },
         );
         let higher = observation(
@@ -389,7 +353,7 @@ mod tests {
             "2026-07-24T16:00:02Z",
             ScreenPayload {
                 foreground_window_title: Some("Beta".to_owned()),
-                ..screen_payload("DISPLAY1", OcrStatus::NoText, None)
+                ..screen_payload(OcrStatus::NoText, None)
             },
         );
         let start = timestamp("2026-07-24T16:00:00Z");
@@ -443,7 +407,7 @@ mod tests {
         let observations = vec![observation(
             1,
             "2026-07-24T16:00:00Z",
-            screen_payload("DISPLAY1", OcrStatus::Succeeded, Some("line one")),
+            screen_payload(OcrStatus::Succeeded, Some("line one")),
         )];
 
         let episode = build_episode(
@@ -510,16 +474,14 @@ mod tests {
         )
         .expect("the golden observations should build an episode");
         let golden = r#"[2026-07-25T01:00:00+09:00 - 2026-07-25T01:05:00+09:00] Screen episode
-Monitor DISPLAY1 (2560x1440):
-  01:00:02 [firefox.exe] Example Page
-    line one
-    line two
-  01:01:14 [Code.exe] contextwitness - Visual Studio Code
-    fn main() {}
-  01:02:00 [Code.exe] contextwitness - Visual Studio Code
-    [OCR failed: engine unavailable]
-Monitor DISPLAY2 (1920x1080):
-  01:00:30"#;
+01:00:02 [firefox.exe] Example Page
+  line one
+  line two
+01:00:30
+01:01:14 [Code.exe] contextwitness - Visual Studio Code
+  fn main() {}
+01:02:00 [Code.exe] contextwitness - Visual Studio Code
+  [OCR failed: engine unavailable]"#;
 
         assert_eq!(episode.content, golden);
         assert_eq!(
@@ -528,9 +490,8 @@ Monitor DISPLAY2 (1920x1080):
             serde_json::json!({
                 "episode_start": "2026-07-24T16:00:00Z",
                 "episode_end": "2026-07-24T16:05:00Z",
-                "monitors": "[\"DISPLAY1\",\"DISPLAY2\"]",
                 "entry_count": "4",
-                "image_paths": "[\"images/a.webp\",\"images/c.webp\",\"images/e.webp\"]"
+                "image_paths": "[\"images/a.webp\",\"images/e.webp\",\"images/c.webp\"]"
             })
         );
     }
@@ -566,7 +527,7 @@ Monitor DISPLAY2 (1920x1080):
                 "2026-07-24T16:00:01Z",
                 ScreenPayload {
                     image_path: Some("images/earlier.webp".to_owned()),
-                    ..screen_payload("DISPLAY1", OcrStatus::Succeeded, Some("earlier"))
+                    ..screen_payload(OcrStatus::Succeeded, Some("earlier"))
                 },
             ),
             observation(
@@ -574,7 +535,7 @@ Monitor DISPLAY2 (1920x1080):
                 "2026-07-24T16:00:02Z",
                 ScreenPayload {
                     image_path: Some("images/later.webp".to_owned()),
-                    ..screen_payload("DISPLAY1", OcrStatus::Succeeded, Some("later"))
+                    ..screen_payload(OcrStatus::Succeeded, Some("later"))
                 },
             ),
         ];
@@ -595,12 +556,12 @@ Monitor DISPLAY2 (1920x1080):
             observation(
                 3,
                 "2026-07-24T16:00:01Z",
-                screen_payload("DISPLAY1", OcrStatus::NoText, Some("earlier")),
+                screen_payload(OcrStatus::NoText, Some("earlier")),
             ),
             observation(
                 4,
                 "2026-07-24T16:00:02Z",
-                screen_payload("DISPLAY1", OcrStatus::NoText, Some("later")),
+                screen_payload(OcrStatus::NoText, Some("later")),
             ),
         ];
         let episode = build_episode(
@@ -622,7 +583,7 @@ Monitor DISPLAY2 (1920x1080):
                 ScreenPayload {
                     foreground_process: Some("vlc.exe".to_owned()),
                     foreground_window_title: Some("Movie".to_owned()),
-                    ..screen_payload("DISPLAY1", OcrStatus::NoText, None)
+                    ..screen_payload(OcrStatus::NoText, None)
                 },
             ),
             observation(
@@ -631,7 +592,7 @@ Monitor DISPLAY2 (1920x1080):
                 ScreenPayload {
                     foreground_process: Some("vlc.exe".to_owned()),
                     foreground_window_title: Some("Movie".to_owned()),
-                    ..screen_payload("DISPLAY1", OcrStatus::NoText, None)
+                    ..screen_payload(OcrStatus::NoText, None)
                 },
             ),
         ];
@@ -647,40 +608,6 @@ Monitor DISPLAY2 (1920x1080):
     }
 
     #[test]
-    fn an_identical_scene_on_another_monitor_keeps_the_entry() {
-        let observations = vec![
-            observation(
-                1,
-                "2026-07-24T16:00:01Z",
-                ScreenPayload {
-                    foreground_process: Some("vlc.exe".to_owned()),
-                    foreground_window_title: Some("Movie".to_owned()),
-                    ..screen_payload("DISPLAY1", OcrStatus::NoText, None)
-                },
-            ),
-            observation(
-                2,
-                "2026-07-24T16:00:02Z",
-                ScreenPayload {
-                    foreground_process: Some("vlc.exe".to_owned()),
-                    foreground_window_title: Some("Movie".to_owned()),
-                    ..screen_payload("DISPLAY2", OcrStatus::NoText, None)
-                },
-            ),
-        ];
-        let episode = build_episode(
-            timestamp("2026-07-24T16:00:00Z"),
-            5,
-            FixedOffset::east_opt(0).expect("UTC offset should be valid"),
-            &observations,
-        )
-        .expect("the observations should build an episode");
-
-        assert_eq!(episode.metadata.entry_count, "2");
-        assert_eq!(episode.metadata.monitors, r#"["DISPLAY1","DISPLAY2"]"#);
-    }
-
-    #[test]
     fn a_different_application_keeps_the_entry() {
         let observations = vec![
             observation(
@@ -688,7 +615,7 @@ Monitor DISPLAY2 (1920x1080):
                 "2026-07-24T16:00:01Z",
                 ScreenPayload {
                     foreground_process: Some("vlc.exe".to_owned()),
-                    ..screen_payload("DISPLAY1", OcrStatus::NoText, None)
+                    ..screen_payload(OcrStatus::NoText, None)
                 },
             ),
             observation(
@@ -696,7 +623,7 @@ Monitor DISPLAY2 (1920x1080):
                 "2026-07-24T16:00:02Z",
                 ScreenPayload {
                     foreground_process: Some("game.exe".to_owned()),
-                    ..screen_payload("DISPLAY1", OcrStatus::NoText, None)
+                    ..screen_payload(OcrStatus::NoText, None)
                 },
             ),
         ];
@@ -722,7 +649,7 @@ Monitor DISPLAY2 (1920x1080):
                 ScreenPayload {
                     foreground_process: Some("editor.exe".to_owned()),
                     foreground_window_title: Some("first.txt".to_owned()),
-                    ..screen_payload("DISPLAY1", OcrStatus::Succeeded, Some("same text"))
+                    ..screen_payload(OcrStatus::Succeeded, Some("same text"))
                 },
             ),
             observation(
@@ -731,7 +658,7 @@ Monitor DISPLAY2 (1920x1080):
                 ScreenPayload {
                     foreground_process: Some("editor.exe".to_owned()),
                     foreground_window_title: Some("second.txt".to_owned()),
-                    ..screen_payload("DISPLAY1", OcrStatus::Succeeded, Some("same text"))
+                    ..screen_payload(OcrStatus::Succeeded, Some("same text"))
                 },
             ),
         ];
@@ -756,7 +683,7 @@ Monitor DISPLAY2 (1920x1080):
                 "2026-07-24T16:00:01Z",
                 ScreenPayload {
                     ocr_error: Some("engine unavailable".to_owned()),
-                    ..screen_payload("DISPLAY1", OcrStatus::NoText, None)
+                    ..screen_payload(OcrStatus::NoText, None)
                 },
             ),
             observation(
@@ -764,7 +691,7 @@ Monitor DISPLAY2 (1920x1080):
                 "2026-07-24T16:00:02Z",
                 ScreenPayload {
                     ocr_error: Some("engine unavailable".to_owned()),
-                    ..screen_payload("DISPLAY1", OcrStatus::Failed, None)
+                    ..screen_payload(OcrStatus::Failed, None)
                 },
             ),
         ];
@@ -790,7 +717,7 @@ Monitor DISPLAY2 (1920x1080):
                     "2026-07-24T16:00:01Z",
                     ScreenPayload {
                         ocr_error: Some("engine unavailable".to_owned()),
-                        ..screen_payload("DISPLAY1", OcrStatus::Failed, None)
+                        ..screen_payload(OcrStatus::Failed, None)
                     },
                 ),
                 observation(
@@ -798,7 +725,7 @@ Monitor DISPLAY2 (1920x1080):
                     "2026-07-24T16:00:02Z",
                     ScreenPayload {
                         ocr_error: Some(second_error.to_owned()),
-                        ..screen_payload("DISPLAY1", OcrStatus::Failed, None)
+                        ..screen_payload(OcrStatus::Failed, None)
                     },
                 ),
             ]
@@ -843,12 +770,12 @@ Monitor DISPLAY2 (1920x1080):
             observation(
                 1,
                 "2026-07-24T16:00:01Z",
-                screen_payload("DISPLAY1", OcrStatus::NoText, None),
+                screen_payload(OcrStatus::NoText, None),
             ),
             observation(
                 2,
                 "2026-07-24T16:00:02Z",
-                screen_payload("DISPLAY1", OcrStatus::Succeeded, Some("typed")),
+                screen_payload(OcrStatus::Succeeded, Some("typed")),
             ),
         ];
 
@@ -870,17 +797,17 @@ Monitor DISPLAY2 (1920x1080):
             observation(
                 1,
                 "2026-07-24T16:00:01Z",
-                screen_payload("DISPLAY1", OcrStatus::Succeeded, Some("a")),
+                screen_payload(OcrStatus::Succeeded, Some("a")),
             ),
             observation(
                 2,
                 "2026-07-24T16:00:02Z",
-                screen_payload("DISPLAY1", OcrStatus::Succeeded, Some("b")),
+                screen_payload(OcrStatus::Succeeded, Some("b")),
             ),
             observation(
                 3,
                 "2026-07-24T16:00:03Z",
-                screen_payload("DISPLAY1", OcrStatus::Succeeded, Some("a")),
+                screen_payload(OcrStatus::Succeeded, Some("a")),
             ),
         ];
 
@@ -914,12 +841,12 @@ Monitor DISPLAY2 (1920x1080):
             observation(
                 1,
                 "2026-07-24T15:59:59Z",
-                screen_payload("DISPLAY1", OcrStatus::NoText, None),
+                screen_payload(OcrStatus::NoText, None),
             ),
             observation(
                 2,
                 "2026-07-24T16:05:00Z",
-                screen_payload("DISPLAY1", OcrStatus::NoText, None),
+                screen_payload(OcrStatus::NoText, None),
             ),
         ];
 
@@ -950,7 +877,7 @@ Monitor DISPLAY2 (1920x1080):
             observation(
                 2,
                 "2026-07-24T16:00:02Z",
-                screen_payload("DISPLAY1", OcrStatus::NoText, None),
+                screen_payload(OcrStatus::NoText, None),
             ),
         ];
 
@@ -971,7 +898,7 @@ Monitor DISPLAY2 (1920x1080):
         let observations = vec![observation(
             1,
             "2026-07-24T16:00:01Z",
-            screen_payload("DISPLAY1", OcrStatus::Failed, None),
+            screen_payload(OcrStatus::Failed, None),
         )];
 
         let episode = build_episode(
@@ -982,7 +909,7 @@ Monitor DISPLAY2 (1920x1080):
         )
         .expect("the failed OCR observation should build an episode");
 
-        assert!(episode.content.ends_with("    [OCR failed]"));
+        assert!(episode.content.ends_with("\n  [OCR failed]"));
     }
 
     #[test]
@@ -993,7 +920,7 @@ Monitor DISPLAY2 (1920x1080):
                 "2026-07-24T16:00:01Z",
                 ScreenPayload {
                     image_path: Some("images/a.webp".to_owned()),
-                    ..screen_payload("DISPLAY1", OcrStatus::Succeeded, Some("x"))
+                    ..screen_payload(OcrStatus::Succeeded, Some("x"))
                 },
             ),
             observation(
@@ -1001,7 +928,7 @@ Monitor DISPLAY2 (1920x1080):
                 "2026-07-24T16:00:02Z",
                 ScreenPayload {
                     image_path: Some("images/b.webp".to_owned()),
-                    ..screen_payload("DISPLAY1", OcrStatus::Succeeded, Some("x"))
+                    ..screen_payload(OcrStatus::Succeeded, Some("x"))
                 },
             ),
             observation(
@@ -1009,7 +936,7 @@ Monitor DISPLAY2 (1920x1080):
                 "2026-07-24T16:00:03Z",
                 ScreenPayload {
                     image_path: Some("images/c.webp".to_owned()),
-                    ..screen_payload("DISPLAY1", OcrStatus::Succeeded, Some("x"))
+                    ..screen_payload(OcrStatus::Succeeded, Some("x"))
                 },
             ),
         ];
@@ -1024,9 +951,9 @@ Monitor DISPLAY2 (1920x1080):
 
         assert_eq!(episode.metadata.entry_count, "1");
         assert_eq!(episode.metadata.image_paths, "[\"images/a.webp\"]");
-        assert!(episode.content.contains("  16:00:01"));
-        assert!(!episode.content.contains("  16:00:02"));
-        assert!(!episode.content.contains("  16:00:03"));
+        assert!(episode.content.contains("\n16:00:01"));
+        assert!(!episode.content.contains("\n16:00:02"));
+        assert!(!episode.content.contains("\n16:00:03"));
     }
 
     #[test]
@@ -1034,7 +961,7 @@ Monitor DISPLAY2 (1920x1080):
         let trailing = vec![observation(
             1,
             "2026-07-24T16:00:01Z",
-            screen_payload("DISPLAY1", OcrStatus::Succeeded, Some("only line\n\n")),
+            screen_payload(OcrStatus::Succeeded, Some("only line\n\n")),
         )];
         let trailing_episode = build_episode(
             timestamp("2026-07-24T16:00:00Z"),
@@ -1044,13 +971,13 @@ Monitor DISPLAY2 (1920x1080):
         )
         .expect("the observation should build an episode");
 
-        assert!(trailing_episode.content.ends_with("    only line"));
+        assert!(trailing_episode.content.ends_with("\n  only line"));
         assert!(!trailing_episode.content.ends_with('\n'));
 
         let interior = vec![observation(
             1,
             "2026-07-24T16:00:01Z",
-            screen_payload("DISPLAY1", OcrStatus::Succeeded, Some("a\n\nb\n\n")),
+            screen_payload(OcrStatus::Succeeded, Some("a\n\nb\n\n")),
         )];
         let interior_episode = build_episode(
             timestamp("2026-07-24T16:00:00Z"),
@@ -1060,7 +987,7 @@ Monitor DISPLAY2 (1920x1080):
         )
         .expect("the observation should build an episode");
 
-        assert!(interior_episode.content.ends_with("    a\n\n    b"));
+        assert!(interior_episode.content.ends_with("\n  a\n\n  b"));
         assert!(!interior_episode.content.ends_with('\n'));
     }
 }

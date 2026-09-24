@@ -5,26 +5,13 @@ use clap::{Parser, Subcommand};
 use cw_core::atomic_file::create_temporary_beside;
 use cw_core::config::{Config, ConfigError, DataPaths, StorageConfig, default_config_path};
 use cw_store::control::{HealthKey, Pause};
-use tracing::{error, info, warn};
+use tracing::{error, info};
 use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, HANDLE};
 use windows::Win32::System::Console::{
     CONSOLE_MODE, ENABLE_ECHO_INPUT, GetConsoleMode, GetStdHandle, STD_INPUT_HANDLE,
     SetConsoleCtrlHandler, SetConsoleMode,
 };
 use windows::Win32::System::Threading::CreateMutexW;
-
-/// How long startup keeps asking for the monitor list before giving up. Enumeration fails while a
-/// session is still coming up, and the reachability check below cannot be skipped, so this waits
-/// for an answer instead of starting without one.
-const MONITOR_ATTEMPTS: u32 = 5;
-const MONITOR_RETRY: std::time::Duration = std::time::Duration::from_secs(2);
-
-/// How long `capture-once --wgc` waits for every monitor to answer. Past the fallback's own
-/// five-second first-frame grace, which is what decides whether a silent session is broken or
-/// merely idle: giving up first would report a monitor as missing that the backend had not
-/// finished judging.
-const WGC_ANSWER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(8);
-const WGC_ANSWER_RETRY: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// The key `setup` rewrites, and the only place the data directory is configured.
 const DATA_DIR_KEY: &str = "data_dir";
@@ -82,12 +69,7 @@ enum Command {
         action: AutostartAction,
     },
     /// Capture, read and store the way a tick would, then exit.
-    CaptureOnce {
-        /// Capture through the fallback backend (Windows Graphics Capture) instead of the
-        /// primary, to check that the failover path works on this machine.
-        #[arg(long)]
-        wgc: bool,
-    },
+    CaptureOnce,
 }
 
 #[derive(Subcommand)]
@@ -106,7 +88,7 @@ pub fn main() {
         Command::Resume => resume(),
         Command::Setup => setup(),
         Command::Autostart { action } => set_autostart(&action),
-        Command::CaptureOnce { wgc } => capture_once(wgc),
+        Command::CaptureOnce => capture_once(),
     };
 
     if let Err(error) = outcome {
@@ -139,8 +121,6 @@ fn daemon() -> ! {
         info!(path = %config_path.display(), "wrote the default config");
     }
 
-    // Without PER_MONITOR_AWARE_V2 every capture arrives at a virtualized resolution and every DPI
-    // reads 96, silently: a visible refusal over a daemon that degrades without saying so.
     if !dpi_aware {
         error!(
             "the process could not become PER_MONITOR_AWARE_V2, and capture would be silently degraded"
@@ -149,12 +129,7 @@ fn daemon() -> ! {
         std::process::exit(1);
     }
 
-    let mut capture = cw_capture::CaptureEngine::new();
-    if let Err(message) = check_thresholds(&mut capture, &config, &config_path) {
-        error!("{message}");
-        drop(logging);
-        std::process::exit(1);
-    }
+    let capture = cw_capture::CaptureEngine::new();
 
     let mut conn = cw_store::db::open(&paths.database()).expect("opening the database failed");
     let mut cursor: episodes::Cursor = None;
@@ -259,74 +234,6 @@ fn install_panic_hook() {
         std::thread::sleep(PANIC_FLUSH);
         std::process::exit(PANIC_EXIT);
     }));
-}
-
-/// Abort rather than warn when a monitor's change threshold cannot be reached.
-fn check_thresholds(
-    capture: &mut cw_capture::CaptureEngine,
-    config: &Config,
-    config_path: &std::path::Path,
-) -> Result<(), String> {
-    let mut last_error = None;
-    for attempt in 1..=MONITOR_ATTEMPTS {
-        match capture.monitors() {
-            // A session still coming up and an RDP reconnect both list no monitors, and every
-            // monitor of an empty list passes every check.
-            Ok(monitors) if monitors.is_empty() => {
-                warn!(attempt, "listing monitors answered with no monitors");
-                last_error = Some("the enumeration listed no monitors".to_owned());
-                std::thread::sleep(MONITOR_RETRY);
-            }
-            Ok(monitors) => {
-                let unreachable: Vec<_> = monitors
-                    .iter()
-                    .filter(|monitor| {
-                        !cw_core::change::change_threshold_is_reachable(
-                            monitor.width,
-                            monitor.height,
-                            monitor.dpi_scale,
-                            &config.capture,
-                        )
-                    })
-                    .map(|monitor| {
-                        format!(
-                            "{} ({}x{} at {}x scale) tops out at {:.0} changed logical pixels",
-                            monitor.id,
-                            monitor.width,
-                            monitor.height,
-                            monitor.dpi_scale,
-                            cw_core::change::max_logical_pixels(
-                                monitor.width,
-                                monitor.height,
-                                monitor.dpi_scale
-                            )
-                        )
-                    })
-                    .collect();
-                if unreachable.is_empty() {
-                    return Ok(());
-                }
-                return Err(format!(
-                    "capture.change_area_logical_pixels is {}, which no pixel change on these \
-                     monitors can exceed: {}. Lower it in {}",
-                    config.capture.change_area_logical_pixels,
-                    unreachable.join("; "),
-                    config_path.display()
-                ));
-            }
-            Err(error) => {
-                warn!(attempt, "listing monitors failed: {error}");
-                last_error = Some(error.to_string());
-                std::thread::sleep(MONITOR_RETRY);
-            }
-        }
-    }
-
-    Err(format!(
-        "the monitors could not be listed in {MONITOR_ATTEMPTS} attempts, so the change threshold \
-         could not be checked against them: {}",
-        last_error.unwrap_or_default()
-    ))
 }
 
 fn open_for(subsystem: &str, paths: &DataPaths) -> rusqlite::Connection {
@@ -488,7 +395,7 @@ fn set_autostart(action: &AutostartAction) -> Result<(), Failure> {
 
 /// Capture with nothing else running: no workers, no tray, no file log. What it stores it stores
 /// exactly as a tick would, so this is also how one checks that capture works at all.
-fn capture_once(wgc: bool) -> Result<(), Failure> {
+fn capture_once() -> Result<(), Failure> {
     if !cw_capture::make_dpi_aware() {
         return Err(Failure::from(
             "the process could not become PER_MONITOR_AWARE_V2, so capture would be silently degraded",
@@ -499,122 +406,53 @@ fn capture_once(wgc: bool) -> Result<(), Failure> {
     let (config, paths, mut conn) = open_store()?;
     let ocr = cw_ocr::WindowsOcr;
     let mut capture = cw_capture::CaptureEngine::new();
-    if wgc {
-        capture.force_fallback();
-    }
-    let mut previous = std::collections::HashMap::new();
-    let mut save_failed = std::collections::HashMap::new();
-    let mut stored = Vec::new();
-    let mut failed = capture::pass(
+    let mut subject = capture::Subject::default();
+    let mut save_failed = None;
+    let mut stored = None;
+    let failed = capture::pass(
         &mut capture,
         &ocr,
         &mut conn,
         &paths,
         &config,
-        &mut previous,
+        &mut subject,
         &mut save_failed,
-        None,
         &mut stored,
     )
-    .err();
-    // WGC delivers each monitor's first frame from a callback thread on its own schedule, so a
-    // pass can find sessions with nothing composed yet; they persist across passes, so ask again.
-    let mut awaited: Option<Vec<String>> = None;
-    if wgc && failed.is_none() {
-        match capture.monitors() {
-            Err(error) => failed = Some(error.into()),
-            Ok(monitors) => {
-                let expected: Vec<String> =
-                    monitors.into_iter().map(|monitor| monitor.id).collect();
-                let deadline = std::time::Instant::now() + WGC_ANSWER_DEADLINE;
-                failed = await_answers(
-                    &expected,
-                    &mut stored,
-                    || std::time::Instant::now() >= deadline,
-                    |missing, stored| {
-                        std::thread::sleep(WGC_ANSWER_RETRY);
-                        capture::pass(
-                            &mut capture,
-                            &ocr,
-                            &mut conn,
-                            &paths,
-                            &config,
-                            &mut previous,
-                            &mut save_failed,
-                            (!expected.is_empty()).then_some(missing),
-                            stored,
-                        )
-                        .err()
-                    },
-                );
-                awaited = Some(expected);
-            }
-        }
-    }
+    .err()
+    .or_else(|| subject.failure().map(Failure::from));
 
-    let (lines, exit) = closing_report(&stored, save_failed, failed, awaited.as_deref());
+    let (lines, exit) = closing_report(stored.as_ref(), save_failed, failed);
     for line in lines {
         println!("{line}");
     }
     exit
 }
 
-/// What `capture-once` says after its passes, and what it exits with: the `--wgc` wait's
-/// no-answer notice, every stored frame's line, then the save-failure summary — printed beside a
-/// pass failure that owns the exit, the exit itself when the pass succeeded.
+/// What `capture-once` says after its pass, and what it exits with: the stored frame's line, then
+/// the save-failure summary — printed beside a pass failure that owns the exit, the exit itself
+/// when the pass succeeded.
 fn closing_report(
-    stored: &[capture::Stored],
-    save_failed: std::collections::HashMap<String, capture::SaveFailure>,
+    stored: Option<&capture::Stored>,
+    save_failed: Option<capture::SaveFailure>,
     failed: Option<Failure>,
-    awaited: Option<&[String]>,
 ) -> (Vec<String>, Result<(), Failure>) {
     let mut lines = Vec::new();
-    // Nothing after a pass failure: the abort, not the deadline, is why answers are missing.
-    if let Some(expected) = awaited
-        && failed.is_none()
-    {
-        let missing: Vec<&str> = expected
-            .iter()
-            .filter(|id| {
-                !stored.iter().any(|frame| &frame.monitor_id == *id)
-                    && !save_failed.contains_key(*id)
-            })
-            .map(String::as_str)
-            .collect();
-        if !missing.is_empty() {
-            lines.push(format!(
-                "{} of {} monitors answered within {}s; nothing from {}",
-                expected.len() - missing.len(),
-                expected.len(),
-                WGC_ANSWER_DEADLINE.as_secs(),
-                missing.join(", ")
-            ));
-        }
-    }
-    if stored.is_empty() && save_failed.is_empty() && failed.is_none() {
+    if stored.is_none() && save_failed.is_none() && failed.is_none() {
         lines.push(
-            "nothing was stored: the privacy gate refused this moment, or no monitor answered."
+            "nothing was stored: the privacy gate refused this moment, or the foreground window \
+             could not be captured."
                 .to_owned(),
         );
     }
-    for frame in stored {
+    if let Some(frame) = stored {
         lines.push(format!(
-            "{} {}x{} ocr {:?} {} chars {}",
-            frame.monitor_id,
-            frame.width,
-            frame.height,
-            frame.ocr_status,
-            frame.text_chars,
-            frame.relative_path
+            "{}x{} ocr {:?} {} chars {}",
+            frame.width, frame.height, frame.ocr_status, frame.text_chars, frame.relative_path
         ));
     }
-    if !save_failed.is_empty() {
-        let mut failures: Vec<String> = save_failed
-            .into_iter()
-            .map(|(monitor_id, failure)| format!("{monitor_id}: {}", failure.message))
-            .collect();
-        failures.sort();
-        let summary = format!("saving failed on {}", failures.join("; "));
+    if let Some(save_failed) = save_failed {
+        let summary = format!("saving failed: {}", save_failed.message);
         return match failed {
             Some(failed) => {
                 lines.push(summary);
@@ -627,39 +465,6 @@ fn closing_report(
         Some(failed) => (lines, Err(failed)),
         None => (lines, Ok(())),
     }
-}
-
-/// Whether every monitor in `expected` has stored a frame. An empty `expected` is a machine with
-/// no usable monitors — the only call sits in the arm where enumeration succeeded — and nothing
-/// can be waited for, so it is answered as complete.
-fn all_answered(stored: &[capture::Stored], expected: &[String]) -> bool {
-    expected
-        .iter()
-        .all(|id| stored.iter().any(|frame| &frame.monitor_id == id))
-}
-
-/// The `--wgc` wait: keeps asking `pass_once` about the monitors that have not answered until
-/// every one has, a pass fails, or `expired` says the deadline arrived. The wait only ever adds
-/// to `stored` — what earlier passes landed is never given back.
-fn await_answers(
-    expected: &[String],
-    stored: &mut Vec<capture::Stored>,
-    mut expired: impl FnMut() -> bool,
-    mut pass_once: impl FnMut(
-        &std::collections::HashSet<String>,
-        &mut Vec<capture::Stored>,
-    ) -> Option<Failure>,
-) -> Option<Failure> {
-    let mut failed = None;
-    while failed.is_none() && !all_answered(stored, expected) && !expired() {
-        let missing: std::collections::HashSet<String> = expected
-            .iter()
-            .filter(|id| !stored.iter().any(|frame| &frame.monitor_id == *id))
-            .cloned()
-            .collect();
-        failed = pass_once(&missing, stored);
-    }
-    failed
 }
 
 /// Ask for what this program cannot work out on its own, and write it down. Nothing here talks to
@@ -960,7 +765,7 @@ impl Drop for EchoOff {
 
 #[cfg(test)]
 mod tests {
-    use super::{await_answers, closing_report, last_error_line};
+    use super::{closing_report, last_error_line};
     use crate::capture::{SaveFailure, Stored};
     use cw_store::outbox::NewestError;
 
@@ -1009,9 +814,8 @@ mod tests {
         );
     }
 
-    fn stored_frame(monitor_id: &str) -> Stored {
+    fn stored_frame() -> Stored {
         Stored {
-            monitor_id: monitor_id.to_owned(),
             width: 1,
             height: 1,
             ocr_status: cw_core::model::OcrStatus::NoText,
@@ -1023,112 +827,33 @@ mod tests {
     #[test]
     fn a_pass_failure_exits_only_after_the_stored_and_save_failure_lines() {
         let refused = || {
-            std::collections::HashMap::from([(
-                "b".to_owned(),
-                SaveFailure {
-                    key: "encode: too wide".to_owned(),
-                    message: "too wide".to_owned(),
-                },
-            )])
+            Some(SaveFailure {
+                key: "encode: too wide".to_owned(),
+                message: "too wide".to_owned(),
+            })
         };
 
-        let (lines, exit) = closing_report(
-            &[stored_frame("a")],
-            refused(),
-            Some("enumeration refused".into()),
-            None,
-        );
+        let (lines, exit) =
+            closing_report(Some(&stored_frame()), refused(), Some("refused".into()));
         assert_eq!(lines.len(), 2);
-        assert!(lines[0].starts_with("a "));
-        assert_eq!(lines[1], "saving failed on b: too wide");
-        assert_eq!(exit.unwrap_err().to_string(), "enumeration refused");
+        assert!(lines[0].starts_with("1x1 "));
+        assert_eq!(lines[1], "saving failed: too wide");
+        assert_eq!(exit.unwrap_err().to_string(), "refused");
 
-        let (lines, exit) = closing_report(&[stored_frame("a")], refused(), None, None);
+        let (lines, exit) = closing_report(Some(&stored_frame()), refused(), None);
         assert_eq!(lines.len(), 1);
-        assert_eq!(
-            exit.unwrap_err().to_string(),
-            "saving failed on b: too wide"
-        );
+        assert_eq!(exit.unwrap_err().to_string(), "saving failed: too wide");
     }
 
     #[test]
-    fn the_no_answer_notice_and_the_nothing_line_yield_to_a_pass_failure() {
-        let expected = ["a".to_owned(), "b".to_owned()];
-
-        let (lines, exit) = closing_report(
-            &[stored_frame("a")],
-            std::collections::HashMap::new(),
-            None,
-            Some(&expected),
-        );
-        assert_eq!(lines.len(), 2);
-        assert_eq!(
-            lines[0],
-            "1 of 2 monitors answered within 8s; nothing from b"
-        );
-        assert!(lines[1].starts_with("a "));
+    fn the_nothing_line_yields_to_a_pass_failure() {
+        let (lines, exit) = closing_report(None, None, None);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].starts_with("nothing was stored"));
         assert!(exit.is_ok());
 
-        let (lines, exit) = closing_report(
-            &[stored_frame("a")],
-            std::collections::HashMap::new(),
-            Some("refused".into()),
-            Some(&expected),
-        );
-        assert_eq!(lines.len(), 1);
-        assert!(lines[0].starts_with("a "));
-        assert_eq!(exit.unwrap_err().to_string(), "refused");
-
-        let (lines, exit) = closing_report(
-            &[],
-            std::collections::HashMap::new(),
-            Some("refused".into()),
-            None,
-        );
+        let (lines, exit) = closing_report(None, None, Some("refused".into()));
         assert!(lines.is_empty());
         assert_eq!(exit.unwrap_err().to_string(), "refused");
-    }
-
-    #[test]
-    fn the_wgc_wait_only_adds_and_a_failing_pass_ends_it() {
-        let expected = ["a".to_owned(), "b".to_owned()];
-
-        let mut stored = vec![stored_frame("a")];
-        let mut asked = Vec::new();
-        let failed = await_answers(
-            &expected,
-            &mut stored,
-            || false,
-            |missing, stored| {
-                let mut ids: Vec<String> = missing.iter().cloned().collect();
-                ids.sort();
-                asked.push(ids);
-                stored.push(stored_frame("b"));
-                None
-            },
-        );
-        assert!(failed.is_none());
-        assert_eq!(stored.len(), 2);
-        assert_eq!(asked, [["b"]]);
-
-        let mut stored = Vec::new();
-        let mut ticks = 0;
-        let mut passes = 0;
-        let failed = await_answers(
-            &expected,
-            &mut stored,
-            || {
-                ticks += 1;
-                ticks > 3
-            },
-            |_missing, stored| {
-                passes += 1;
-                stored.push(stored_frame("a"));
-                Some("refused".into())
-            },
-        );
-        assert_eq!(failed.unwrap().to_string(), "refused");
-        assert_eq!(passes, 1);
-        assert_eq!(stored.len(), 1);
     }
 }

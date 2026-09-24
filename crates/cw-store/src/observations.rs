@@ -9,8 +9,6 @@ const SELECT_BY_ID: &str = "SELECT id, source, observed_at, duration_ms, schema_
 /// Half-open in its contract, inclusive in its SQL: `[start, end)` is exactly `[start, end - 1ns]`
 /// because the instants this schema represents are the nanosecond grid — `to_sql` refuses an
 /// overflowing nanosecond field, so nothing storable lies strictly between the two.
-/// The `id` tiebreak is not decoration — one tick captures several monitors and can stamp
-/// them with the same instant, and SQLite does not promise an order among equal sort keys.
 const SELECT_IN_WINDOW: &str = "SELECT id, source, observed_at, duration_ms, schema_version, payload FROM observations \
      WHERE observed_at >= ?1 AND observed_at <= ?2 ORDER BY observed_at, id";
 
@@ -205,7 +203,6 @@ mod tests {
 
     fn fully_populated_screen_payload() -> ScreenPayload {
         ScreenPayload {
-            monitor_id: "monitor-1".to_owned(),
             width: 2560,
             height: 1440,
             image_path: Some("screens/観測.png".to_owned()),
@@ -633,5 +630,49 @@ mod tests {
 
         let found = find_by_id(&conn, id).expect("the canonical observation id lookup should work");
         assert_eq!(found, None);
+    }
+
+    #[test]
+    fn a_version_one_row_with_a_monitor_id_still_reads() {
+        let dir = tempdir().expect("the temporary database directory should be creatable");
+        let path = dir.path().join("db.sqlite3");
+        let conn = db::open(&path).expect("the fresh database should initialize");
+        let id = ulid::Ulid::generate();
+        let observed_at = at("2026-07-25T12:34:56Z");
+        conn.execute(
+            "INSERT INTO observations \
+             (id, source, observed_at, duration_ms, schema_version, payload) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                id.to_string(),
+                "screen",
+                timestamp::to_sql(observed_at)
+                    .expect("the observation timestamp should be spellable"),
+                Option::<i64>::None,
+                1_i64,
+                r#"{"foreground_process":"notepad.exe","foreground_window_title":"メモ帳","height":1440,"image_path":"screens/a.webp","monitor_id":"monitor-1","ocr_error":null,"ocr_langs":["ja-JP"],"ocr_status":"succeeded","ocr_text":"テスト","width":2560}"#,
+            ],
+        )
+        .expect("the version-1 row should be writable");
+
+        let restored = find_by_id(&conn, id)
+            .expect("the version-1 row should be readable")
+            .expect("the version-1 row should be found");
+
+        assert_eq!(restored.schema_version, 1);
+        assert_eq!(
+            restored.payload,
+            SourcePayload::Screen(ScreenPayload {
+                width: 2560,
+                height: 1440,
+                image_path: Some("screens/a.webp".to_owned()),
+                ocr_status: OcrStatus::Succeeded,
+                ocr_error: None,
+                ocr_text: Some("テスト".to_owned()),
+                ocr_langs: vec!["ja-JP".to_owned()],
+                foreground_process: Some("notepad.exe".to_owned()),
+                foreground_window_title: Some("メモ帳".to_owned()),
+            })
+        );
     }
 }

@@ -307,7 +307,6 @@ mod tests {
             metadata: cw_core::episode::EpisodeMetadata {
                 episode_start: start_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
                 episode_end: end_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-                monitors: "[]".to_owned(),
                 entry_count: "1".to_owned(),
                 image_paths: "[]".to_owned(),
             },

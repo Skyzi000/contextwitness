@@ -41,7 +41,7 @@ pub enum ImageBufferError {
 }
 
 /// Downscaled grayscale view used to estimate changed logical pixels, kept between ticks
-/// instead of the full frame (a few tens of KiB per monitor rather than tens of MiB).
+/// instead of the full frame (a few tens of KiB rather than tens of MiB).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Thumbnail {
     luma: Vec<u8>,
@@ -144,34 +144,6 @@ pub fn frame_changed(
         > f64::from(config.change_area_logical_pixels)
 }
 
-/// Largest value `Thumbnail::changed_logical_pixels` can return for a monitor of this size: every
-/// sampled pixel changed. Returns 0.0 for a scale that is not finite and positive.
-pub fn max_logical_pixels(width: u32, height: u32, dpi_scale: f32) -> f64 {
-    if !dpi_scale.is_finite() || dpi_scale <= 0.0 {
-        return 0.0;
-    }
-
-    f64::from(width) * f64::from(height) / f64::from(dpi_scale).powi(2)
-}
-
-/// Whether `config.change_area_logical_pixels` can ever be exceeded on a monitor of this size.
-///
-/// `frame_changed` compares with `>`, so a threshold at or above the monitor's logical area is
-/// never satisfied and no pixel difference on that monitor ever counts as changed again after its
-/// first frame. What still gets through is a change of dimensions or
-/// DPI scale, which `frame_changed` answers before it compares any pixels. `Config::validate`
-/// cannot check this because no monitor is known when the config is read, so it has to be asked
-/// once per monitor, as they are enumerated. Kept here so bound and the comparison that makes it a
-/// bound stay in the same file.
-pub fn change_threshold_is_reachable(
-    width: u32,
-    height: u32,
-    dpi_scale: f32,
-    config: &crate::config::CaptureConfig,
-) -> bool {
-    max_logical_pixels(width, height, dpi_scale) > f64::from(config.change_area_logical_pixels)
-}
-
 fn rgba_image(rgba: &[u8], width: u32, height: u32) -> Result<image::RgbaImage, ImageBufferError> {
     if width == 0 || height == 0 {
         return Err(ImageBufferError::EmptyImage);
@@ -196,10 +168,7 @@ fn rgba_image(rgba: &[u8], width: u32, height: u32) -> Result<image::RgbaImage, 
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        ImageBufferError, Thumbnail, change_threshold_is_reachable, frame_changed,
-        max_logical_pixels,
-    };
+    use super::{ImageBufferError, Thumbnail, frame_changed};
     use crate::config::CaptureConfig;
 
     const WIDTH: u32 = 2560;
@@ -277,66 +246,22 @@ mod tests {
 
         assert!(
             frame_changed(None, &thumbnail, &CaptureConfig::default()),
-            "the first frame for a monitor must always be treated as changed"
+            "the first frame must always be treated as changed"
         );
     }
 
     #[test]
-    fn a_threshold_at_the_monitor_area_can_never_fire() {
-        assert_eq!(max_logical_pixels(1920, 1080, 1.0), 2_073_600.0);
-
+    fn a_threshold_at_the_frame_area_can_never_fire() {
         let config = |change_area_logical_pixels| CaptureConfig {
             change_area_logical_pixels,
             ..CaptureConfig::default()
         };
-        assert!(!change_threshold_is_reachable(
-            1920,
-            1080,
-            1.0,
-            &config(2_073_600)
-        ));
-        assert!(change_threshold_is_reachable(
-            1920,
-            1080,
-            1.0,
-            &config(2_073_599)
-        ));
-
-        assert_eq!(max_logical_pixels(2560, 1440, 2.0), 921_600.0);
-        assert!(change_threshold_is_reachable(
-            2560,
-            1440,
-            2.0,
-            &CaptureConfig::default()
-        ));
-        assert!(!change_threshold_is_reachable(
-            2560,
-            1440,
-            2.0,
-            &config(921_600)
-        ));
-
         let before = Thumbnail::from_rgba(&solid(WIDTH, HEIGHT, 200), WIDTH, HEIGHT, 1.0)
             .expect("the fixed test image should build");
         let after = Thumbnail::from_rgba(&solid(WIDTH, HEIGHT, 0), WIDTH, HEIGHT, 1.0)
             .expect("the fixed test image should build");
         assert!(!frame_changed(Some(&before), &after, &config(3_686_400)));
         assert!(frame_changed(Some(&before), &after, &config(3_686_399)));
-    }
-
-    #[test]
-    fn an_unusable_display_scale_makes_no_threshold_reachable() {
-        let config = CaptureConfig {
-            change_area_logical_pixels: 0,
-            ..CaptureConfig::default()
-        };
-
-        for dpi_scale in [0.0, -1.0, f32::NAN] {
-            assert_eq!(max_logical_pixels(1920, 1080, dpi_scale), 0.0);
-            assert!(!change_threshold_is_reachable(
-                1920, 1080, dpi_scale, &config
-            ));
-        }
     }
 
     #[test]

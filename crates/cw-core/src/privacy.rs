@@ -51,7 +51,7 @@ fn file_name_component(path: &str) -> Option<&str> {
 pub enum CaptureDecision {
     /// Capture this tick.
     Capture,
-    /// The foreground process is blacklisted; skip every monitor this tick.
+    /// The foreground process is blacklisted; skip this tick.
     SkipBlacklisted {
         /// Foreground process value exactly as supplied by the caller.
         process: String,
