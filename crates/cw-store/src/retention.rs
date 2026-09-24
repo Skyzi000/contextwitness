@@ -313,7 +313,7 @@ mod tests {
              VALUES (?1, ?2, ?3, ?4)",
             rusqlite::params![
                 stored_id,
-                images::relative_path(id, created_at),
+                images::legacy_path(id, created_at),
                 byte_size,
                 spelled
             ],
@@ -377,9 +377,10 @@ mod tests {
         )
         .expect("the test observation should be storable");
         let pixels = vec![7u8; 4 * 3 * 3];
-        images::save(conn, root, id, &pixels, 4, 3, 75.0, created_at)
+        let relative = images::relative_path(id, created_at.fixed_offset(), None, None);
+        images::save(conn, root, id, &relative, &pixels, 4, 3, 75.0, created_at)
             .expect("the test image should be saved");
-        id.to_string()
+        relative
     }
 
     /// A committed delete landing in the middle of a pass, standing in for the concurrent deleter a
@@ -408,7 +409,7 @@ mod tests {
     ) -> String {
         let spelled =
             timestamp::to_sql(created_at).expect("the test timestamp should be spellable");
-        let path = images::relative_path(late, created_at);
+        let path = images::legacy_path(late, created_at);
         conn.execute_batch(&format!(
             "CREATE TRIGGER late_saver AFTER DELETE ON images \
              WHEN old.observation_id = '{after}' BEGIN \
@@ -600,11 +601,8 @@ mod tests {
         let start = now() - TimeDelta::days(30);
         save_registered(&mut conn, &root, 1, start);
         let gone = save_registered(&mut conn, &root, 2, start + TimeDelta::minutes(1));
-        std::fs::remove_file(root.join(images::relative_path(
-            ulid::Ulid::from(2u128),
-            start + TimeDelta::minutes(1),
-        )))
-        .expect("the second image should be removable without touching its row");
+        std::fs::remove_file(root.join(&gone))
+            .expect("the second image should be removable without touching its row");
         let stored = u64::try_from(budget(&conn)).expect("the test budget should fit u64");
 
         let swept = sweep(&mut conn, &root, now(), 7, 1).expect("the sweep should run");

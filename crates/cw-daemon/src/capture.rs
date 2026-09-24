@@ -57,8 +57,7 @@ pub fn run(
 }
 
 /// One frame a pass stored, as the daemon's log line and `capture-once`'s printed line describe
-/// it. The recognized text is deliberately not here: neither destination is a place screen content
-/// goes, and only its length is reported.
+/// it.
 pub(crate) struct Stored {
     pub width: u32,
     pub height: u32,
@@ -163,7 +162,6 @@ pub(crate) fn pass(
                 detail: Some(detail),
             },
         )?;
-        // Without the process name: the audit trail is where that belongs, not the log.
         debug!("tick skipped by the privacy gate");
         return Ok(());
     }
@@ -213,29 +211,33 @@ pub(crate) fn pass(
         foreground_window_title: foreground.title,
     };
     let mut observation = Observation::new_screen(payload, captured_at);
+    let offset =
+        chrono::TimeZone::offset_from_utc_datetime(&chrono::Local, &captured_at.naive_utc());
+    let mut relative_path = String::new();
     // The `images/` prefix is the payload's spelling only: delivered paths are
     // data_dir-relative, the images table keys on the path relative to the images root.
     if let SourcePayload::Screen(payload) = &mut observation.payload {
-        payload.image_path = Some(format!(
-            "images/{}",
-            cw_store::images::relative_path(observation.id, captured_at)
-        ));
+        relative_path = cw_store::images::relative_path(
+            observation.id,
+            captured_at.with_timezone(&offset),
+            payload.foreground_process.as_deref(),
+            payload.foreground_window_title.as_deref(),
+        );
+        payload.image_path = Some(format!("images/{relative_path}"));
     }
     let rgb = bgra_to_rgb(&frame.bgra);
-    let relative_path = match cw_store::images::save_with_observation(
+    match cw_store::images::save_with_observation(
         conn,
         &paths.images(),
         &observation,
+        &relative_path,
         &rgb,
         frame.width,
         frame.height,
         f32::from(config.capture.webp_quality),
         captured_at,
     ) {
-        Ok(stored) => {
-            *save_failed = None;
-            stored
-        }
+        Ok(()) => *save_failed = None,
         Err(error) => {
             let key = save_failure_key(&error);
             if save_failed.as_ref().is_none_or(|last| last.key != key) {
@@ -247,7 +249,7 @@ pub(crate) fn pass(
             }
             return Ok(());
         }
-    };
+    }
     subject.baseline = Some(thumbnail);
     *stored = Some(Stored {
         width: frame.width,

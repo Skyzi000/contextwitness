@@ -2,11 +2,6 @@ use cw_core::config::DataPaths;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
-/// Captured content — window titles, process names, OCR text — reaches a log only where
-/// delivery diagnostics quote the server's error text: a server refusing an episode can quote
-/// it back. Every field written here is one a `tracing` call in this binary chooses, so this is
-/// a rule about the call sites, not a filter.
-///
 /// The returned guard flushes the non-blocking writer when it drops, so the caller has to hold it
 /// for as long as it wants file logs — `let _ = init(..)` would drop it at once and lose them.
 #[must_use]

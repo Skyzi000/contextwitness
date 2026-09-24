@@ -2,7 +2,7 @@
 
 use crate::control_cursor::{Cursor, head, load_cursor, store_cursor};
 use crate::{StoreError, observations, timestamp};
-use chrono::Datelike;
+use chrono::{Datelike, Timelike};
 use std::collections::HashSet;
 
 const INSERT_IMAGE: &str = "INSERT INTO images \
@@ -61,6 +61,10 @@ pub struct RowScan {
     pub finished: bool,
 }
 
+const PROCESS_CHARS: usize = 32;
+const TITLE_CHARS: usize = 48;
+const LABEL_CHARS: usize = PROCESS_CHARS + 1 + TITLE_CHARS;
+
 /// Where an image for `id` taken at `at` is filed, relative to the image root.
 ///
 /// Forward slashes on every platform. This string is a UNIQUE key that a sweep compares against
@@ -68,13 +72,47 @@ pub struct RowScan {
 /// same file two ways, the constraint would let both exist and each would be invisible to the
 /// other's lookup. Joining it onto a root with `Path::join` handles the separator when a real
 /// path is needed.
-pub fn relative_path(id: ulid::Ulid, at: chrono::DateTime<chrono::Utc>) -> String {
+pub fn relative_path(
+    id: ulid::Ulid,
+    at: chrono::DateTime<chrono::FixedOffset>,
+    process: Option<&str>,
+    title: Option<&str>,
+) -> String {
+    let process = process.filter(|process| !process.is_empty());
+    let mut label = sanitize(process.unwrap_or("unknown"), PROCESS_CHARS);
+    if let Some(title) = title.filter(|title| !title.is_empty()) {
+        label.push('_');
+        label.push_str(&sanitize(title, TITLE_CHARS));
+    }
+    format!(
+        "{:04}/{:02}/{:02}/{:02}{:02}{:02}_{label}_{id}.webp",
+        at.year(),
+        at.month(),
+        at.day(),
+        at.hour(),
+        at.minute(),
+        at.second()
+    )
+}
+
+pub(crate) fn legacy_path(id: ulid::Ulid, at: chrono::DateTime<chrono::Utc>) -> String {
     format!(
         "{:04}/{:02}/{:02}/{id}.webp",
         at.year(),
         at.month(),
         at.day()
     )
+}
+
+fn is_forbidden(c: char) -> bool {
+    c.is_ascii_control() || matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*')
+}
+
+fn sanitize(text: &str, max_chars: usize) -> String {
+    text.chars()
+        .take(max_chars)
+        .map(|c| if is_forbidden(c) { '_' } else { c })
+        .collect()
 }
 
 /// Encode `pixels` as WebP, register it, and put the file in place.
@@ -87,18 +125,24 @@ pub fn relative_path(id: ulid::Ulid, at: chrono::DateTime<chrono::Utc>) -> Strin
 /// The observation this image belongs to must already be committed, since the image row references
 /// it. A caller that is writing both takes [`save_with_observation`], which commits the two rows
 /// together.
+///
+/// `relative` is the file's name as [`relative_path`] spells it for `id`. A name [`delete`] would
+/// refuse to read back is refused before anything is written.
 #[allow(clippy::too_many_arguments)]
 pub fn save(
     conn: &mut rusqlite::Connection,
     root: &std::path::Path,
     id: ulid::Ulid,
+    relative: &str,
     pixels: &[u8],
     width: u32,
     height: u32,
     quality: f32,
     at: chrono::DateTime<chrono::Utc>,
-) -> Result<String, StoreError> {
-    save_registering(conn, root, id, None, pixels, width, height, quality, at)
+) -> Result<(), StoreError> {
+    save_registering(
+        conn, root, id, None, relative, pixels, width, height, quality, at,
+    )
 }
 
 /// [`save`], with `observation` inserted into the same transaction as the image row.
@@ -114,17 +158,19 @@ pub fn save_with_observation(
     conn: &mut rusqlite::Connection,
     root: &std::path::Path,
     observation: &cw_core::model::Observation,
+    relative: &str,
     pixels: &[u8],
     width: u32,
     height: u32,
     quality: f32,
     at: chrono::DateTime<chrono::Utc>,
-) -> Result<String, StoreError> {
+) -> Result<(), StoreError> {
     save_registering(
         conn,
         root,
         observation.id,
         Some(observation),
+        relative,
         pixels,
         width,
         height,
@@ -142,12 +188,13 @@ fn save_registering(
     root: &std::path::Path,
     id: ulid::Ulid,
     observation: Option<&cw_core::model::Observation>,
+    relative: &str,
     pixels: &[u8],
     width: u32,
     height: u32,
     quality: f32,
     at: chrono::DateTime<chrono::Utc>,
-) -> Result<String, StoreError> {
+) -> Result<(), StoreError> {
     let id_text = id.to_string();
     // 16,383 is the encoder's dimension limit, not one imposed by this program.
     if !(1..=16_383).contains(&width)
@@ -176,7 +223,7 @@ fn save_registering(
     }
 
     let created_at = timestamp::to_sql(at)?;
-    let relative = relative_path(id, at);
+    let relative = checked_path(id, at, relative)?;
     // `encode` would unwrap this error and panic on the capture path.
     let encoded = webp::Encoder::from_rgb(pixels, width, height)
         .encode_simple(false, quality)
@@ -288,7 +335,7 @@ fn save_registering(
     }
     drop(file);
 
-    Ok(relative)
+    Ok(())
 }
 
 /// Remove an image and the row that registers it.
@@ -788,7 +835,8 @@ fn path_relative_to_root(
     Ok(relative.to_string_lossy().replace('\\', "/"))
 }
 
-/// The path a row claims, checked against the one this program would have written for it.
+/// The path a row claims, checked against the names this program has written for it:
+/// `legacy_path` of its `created_at`, or a `relative_path` name ending in its id.
 ///
 /// `relative_path` is TEXT and the schema constrains nothing, so a row edited by hand or damaged
 /// can name anything at all — including a path that climbs out of the image root, which `delete`
@@ -798,7 +846,7 @@ fn checked_path(
     created_at: chrono::DateTime<chrono::Utc>,
     stored: &str,
 ) -> Result<String, StoreError> {
-    if stored == relative_path(id, created_at) {
+    if stored == legacy_path(id, created_at) || is_labelled_path(id, stored) {
         Ok(stored.to_owned())
     } else {
         Err(StoreError::Encoding {
@@ -809,6 +857,27 @@ fn checked_path(
             )),
         })
     }
+}
+
+fn is_labelled_path(id: ulid::Ulid, stored: &str) -> bool {
+    const SHAPE: &[u8] = b"0000/00/00/000000_";
+    let Some(head) = stored.as_bytes().get(..SHAPE.len()) else {
+        return false;
+    };
+    let head_fits = head.iter().zip(SHAPE).all(|(&byte, &shape)| {
+        if shape == b'0' {
+            byte.is_ascii_digit()
+        } else {
+            byte == shape
+        }
+    });
+    if !head_fits {
+        return false;
+    }
+    let Some(label) = stored[SHAPE.len()..].strip_suffix(&format!("_{id}.webp")) else {
+        return false;
+    };
+    !label.is_empty() && label.chars().count() <= LABEL_CHARS && !label.contains(is_forbidden)
 }
 
 /// Read and validate the columns needed by image-row readers.
@@ -849,10 +918,11 @@ fn decode_image_path(
 mod tests {
     use super::{
         BATCH, Batch, DeleteOutcome, MAX_PAGES, RowScan, SCANNER_CURSOR, SCANNER_HIGH_WATER, Walk,
-        delete, save, scan_orphan_rows, sweep_batch, sweep_orphan_files,
+        checked_path, delete, legacy_path, relative_path, sanitize, save, scan_orphan_rows,
+        sweep_batch, sweep_orphan_files,
     };
     use crate::{StoreError, db, observations, timestamp};
-    use chrono::{DateTime, TimeDelta, TimeZone, Utc};
+    use chrono::{DateTime, FixedOffset, TimeDelta, TimeZone, Utc};
     use cw_core::model::{Observation, OcrStatus, ScreenPayload};
     use tempfile::{TempDir, tempdir};
 
@@ -953,6 +1023,15 @@ mod tests {
         (0..len).map(|index| rgb[index % rgb.len()]).collect()
     }
 
+    fn name(id: ulid::Ulid, taken_at: DateTime<Utc>) -> String {
+        relative_path(
+            id,
+            taken_at.fixed_offset(),
+            Some("synthetic.exe"),
+            Some("Synthetic window"),
+        )
+    }
+
     fn save_test_image(
         conn: &mut rusqlite::Connection,
         root: &std::path::Path,
@@ -961,8 +1040,20 @@ mod tests {
         seed: u8,
     ) -> String {
         insert_observation(conn, id, taken_at);
-        save(conn, root, id, &pixels(seed), WIDTH, HEIGHT, 75.0, taken_at)
-            .expect("the synthetic image should be saved")
+        let relative = name(id, taken_at);
+        save(
+            conn,
+            root,
+            id,
+            &relative,
+            &pixels(seed),
+            WIDTH,
+            HEIGHT,
+            75.0,
+            taken_at,
+        )
+        .expect("the synthetic image should be saved");
+        relative
     }
 
     /// Registers a row with no file beside it, so a scan reports its name without a picture being
@@ -970,7 +1061,7 @@ mod tests {
     fn register_row(conn: &rusqlite::Connection, index: u128, taken_at: DateTime<Utc>) -> String {
         let id = ulid::Ulid::from(index);
         insert_observation(conn, id, taken_at);
-        let relative = super::relative_path(id, taken_at);
+        let relative = legacy_path(id, taken_at);
         conn.execute(
             "INSERT INTO images (observation_id, relative_path, byte_size, created_at) \
              VALUES (?1, ?2, 1, ?3)",
@@ -1060,11 +1151,13 @@ mod tests {
         // COMMIT that answers — the one failure the last statement of `save` can be given here.
         conn.execute_batch("PRAGMA defer_foreign_keys = ON")
             .expect("the pragma should apply");
+        let relative = name(id, taken_at);
 
         let result = save(
             &mut conn,
             &root,
             id,
+            &relative,
             &pixels(93),
             WIDTH,
             HEIGHT,
@@ -1073,7 +1166,7 @@ mod tests {
         );
 
         assert!(matches!(result, Err(StoreError::Sql { .. })), "{result:?}");
-        let published = root.join(format!("2026/07/30/{id}.webp"));
+        let published = root.join(relative);
         assert!(
             published.is_file(),
             "the published image should still be there"
@@ -1102,6 +1195,7 @@ mod tests {
             &mut conn,
             &root,
             id,
+            &name(id, at(2026, 7, 30)),
             &pixels(7),
             WIDTH,
             HEIGHT,
@@ -1124,7 +1218,10 @@ mod tests {
 
         assert!(stored.contains('/'));
         assert!(!stored.contains('\\'));
-        assert_eq!(stored, "2026/07/30/00000000000000000000000001.webp");
+        assert_eq!(
+            stored,
+            "2026/07/30/123456_synthetic.exe_Synthetic window_00000000000000000000000001.webp"
+        );
     }
 
     #[test]
@@ -1140,6 +1237,7 @@ mod tests {
             &mut conn,
             &root,
             id,
+            &relative,
             &pixels(200),
             WIDTH,
             HEIGHT,
@@ -1196,6 +1294,7 @@ mod tests {
             &mut conn,
             &root,
             first_id,
+            &relative,
             &pixels(32),
             WIDTH,
             HEIGHT,
@@ -1236,9 +1335,12 @@ mod tests {
         insert_observation(&conn, id, taken_at);
         let mut short = pixels(40);
         short.pop();
+        let relative = name(id, taken_at);
 
-        let error = save(&mut conn, &root, id, &short, WIDTH, HEIGHT, 75.0, taken_at)
-            .expect_err("the short frame should be refused");
+        let error = save(
+            &mut conn, &root, id, &relative, &short, WIDTH, HEIGHT, 75.0, taken_at,
+        )
+        .expect_err("the short frame should be refused");
 
         match error {
             StoreError::Encode { id: actual, .. } => assert_eq!(actual, id.to_string()),
@@ -1249,8 +1351,10 @@ mod tests {
         long.push(0);
         // The encoder ignores trailing bytes, so only this side of the check catches a length test
         // weakened to accept a buffer that is merely large enough.
-        let error = save(&mut conn, &root, id, &long, WIDTH, HEIGHT, 75.0, taken_at)
-            .expect_err("the long frame should be refused");
+        let error = save(
+            &mut conn, &root, id, &relative, &long, WIDTH, HEIGHT, 75.0, taken_at,
+        )
+        .expect_err("the long frame should be refused");
         match error {
             StoreError::Encode { id: actual, .. } => assert_eq!(actual, id.to_string()),
             other => panic!("expected Encode, got {other:?}"),
@@ -1273,6 +1377,7 @@ mod tests {
             &mut conn,
             &root,
             oversized_id,
+            &name(oversized_id, taken_at),
             &oversized,
             16_384,
             1,
@@ -1282,10 +1387,12 @@ mod tests {
         .expect_err("the frame above the encoder's dimension limit should be refused");
         assert!(matches!(oversized_error, StoreError::Encode { .. }));
 
+        let zero_width_id = ulid::Ulid::generate();
         let zero_width_error = save(
             &mut conn,
             &root,
-            ulid::Ulid::generate(),
+            zero_width_id,
+            &name(zero_width_id, taken_at),
             &[],
             0,
             1,
@@ -1295,10 +1402,12 @@ mod tests {
         .expect_err("a zero-width frame should be refused");
         assert!(matches!(zero_width_error, StoreError::Encode { .. }));
 
+        let quality_id = ulid::Ulid::generate();
         let quality_error = save(
             &mut conn,
             &root,
-            ulid::Ulid::generate(),
+            quality_id,
+            &name(quality_id, taken_at),
             &pixels(41),
             WIDTH,
             HEIGHT,
@@ -1331,11 +1440,27 @@ mod tests {
             })
             .collect();
         save(
-            &mut conn, &root, zero_id, &detailed, DETAILED, DETAILED, 0.0, taken_at,
+            &mut conn,
+            &root,
+            zero_id,
+            &name(zero_id, taken_at),
+            &detailed,
+            DETAILED,
+            DETAILED,
+            0.0,
+            taken_at,
         )
         .expect("quality zero should be accepted");
         save(
-            &mut conn, &root, hundred_id, &detailed, DETAILED, DETAILED, 100.0, taken_at,
+            &mut conn,
+            &root,
+            hundred_id,
+            &name(hundred_id, taken_at),
+            &detailed,
+            DETAILED,
+            DETAILED,
+            100.0,
+            taken_at,
         )
         .expect("quality one hundred should be accepted");
 
@@ -1375,13 +1500,31 @@ mod tests {
         insert_observation(&conn, id, taken_at);
         let pixels = vec![0_u8; 49_149];
 
-        save(&mut conn, &root, id, &pixels, 16_383, 1, 75.0, taken_at)
-            .expect("a frame at the encoder's dimension limit should be accepted");
+        save(
+            &mut conn,
+            &root,
+            id,
+            &name(id, taken_at),
+            &pixels,
+            16_383,
+            1,
+            75.0,
+            taken_at,
+        )
+        .expect("a frame at the encoder's dimension limit should be accepted");
 
         let second_id = ulid::Ulid::generate();
         insert_observation(&conn, second_id, taken_at);
         save(
-            &mut conn, &root, second_id, &pixels, 1, 16_383, 75.0, taken_at,
+            &mut conn,
+            &root,
+            second_id,
+            &name(second_id, taken_at),
+            &pixels,
+            1,
+            16_383,
+            75.0,
+            taken_at,
         )
         .expect("a tall frame at the encoder's dimension limit should be accepted");
 
@@ -1407,11 +1550,13 @@ mod tests {
     #[test]
     fn a_timestamp_this_schema_cannot_store_is_refused_before_anything_is_written() {
         let (_dir, mut conn, root) = database();
+        let id = ulid::Ulid::generate();
 
         let error = save(
             &mut conn,
             &root,
-            ulid::Ulid::generate(),
+            id,
+            &name(id, DateTime::<Utc>::MAX_UTC),
             &pixels(42),
             WIDTH,
             HEIGHT,
@@ -1570,7 +1715,7 @@ mod tests {
         let id = ulid::Ulid::generate();
         let taken_at = at(2026, 7, 30);
         insert_observation(&conn, id, taken_at);
-        let canonical = super::relative_path(id, taken_at);
+        let canonical = legacy_path(id, taken_at);
         let path = root.join(&canonical);
         std::fs::create_dir_all(
             path.parent()
@@ -1608,7 +1753,7 @@ mod tests {
         let id = ulid::Ulid::generate();
         let taken_at = at(2026, 7, 30);
         insert_observation(&conn, id, taken_at);
-        let canonical = super::relative_path(id, taken_at);
+        let canonical = legacy_path(id, taken_at);
         let path = root.join(&canonical);
         std::fs::create_dir_all(
             path.parent()
@@ -1655,7 +1800,7 @@ mod tests {
         )
         .expect("the observation id should be made non-canonical before it has children");
 
-        let relative = super::relative_path(id, taken_at);
+        let relative = legacy_path(id, taken_at);
         let path = root.join(&relative);
         std::fs::create_dir_all(
             path.parent()
@@ -2534,6 +2679,7 @@ mod tests {
             &mut conn,
             &root,
             id,
+            &relative,
             &pixels(201),
             WIDTH,
             HEIGHT,
@@ -2562,7 +2708,8 @@ mod tests {
         let id = ulid::Ulid::generate();
         let taken_at = at(2026, 7, 30);
         insert_observation(&conn, id, taken_at);
-        let destination = root.join(super::relative_path(id, taken_at));
+        let relative = name(id, taken_at);
+        let destination = root.join(&relative);
         std::fs::create_dir_all(
             destination
                 .parent()
@@ -2576,6 +2723,7 @@ mod tests {
             &mut conn,
             &root,
             id,
+            &relative,
             &pixels(210),
             WIDTH,
             HEIGHT,
@@ -2614,5 +2762,199 @@ mod tests {
                 .file_name();
             assert!(!name.to_string_lossy().contains(".tmp-"));
         }
+    }
+
+    #[test]
+    fn sanitizing_replaces_each_forbidden_and_control_character_and_nothing_else() {
+        assert_eq!(
+            sanitize("a<b>c:d\"e/f\\g|h?i*j\u{0}k\n\u{1f}l\u{7f}m", usize::MAX),
+            "a_b_c_d_e_f_g_h_i_j_k__l_m"
+        );
+        let untouched = "Ünïcode ウィンドウ .. \u{80} 🦀 - _";
+        assert_eq!(sanitize(untouched, usize::MAX), untouched);
+    }
+
+    #[test]
+    fn sanitizing_twice_changes_nothing() {
+        let long = "あ<".repeat(40);
+        for text in ["a<b>c", "\u{0}\u{7f}", "plain", long.as_str()] {
+            let once = sanitize(text, 32);
+            assert_eq!(sanitize(&once, 32), once);
+        }
+    }
+
+    #[test]
+    fn a_long_process_and_title_are_cut_at_a_character_boundary() {
+        let id = ulid::Ulid::from(1u128);
+
+        let relative = relative_path(
+            id,
+            at(2026, 7, 30).fixed_offset(),
+            Some(&"あ".repeat(40)),
+            Some(&"🦀".repeat(60)),
+        );
+
+        assert_eq!(
+            relative,
+            format!(
+                "2026/07/30/123456_{}_{}_{id}.webp",
+                "あ".repeat(32),
+                "🦀".repeat(48)
+            )
+        );
+    }
+
+    #[test]
+    fn the_name_carries_the_local_date_and_time_the_process_and_the_title() {
+        let id = ulid::Ulid::from(1u128);
+        let plus_nine = FixedOffset::east_opt(9 * 3600).expect("the test offset should be valid");
+        let taken_at = Utc
+            .with_ymd_and_hms(2026, 7, 30, 20, 34, 56)
+            .single()
+            .expect("the test timestamp should be valid");
+
+        let relative = relative_path(
+            id,
+            taken_at.with_timezone(&plus_nine),
+            Some("chrome.exe"),
+            Some("Synthetic: window?"),
+        );
+
+        assert_eq!(
+            relative,
+            format!("2026/07/31/053456_chrome.exe_Synthetic_ window__{id}.webp")
+        );
+    }
+
+    #[test]
+    fn an_unknown_process_is_named_unknown_and_a_missing_or_empty_title_is_left_out() {
+        let id = ulid::Ulid::from(1u128);
+        let taken_at = at(2026, 7, 30).fixed_offset();
+
+        for (process, title) in [(None, None), (Some(""), Some("")), (None, Some(""))] {
+            assert_eq!(
+                relative_path(id, taken_at, process, title),
+                format!("2026/07/30/123456_unknown_{id}.webp")
+            );
+        }
+        assert_eq!(
+            relative_path(id, taken_at, None, Some("Synthetic window")),
+            format!("2026/07/30/123456_unknown_Synthetic window_{id}.webp")
+        );
+        assert_eq!(
+            relative_path(id, taken_at, Some("code.exe"), None),
+            format!("2026/07/30/123456_code.exe_{id}.webp")
+        );
+    }
+
+    #[test]
+    fn a_legacy_row_and_a_labelled_row_are_both_accepted() {
+        let id = ulid::Ulid::generate();
+        let created_at = at(2026, 7, 30);
+        let plus_nine = FixedOffset::east_opt(9 * 3600).expect("the test offset should be valid");
+
+        for stored in [
+            legacy_path(id, created_at),
+            relative_path(id, created_at.with_timezone(&plus_nine), None, None),
+            relative_path(
+                id,
+                (created_at + TimeDelta::days(1)).fixed_offset(),
+                Some(&"p".repeat(40)),
+                Some(&"t".repeat(60)),
+            ),
+            relative_path(
+                id,
+                created_at.fixed_offset(),
+                Some(&"あ".repeat(40)),
+                Some(&"🦀".repeat(60)),
+            ),
+        ] {
+            assert_eq!(checked_path(id, created_at, &stored).ok(), Some(stored));
+        }
+    }
+
+    #[test]
+    fn a_row_not_bound_to_its_id_or_not_confined_to_its_day_is_refused() {
+        let id = ulid::Ulid::generate();
+        let other = ulid::Ulid::generate();
+        let created_at = at(2026, 7, 30);
+
+        for stored in [
+            format!("2026/07/30/123456_chrome.exe_{other}.webp"),
+            format!(
+                "2026/07/30/123456_chrome.exe_{}.webp",
+                id.to_string().to_lowercase()
+            ),
+            format!("2026/07/30/123456_../../../outside_{id}.webp"),
+            format!("2026/07/30/123456_..\\..\\..\\outside_{id}.webp"),
+            format!("2026/07/30/123456_chrome.exe_{id}.png"),
+            format!("2026/07/30/123456_chrome.exe_{id}.webp.tmp"),
+            format!("2026/07/30/123456__{id}.webp"),
+            format!("2026/07/30/123456_a:b_{id}.webp"),
+            format!("2026/07/30/123456_a\u{7}b_{id}.webp"),
+            format!("2026/07/30/123456_{}_{id}.webp", "x".repeat(82)),
+            format!("2026/07/30/12345_chrome.exe_{id}.webp"),
+            format!("2026/7/30/123456_chrome.exe_{id}.webp"),
+            format!("../2026/07/30/123456_chrome.exe_{id}.webp"),
+            format!("2026/../../123456_chrome.exe_{id}.webp"),
+            format!("2026\\07\\30\\123456_chrome.exe_{id}.webp"),
+            legacy_path(id, created_at + TimeDelta::days(1)),
+        ] {
+            assert!(
+                matches!(
+                    checked_path(id, created_at, &stored),
+                    Err(StoreError::Encoding { .. })
+                ),
+                "{stored}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_name_the_readers_would_refuse_is_refused_before_anything_is_written() {
+        let (dir, mut conn, root) = database();
+        let id = ulid::Ulid::generate();
+        let taken_at = at(2026, 7, 30);
+        insert_observation(&conn, id, taken_at);
+
+        for relative in [
+            name(ulid::Ulid::generate(), taken_at),
+            format!("../2026/07/30/123456_escaped_{id}.webp"),
+        ] {
+            let error = save(
+                &mut conn,
+                &root,
+                id,
+                &relative,
+                &pixels(60),
+                WIDTH,
+                HEIGHT,
+                75.0,
+                taken_at,
+            )
+            .expect_err("the name should be refused");
+            assert!(matches!(error, StoreError::Encoding { .. }), "{error:?}");
+        }
+        assert!(!root.exists());
+        assert!(!dir.path().join("2026").exists());
+    }
+
+    #[test]
+    fn a_legacy_row_and_its_file_are_still_deleted() {
+        let (_dir, mut conn, root) = database();
+        let relative = register_row(&conn, 1, at(2026, 7, 30));
+        let path = root.join(&relative);
+        std::fs::create_dir_all(
+            path.parent()
+                .expect("the legacy image should have a parent"),
+        )
+        .expect("the legacy image directory should be creatable");
+        std::fs::write(&path, b"a legacy image").expect("the legacy image should be writable");
+
+        let outcome =
+            delete(&mut conn, &root, ulid::Ulid::from(1u128)).expect("the legacy row should go");
+
+        assert_eq!(outcome, DeleteOutcome::Removed);
+        assert!(!path.exists());
     }
 }
