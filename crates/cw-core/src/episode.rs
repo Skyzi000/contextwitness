@@ -136,8 +136,7 @@ pub fn build_episode(
         let mut entry_line = observation
             .observed_at
             .with_timezone(&render_offset)
-            .format("%H:%M:%S")
-            .to_string();
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         if let Some(process) = &screen.foreground_process {
             entry_line.push_str(" [");
             entry_line.push_str(process);
@@ -474,13 +473,13 @@ mod tests {
         )
         .expect("the golden observations should build an episode");
         let golden = r#"[2026-07-25T01:00:00+09:00 - 2026-07-25T01:05:00+09:00] Screen episode
-01:00:02 [firefox.exe] Example Page
+2026-07-25T01:00:02+09:00 [firefox.exe] Example Page
   line one
   line two
-01:00:30
-01:01:14 [Code.exe] contextwitness - Visual Studio Code
+2026-07-25T01:00:30+09:00
+2026-07-25T01:01:14+09:00 [Code.exe] contextwitness - Visual Studio Code
   fn main() {}
-01:02:00 [Code.exe] contextwitness - Visual Studio Code
+2026-07-25T01:02:00+09:00 [Code.exe] contextwitness - Visual Studio Code
   [OCR failed: engine unavailable]"#;
 
         assert_eq!(episode.content, golden);
@@ -951,9 +950,9 @@ mod tests {
 
         assert_eq!(episode.metadata.entry_count, "1");
         assert_eq!(episode.metadata.image_paths, "[\"images/a.webp\"]");
-        assert!(episode.content.contains("\n16:00:01"));
-        assert!(!episode.content.contains("\n16:00:02"));
-        assert!(!episode.content.contains("\n16:00:03"));
+        assert!(episode.content.contains("\n2026-07-24T16:00:01Z"));
+        assert!(!episode.content.contains("\n2026-07-24T16:00:02Z"));
+        assert!(!episode.content.contains("\n2026-07-24T16:00:03Z"));
     }
 
     #[test]
