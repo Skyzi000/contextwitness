@@ -918,8 +918,8 @@ fn decode_image_path(
 mod tests {
     use super::{
         BATCH, Batch, DeleteOutcome, MAX_PAGES, RowScan, SCANNER_CURSOR, SCANNER_HIGH_WATER, Walk,
-        checked_path, delete, legacy_path, relative_path, sanitize, save, scan_orphan_rows,
-        sweep_batch, sweep_orphan_files,
+        checked_path, delete, legacy_path, relative_path, sanitize, save, save_with_observation,
+        scan_orphan_rows, sweep_batch, sweep_orphan_files,
     };
     use crate::{StoreError, db, observations, timestamp};
     use chrono::{DateTime, FixedOffset, TimeDelta, TimeZone, Utc};
@@ -998,6 +998,11 @@ mod tests {
     }
 
     fn insert_observation(conn: &rusqlite::Connection, id: ulid::Ulid, observed_at: DateTime<Utc>) {
+        observations::insert(conn, &observation(id, observed_at))
+            .expect("the image's observation should be stored");
+    }
+
+    fn observation(id: ulid::Ulid, observed_at: DateTime<Utc>) -> Observation {
         let mut observation = Observation::new_screen(
             ScreenPayload {
                 width: WIDTH,
@@ -1013,7 +1018,7 @@ mod tests {
             observed_at,
         );
         observation.id = id;
-        observations::insert(conn, &observation).expect("the image's observation should be stored");
+        observation
     }
 
     fn pixels(seed: u8) -> Vec<u8> {
@@ -1140,6 +1145,44 @@ mod tests {
             created_at,
             timestamp::to_sql(taken_at).expect("the test timestamp should be spellable")
         );
+    }
+
+    #[test]
+    fn an_image_past_max_path_is_saved_with_its_observation() {
+        let (dir, mut conn, _) = database();
+        let root = dir.path().join("r".repeat(200)).join("images");
+        let id = ulid::Ulid::generate();
+        let taken_at = at(2026, 7, 30);
+        let relative = name(id, taken_at);
+        assert!(root.join(&relative).as_os_str().len() > 260);
+
+        save_with_observation(
+            &mut conn,
+            &root,
+            &observation(id, taken_at),
+            &relative,
+            &pixels(10),
+            WIDTH,
+            HEIGHT,
+            75.0,
+            taken_at,
+        )
+        .expect("a long image path should be saved");
+
+        assert!(
+            observations::find_by_id(&conn, id)
+                .expect("the observation should be readable")
+                .is_some()
+        );
+        let stored_path: String = conn
+            .query_one(
+                "SELECT relative_path FROM images WHERE observation_id = ?1",
+                [id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("the image row should be readable");
+        assert_eq!(stored_path, relative);
+        assert!(root.join(&relative).is_file());
     }
 
     #[test]

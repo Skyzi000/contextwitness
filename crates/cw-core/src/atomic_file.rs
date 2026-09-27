@@ -107,7 +107,7 @@ pub fn rename_without_replacing(
     file: &std::fs::File,
     destination: &std::path::Path,
 ) -> std::io::Result<bool> {
-    use std::os::windows::{ffi::OsStrExt, io::AsRawHandle};
+    use std::os::windows::io::AsRawHandle;
     use windows::Win32::{
         Foundation::{ERROR_ALREADY_EXISTS, HANDLE},
         Storage::FileSystem::{FILE_RENAME_INFO, FileRenameInfo, SetFileInformationByHandle},
@@ -119,8 +119,7 @@ pub fn rename_without_replacing(
     // `MoveFileExW` with no flags would refuse a taken destination too; what renaming by handle
     // adds is that it moves the file this call opened, rather than whatever its source name has
     // come to mean by now. Works on exFAT as well as NTFS.
-    let destination = std::path::absolute(destination)?;
-    let destination: Vec<u16> = destination.as_os_str().encode_wide().collect();
+    let destination = extended_length(&std::path::absolute(destination)?);
     let name_bytes = destination.len() * std::mem::size_of::<u16>();
     let mut buf = vec![0u64; (std::mem::size_of::<FILE_RENAME_INFO>() + name_bytes).div_ceil(8)];
     let result = unsafe {
@@ -146,6 +145,23 @@ pub fn rename_without_replacing(
         Ok(()) => Ok(true),
         Err(error) if error.code() == already_exists => Ok(false),
         Err(error) => Err(io_error(error)),
+    }
+}
+
+/// An absolute `path` in the `\\?\` form, the one Win32 takes past MAX_PATH. The standard library
+/// adds it to the paths it passes itself, but not to a name inside a `FILE_RENAME_INFO`.
+fn extended_length(path: &std::path::Path) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::{Component, Prefix};
+
+    let wide = path.as_os_str().encode_wide();
+    match path.components().next() {
+        Some(Component::Prefix(prefix)) => match prefix.kind() {
+            Prefix::Disk(_) => r"\\?\".encode_utf16().chain(wide).collect(),
+            Prefix::UNC(..) => r"\\?\UNC".encode_utf16().chain(wide.skip(1)).collect(),
+            _ => wide.collect(),
+        },
+        _ => wide.collect(),
     }
 }
 
@@ -342,6 +358,23 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&temp_dir).expect("the rename test directory should be removable");
+    }
+
+    #[test]
+    fn drive_and_share_paths_get_the_extended_length_prefix_and_prefixed_ones_keep_theirs() {
+        for (path, expected) in [
+            (r"C:\data\a.webp", r"\\?\C:\data\a.webp"),
+            (r"\\server\share\a.webp", r"\\?\UNC\server\share\a.webp"),
+            (r"\\?\C:\data\a.webp", r"\\?\C:\data\a.webp"),
+            (
+                r"\\?\UNC\server\share\a.webp",
+                r"\\?\UNC\server\share\a.webp",
+            ),
+        ] {
+            let spelled = String::from_utf16(&extended_length(std::path::Path::new(path)))
+                .expect("the test path should be valid UTF-16");
+            assert_eq!(spelled, expected);
+        }
     }
 
     #[test]
