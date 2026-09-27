@@ -176,12 +176,24 @@ fn daemon() -> ! {
 /// however the process dies, which is why the claim is a mutex and not a lock file — there is no
 /// stale lock to recognize and clean up after a crash.
 fn claim_single_instance() {
-    let name = windows::core::HSTRING::from(INSTANCE_MUTEX);
-    let _held = unsafe { CreateMutexW(None, false, &name) };
-    if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
-        eprintln!("contextwitness is already running in this session.");
-        std::process::exit(1);
+    match claim_mutex(INSTANCE_MUTEX) {
+        Ok(true) => {}
+        Ok(false) => {
+            eprintln!("contextwitness is already running in this session.");
+            std::process::exit(1);
+        }
+        Err(error) => {
+            eprintln!("contextwitness could not claim its single-instance mutex: {error}");
+            std::process::exit(1);
+        }
     }
+}
+
+/// `Ok(false)` when a mutex of that name already exists.
+fn claim_mutex(name: &str) -> windows::core::Result<bool> {
+    let name = windows::core::HSTRING::from(name);
+    let _held = unsafe { CreateMutexW(None, false, &name) }?;
+    Ok(unsafe { GetLastError() } != ERROR_ALREADY_EXISTS)
 }
 
 /// Whether this call wrote the default config, the config itself, and the directory it names.
@@ -765,9 +777,37 @@ impl Drop for EchoOff {
 
 #[cfg(test)]
 mod tests {
-    use super::{closing_report, last_error_line};
+    use super::{claim_mutex, closing_report, last_error_line};
     use crate::capture::{SaveFailure, Stored};
     use cw_store::outbox::NewestError;
+
+    #[test]
+    fn a_mutex_name_is_claimed_once() {
+        let name = format!(
+            "Local\\ContextWitness-test-claim-{}",
+            ulid::Ulid::generate()
+        );
+        assert!(claim_mutex(&name).expect("a fresh name should be claimable"));
+        assert!(!claim_mutex(&name).expect("a taken name should be reported, not fail"));
+    }
+
+    #[test]
+    fn a_mutex_name_held_by_another_kind_of_object_is_a_failure() {
+        let name = format!(
+            "Local\\ContextWitness-test-event-{}",
+            ulid::Ulid::generate()
+        );
+        let _event = unsafe {
+            windows::Win32::System::Threading::CreateEventW(
+                None,
+                false,
+                false,
+                &windows::core::HSTRING::from(&name),
+            )
+        }
+        .expect("the squatting event should be creatable");
+        assert!(claim_mutex(&name).is_err());
+    }
 
     #[test]
     fn the_last_error_line_names_the_failure_and_the_backlog() {
