@@ -5,7 +5,7 @@ use cw_core::privacy::CaptureDecision;
 use cw_store::control::{ControlEvent, EventKind, HealthKey};
 use tracing::{debug, error, info, warn};
 
-/// `last_tick_at` is written at most this often (design §7): a stale mark only ever holds
+/// `last_tick_at` is written at most this often: a stale mark only ever holds
 /// episode closure back, never moves it ahead.
 const HEALTH_TICK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 

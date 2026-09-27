@@ -211,7 +211,7 @@ fn refuse_before_logging(message: &str) -> ! {
     std::process::exit(1);
 }
 
-/// A panicking worker takes the whole process with it (plan Task 25). Left to itself that thread
+/// A panicking worker takes the whole process with it. Left to itself that thread
 /// dies alone and leaves a daemon that still holds its tray icon and captures nothing; falling over
 /// is visible, and autostart brings it back at the next logon.
 fn install_panic_hook() {

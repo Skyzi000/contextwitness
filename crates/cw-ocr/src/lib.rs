@@ -14,7 +14,7 @@ pub struct OcrOutcome {
     pub langs: Vec<String>,
 }
 
-/// The OCR boundary (design §11): the daemon reads text through this and nothing else, so a
+/// The OCR boundary: the daemon reads text through this and nothing else, so a
 /// different backend is a new implementor, not a new call site.
 pub trait OcrEngine {
     /// Recognize text in a tightly packed BGRA8 frame. Never panics; failures come back as

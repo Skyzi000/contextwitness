@@ -1,7 +1,7 @@
 use crate::{StoreError, timestamp};
 
 /// The first retry waits this long, and every further one waits twice its predecessor up to
-/// [`MAX_DELAY_SECONDS`] (plan Task 20).
+/// [`MAX_DELAY_SECONDS`].
 const FIRST_DELAY_SECONDS: i64 = 30;
 const MAX_DELAY_SECONDS: i64 = 900;
 

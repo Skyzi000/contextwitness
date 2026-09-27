@@ -28,7 +28,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// every delivery.
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
 /// How much of a server reply travels into an error message: the server's stated reason is the
-/// diagnosis and must reach the operator (owner ruling 2026-08-22), bounded so a refusal that
+/// diagnosis and must reach the operator, bounded so a refusal that
 /// quotes the submission back cannot flood a log line.
 const BODY_EXCERPT_BYTES: usize = 2048;
 

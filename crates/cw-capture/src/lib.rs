@@ -159,7 +159,7 @@ pub struct Foreground {
 /// Ask for PER_MONITOR_AWARE_V2 and answer whether the process actually has it. The setter's own
 /// result is not the answer: it fails with ERROR_ACCESS_DENIED when awareness was already set (a
 /// manifest, an AppCompat shim), and that state may still be the right one. Without V2, Windows
-/// virtualizes every DPI read, silently (design §3.2) — the caller decides whether to keep going
+/// virtualizes every DPI read, silently — the caller decides whether to keep going
 /// on a `false`.
 pub fn make_dpi_aware() -> bool {
     unsafe {

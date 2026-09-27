@@ -1,7 +1,6 @@
 use cw_core::config::{Config, DataPaths};
 use tracing::{error, info, warn};
 
-/// Plan Task 21's hourly maintenance cadence.
 const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 /// The cadence taken instead while a pass has work it did not reach.
 const SHORT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);

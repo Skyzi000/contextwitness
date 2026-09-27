@@ -5,7 +5,7 @@ use tracing::{debug, error, info};
 /// The source `cw_core::episode::build_episode` stamps on what it builds. Spelled here because
 /// `latest_end` is asked per source and cw-core does not export the constant.
 const SOURCE: &str = "screen";
-/// A window is only built this long after it closed (plan Task 21): the tick that observed its
+/// A window is only built this long after it closed: the tick that observed its
 /// last instants may still be writing them, and an episode is a snapshot that is not rebuilt.
 /// `close_due` subtracts it from two clocks — the wall clock, and the writer's last tick — since
 /// only the second of them stops when the writer does.
