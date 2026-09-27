@@ -123,7 +123,7 @@ fn daemon() -> ! {
 
     if !dpi_aware {
         error!(
-            "the process could not become PER_MONITOR_AWARE_V2, and capture would be silently degraded"
+            "the process could not become PER_MONITOR_AWARE_V2, and capture may be silently degraded"
         );
         drop(logging);
         std::process::exit(1);
@@ -398,7 +398,7 @@ fn set_autostart(action: &AutostartAction) -> Result<(), Failure> {
 fn capture_once() -> Result<(), Failure> {
     if !cw_capture::make_dpi_aware() {
         return Err(Failure::from(
-            "the process could not become PER_MONITOR_AWARE_V2, so capture would be silently degraded",
+            "the process could not become PER_MONITOR_AWARE_V2, so capture may be silently degraded",
         ));
     }
     cw_ocr::init_runtime();
