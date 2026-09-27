@@ -78,11 +78,24 @@ fn recognize_inner(
         .Lines()
         .map_err(|error| format!("reading recognized lines failed: {error}"))?
     {
-        lines.push(
-            line.Text()
-                .map_err(|error| format!("reading a recognized line failed: {error}"))?
-                .to_string(),
-        );
+        let words = line
+            .Words()
+            .and_then(|words| {
+                words
+                    .into_iter()
+                    .map(|word| {
+                        let rect = word.BoundingRect()?;
+                        Ok(Word {
+                            text: word.Text()?.to_string(),
+                            left: rect.X,
+                            right: rect.X + rect.Width,
+                            height: rect.Height,
+                        })
+                    })
+                    .collect::<windows::core::Result<Vec<_>>>()
+            })
+            .map_err(|error| format!("reading a recognized line failed: {error}"))?;
+        lines.push(join_words(&words));
     }
     let text = lines.join("\n");
     if text.trim().is_empty() {
@@ -100,6 +113,48 @@ fn recognize_inner(
             langs,
         })
     }
+}
+
+struct Word {
+    text: String,
+    left: f32,
+    right: f32,
+    height: f32,
+}
+
+const WIDE_GAP_IN_WORD_HEIGHTS: f32 = 1.0;
+
+/// Windows OCR returns every CJK character as a word of its own, and `OcrLine::Text` puts a space
+/// between every two words.
+fn join_words(words: &[Word]) -> String {
+    let mut heights: Vec<f32> = words.iter().map(|word| word.height).collect();
+    heights.sort_by(f32::total_cmp);
+    let wide_gap =
+        heights.get(heights.len() / 2).copied().unwrap_or_default() * WIDE_GAP_IN_WORD_HEIGHTS;
+
+    let mut text = String::new();
+    let mut previous: Option<&Word> = None;
+    for word in words {
+        if let Some(previous) = previous {
+            let touches_cjk = previous.text.chars().next_back().is_some_and(is_cjk)
+                || word.text.chars().next().is_some_and(is_cjk);
+            if !touches_cjk || word.left - previous.right >= wide_gap {
+                text.push(' ');
+            }
+        }
+        text.push_str(&word.text);
+        previous = Some(word);
+    }
+    text
+}
+
+fn is_cjk(c: char) -> bool {
+    matches!(c,
+        '\u{2E80}'..='\u{9FFF}'
+        | '\u{F900}'..='\u{FAFF}'
+        | '\u{FE30}'..='\u{FE4F}'
+        | '\u{FF00}'..='\u{FFEF}'
+        | '\u{20000}'..='\u{3FFFF}')
 }
 
 /// First configured language that Windows actually ships an OCR engine for, falling back to the
@@ -129,4 +184,101 @@ fn shrink(bgra: &[u8], width: u32, height: u32, max: u32) -> Result<(Vec<u8>, u3
         image::imageops::FilterType::Triangle,
     );
     Ok((resized.into_raw(), new_width, new_height))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `(text, gap before it, width)`, laid out left to right at height 20.
+    type Laid = (&'static str, f32, f32);
+
+    fn line(words: &[Laid]) -> Vec<Word> {
+        let mut right = 0.0;
+        words
+            .iter()
+            .map(|&(text, gap, width)| {
+                let left = right + gap;
+                right = left + width;
+                Word {
+                    text: text.to_owned(),
+                    left,
+                    right,
+                    height: 20.0,
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn joins_words_the_way_the_text_was_set() {
+        let cases: &[(&[Laid], &str)] = &[
+            (
+                &[
+                    ("カ", 0.0, 18.0),
+                    ("タ", 2.0, 18.0),
+                    ("カ", 3.0, 18.0),
+                    ("ナ", 2.0, 18.0),
+                ],
+                "カタカナ",
+            ),
+            (
+                &[
+                    ("example.com", 0.0, 90.0),
+                    ("の", 1.0, 18.0),
+                    ("話", 2.0, 18.0),
+                ],
+                "example.comの話",
+            ),
+            (
+                &[
+                    ("2026", 0.0, 40.0),
+                    ("年", 1.0, 18.0),
+                    ("9", 1.0, 10.0),
+                    ("月", 1.0, 18.0),
+                ],
+                "2026年9月",
+            ),
+            (
+                &[
+                    ("「", 0.0, 8.0),
+                    ("保", 10.0, 18.0),
+                    ("存", 2.0, 18.0),
+                    ("」", 2.0, 8.0),
+                ],
+                "「保存」",
+            ),
+            (
+                &[
+                    ("保", 0.0, 18.0),
+                    ("存", 2.0, 18.0),
+                    ("キ", 40.0, 18.0),
+                    ("ャ", 2.0, 14.0),
+                ],
+                "保存 キャ",
+            ),
+            (&[("」", 0.0, 8.0), ("「", 60.0, 8.0)], "」 「"),
+            (
+                &[("Hello,", 0.0, 50.0), ("world", 6.0, 50.0)],
+                "Hello, world",
+            ),
+            (&[("単", 0.0, 18.0)], "単"),
+            (&[], ""),
+        ];
+        for &(words, expected) in cases {
+            assert_eq!(join_words(&line(words)), expected, "{words:?}");
+        }
+    }
+
+    #[test]
+    fn a_space_starts_at_a_gap_of_one_word_height() {
+        assert_eq!(
+            join_words(&line(&[("保", 0.0, 18.0), ("存", 19.9, 18.0)])),
+            "保存"
+        );
+        assert_eq!(
+            join_words(&line(&[("保", 0.0, 18.0), ("存", 20.0, 18.0)])),
+            "保 存"
+        );
+    }
 }
