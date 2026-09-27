@@ -122,23 +122,28 @@ struct Word {
     height: f32,
 }
 
-const WIDE_GAP_IN_WORD_HEIGHTS: f32 = 1.0;
+const CJK_SPACE_GAP_IN_WORD_HEIGHTS: f32 = 1.0;
+const MIXED_SPACE_GAP_IN_WORD_HEIGHTS: f32 = 0.25;
 
-/// Windows OCR returns every CJK character as a word of its own, and `OcrLine::Text` puts a space
-/// between every two words.
 fn join_words(words: &[Word]) -> String {
     let mut heights: Vec<f32> = words.iter().map(|word| word.height).collect();
     heights.sort_by(f32::total_cmp);
-    let wide_gap =
-        heights.get(heights.len() / 2).copied().unwrap_or_default() * WIDE_GAP_IN_WORD_HEIGHTS;
+    let word_height = heights.get(heights.len() / 2).copied().unwrap_or_default();
 
     let mut text = String::new();
     let mut previous: Option<&Word> = None;
     for word in words {
         if let Some(previous) = previous {
-            let touches_cjk = previous.text.chars().next_back().is_some_and(is_cjk)
-                || word.text.chars().next().is_some_and(is_cjk);
-            if !touches_cjk || word.left - previous.right >= wide_gap {
+            let gap = word.left - previous.right;
+            let spaced = match (
+                previous.text.chars().next_back().is_some_and(is_cjk),
+                word.text.chars().next().is_some_and(is_cjk),
+            ) {
+                (true, true) => gap >= word_height * CJK_SPACE_GAP_IN_WORD_HEIGHTS,
+                (false, false) => true,
+                _ => gap >= word_height * MIXED_SPACE_GAP_IN_WORD_HEIGHTS,
+            };
+            if spaced {
                 text.push(' ');
             }
         }
@@ -259,6 +264,24 @@ mod tests {
             ),
             (&[("」", 0.0, 8.0), ("「", 60.0, 8.0)], "」 「"),
             (
+                &[
+                    ("mkdir", 0.0, 50.0),
+                    ("テ", 7.0, 18.0),
+                    ("ス", 2.0, 18.0),
+                    ("ト", 2.0, 18.0),
+                ],
+                "mkdir テスト",
+            ),
+            (
+                &[
+                    ("--author=", 0.0, 80.0),
+                    ("山", 2.0, 18.0),
+                    ("田", 2.0, 18.0),
+                    ("--oneline", 7.0, 80.0),
+                ],
+                "--author=山田 --oneline",
+            ),
+            (
                 &[("Hello,", 0.0, 50.0), ("world", 6.0, 50.0)],
                 "Hello, world",
             ),
@@ -279,6 +302,18 @@ mod tests {
         assert_eq!(
             join_words(&line(&[("保", 0.0, 18.0), ("存", 20.0, 18.0)])),
             "保 存"
+        );
+    }
+
+    #[test]
+    fn a_space_between_cjk_and_other_text_starts_at_a_quarter_word_height() {
+        assert_eq!(
+            join_words(&line(&[("API", 0.0, 30.0), ("キ", 4.9, 18.0)])),
+            "APIキ"
+        );
+        assert_eq!(
+            join_words(&line(&[("API", 0.0, 30.0), ("キ", 5.0, 18.0)])),
+            "API キ"
         );
     }
 }
