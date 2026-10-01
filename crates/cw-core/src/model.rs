@@ -43,6 +43,38 @@ pub struct Observation {
     pub payload: SourcePayload,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureState {
+    Paused,
+    Excluded,
+    NoTarget,
+    CaptureFailed,
+    NoNewFrame,
+    Unchanged,
+    SaveFailed,
+    /// Nothing was recorded from `start_at`, the last record before the gap, to `end_at`, the first
+    /// record after it.
+    Unrecorded,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaptureStatus {
+    pub state: CaptureState,
+    pub process: Option<String>,
+    pub title: Option<String>,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateSpan {
+    pub id: ulid::Ulid,
+    pub status: CaptureStatus,
+    pub start_at: chrono::DateTime<chrono::Utc>,
+    /// Start of the last tick that saw `status`, inclusive; for `Unrecorded`, the first record after
+    /// the gap.
+    pub end_at: chrono::DateTime<chrono::Utc>,
+}
+
 impl SourcePayload {
     /// "screen" for Screen; the stored source string for Unknown.
     pub fn kind(&self) -> &str {

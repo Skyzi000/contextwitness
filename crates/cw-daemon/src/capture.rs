@@ -1,13 +1,11 @@
 use cw_core::change::{Thumbnail, frame_changed};
 use cw_core::config::{Config, DataPaths};
-use cw_core::model::{Observation, OcrStatus, ScreenPayload, SourcePayload};
+use cw_core::model::{
+    CaptureState, CaptureStatus, Observation, OcrStatus, ScreenPayload, SourcePayload, StateSpan,
+};
 use cw_core::privacy::CaptureDecision;
 use cw_store::control::{ControlEvent, EventKind, HealthKey};
 use tracing::{debug, error, info, warn};
-
-/// `last_tick_at` is written at most this often: a stale mark only ever holds
-/// episode closure back, never moves it ahead.
-const HEALTH_TICK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Run the capture loop on this thread until the process ends.
 pub fn run(
@@ -19,9 +17,9 @@ pub fn run(
 ) -> ! {
     let interval = std::time::Duration::from_secs(config.capture.interval_secs);
     let mut subject = Subject::default();
-    let mut health_written: Option<std::time::Instant> = None;
     let mut save_failed: Option<SaveFailure> = None;
     let mut last_failure: Option<String> = None;
+    let mut recorder = Recorder::default();
 
     loop {
         let started = std::time::Instant::now();
@@ -32,7 +30,7 @@ pub fn run(
             &paths,
             &config,
             &mut subject,
-            &mut health_written,
+            &mut recorder,
             &mut save_failed,
         ) {
             Ok(()) => last_failure = None,
@@ -41,6 +39,7 @@ pub fn run(
                 // gate, and failing open shows a screen the gate may have been refusing.
                 capture.discard_pending();
                 subject.aim(None);
+                recorder.open = None;
                 // The same failure repeating every tick is one line of news, not one line per
                 // tick.
                 let message = error.to_string();
@@ -75,10 +74,11 @@ fn tick(
     paths: &DataPaths,
     config: &Config,
     subject: &mut Subject,
-    health_written: &mut Option<std::time::Instant>,
+    recorder: &mut Recorder,
     save_failed: &mut Option<SaveFailure>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let started = chrono::Utc::now();
+    let interval = std::time::Duration::from_secs(config.capture.interval_secs);
 
     if let Some(pause) = cw_store::control::get_pause(conn)? {
         let paused = match pause {
@@ -88,7 +88,13 @@ fn tick(
         if paused {
             capture.discard_pending();
             subject.aim(None);
-            mark_tick(conn, health_written, started)?;
+            let status = CaptureStatus {
+                state: CaptureState::Paused,
+                process: None,
+                title: None,
+                detail: None,
+            };
+            recorder.record(conn, started, Some(status), interval)?;
             debug!("capture is paused");
             return Ok(());
         }
@@ -105,7 +111,7 @@ fn tick(
         save_failed,
         &mut stored,
     );
-    report_then_finish(outcome, stored.as_ref(), |frame| {
+    let status = report_then_finish(outcome, stored.as_ref(), |frame| {
         info!(
             width = frame.width,
             height = frame.height,
@@ -115,10 +121,10 @@ fn tick(
             "stored frame"
         );
     })?;
-
-    // When this mark becomes readable, every shot the pass pulled has been stored or refused. An
-    // error return skips the mark, which stalls the closer — the safe direction.
-    mark_tick(conn, health_written, started)?;
+    // When the tick mark this writes becomes readable, every shot the pass pulled has been stored
+    // or refused and the tick's state recorded. An error return skips the mark, which stalls the
+    // closer — the safe direction.
+    recorder.record(conn, started, status, interval)?;
 
     Ok(())
 }
@@ -128,7 +134,8 @@ fn tick(
 /// here — `tick` owns that, and `capture-once` is a user asking for this pass in particular.
 /// `save_failed` holds the last save failure reported, so a failure that repeats is only news the
 /// first time. `stored` receives the frame as it lands, so an error return leaves the report of
-/// the store in the caller's hands rather than taking it down with the pass.
+/// the store in the caller's hands rather than taking it down with the pass. Answers `None` when a
+/// frame was stored, and otherwise what the pass saw instead.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn pass(
     capture: &mut cw_capture::CaptureEngine,
@@ -139,8 +146,14 @@ pub(crate) fn pass(
     subject: &mut Subject,
     save_failed: &mut Option<SaveFailure>,
     stored: &mut Option<Stored>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<Option<CaptureStatus>, Box<dyn std::error::Error>> {
     let foreground = cw_capture::foreground();
+    let saw = |state, detail| CaptureStatus {
+        state,
+        process: foreground.process.clone(),
+        title: foreground.title.clone(),
+        detail,
+    };
     let skip_detail = match cw_core::privacy::decide_capture(
         foreground.process.as_deref(),
         &config.privacy.process_blacklist,
@@ -159,17 +172,22 @@ pub(crate) fn pass(
                 id: ulid::Ulid::generate(),
                 kind: EventKind::BlacklistSkip,
                 at: chrono::Utc::now(),
-                detail: Some(detail),
+                detail: Some(detail.clone()),
             },
         )?;
         debug!("tick skipped by the privacy gate");
-        return Ok(());
+        return Ok(Some(CaptureStatus {
+            state: CaptureState::Excluded,
+            process: None,
+            title: None,
+            detail: Some(detail),
+        }));
     }
 
     let Some(target) = foreground.target else {
         capture.release();
         subject.aim(None);
-        return Ok(());
+        return Ok(Some(saw(CaptureState::NoTarget, None)));
     };
     subject.aim(Some(target));
     let frame = match capture.capture(target) {
@@ -181,14 +199,19 @@ pub(crate) fn pass(
             if subject.failed(&error) {
                 warn!("capture failed: {error}");
             }
-            return Ok(());
+            return Ok(Some(match error {
+                cw_capture::CaptureError::Recoverable(cw_capture::Recoverable::NoNewFrame) => {
+                    saw(CaptureState::NoNewFrame, None)
+                }
+                error => saw(CaptureState::CaptureFailed, Some(error.to_string())),
+            }));
         }
     };
 
     let rgba = bgra_to_rgba(&frame.bgra);
     let thumbnail = Thumbnail::from_rgba(&rgba, frame.width, frame.height, frame.dpi_scale)?;
     if !frame_changed(subject.baseline.as_ref(), &thumbnail, &config.capture) {
-        return Ok(());
+        return Ok(Some(saw(CaptureState::Unchanged, None)));
     }
 
     let ocr = ocr.recognize(
@@ -207,8 +230,8 @@ pub(crate) fn pass(
         ocr_error: ocr.error,
         ocr_text: ocr.text,
         ocr_langs: ocr.langs,
-        foreground_process: foreground.process,
-        foreground_window_title: foreground.title,
+        foreground_process: foreground.process.clone(),
+        foreground_window_title: foreground.title.clone(),
     };
     let mut observation = Observation::new_screen(payload, captured_at);
     let offset =
@@ -226,6 +249,7 @@ pub(crate) fn pass(
         payload.image_path = Some(format!("images/{relative_path}"));
     }
     let rgb = bgra_to_rgb(&frame.bgra);
+    let longest_wait = longest_wait(std::time::Duration::from_secs(config.capture.interval_secs))?;
     match cw_store::images::save_with_observation(
         conn,
         &paths.images(),
@@ -236,6 +260,7 @@ pub(crate) fn pass(
         frame.height,
         f32::from(config.capture.webp_quality),
         captured_at,
+        |conn| cw_store::capture_states::mark_recorded(conn, captured_at, longest_wait),
     ) {
         Ok(()) => *save_failed = None,
         Err(error) => {
@@ -243,11 +268,11 @@ pub(crate) fn pass(
             if save_failed.as_ref().is_none_or(|last| last.key != key) {
                 error!("failed to store frame: {error}");
                 *save_failed = Some(SaveFailure {
-                    key,
+                    key: key.clone(),
                     message: error.to_string(),
                 });
             }
-            return Ok(());
+            return Ok(Some(saw(CaptureState::SaveFailed, Some(key))));
         }
     }
     subject.baseline = Some(thumbnail);
@@ -260,20 +285,82 @@ pub(crate) fn pass(
     });
     cw_store::control::advance_health(conn, HealthKey::LastCapture, captured_at)?;
 
-    Ok(())
+    Ok(None)
 }
 
 /// Hands every stored frame to `report` before the outcome may leave, so a failing pass cannot
 /// take the report of its stores down with it.
 pub(crate) fn report_then_finish(
-    outcome: Result<(), Box<dyn std::error::Error>>,
+    outcome: Result<Option<CaptureStatus>, Box<dyn std::error::Error>>,
     stored: Option<&Stored>,
     report: impl FnOnce(&Stored),
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<Option<CaptureStatus>, Box<dyn std::error::Error>> {
     if let Some(frame) = stored {
         report(frame);
     }
     outcome
+}
+
+/// The longest stretch between two records that is not written as one with nothing recorded.
+fn longest_wait(
+    interval: std::time::Duration,
+) -> Result<chrono::TimeDelta, chrono::OutOfRangeError> {
+    chrono::TimeDelta::from_std(interval * 2)
+}
+
+/// The capture-state span still open.
+#[derive(Default)]
+struct Recorder {
+    open: Option<(ulid::Ulid, CaptureStatus)>,
+}
+
+impl Recorder {
+    /// Record the tick that started at `started` and stored a frame, or stored none for the reason
+    /// `status` gives, and mark it as the last tick. A frame accounts for the gap before it as it is
+    /// saved; a tick that stored none accounts for the gap before its start here. The store and
+    /// this recorder change together or not at all.
+    fn record(
+        &mut self,
+        conn: &mut rusqlite::Connection,
+        started: chrono::DateTime<chrono::Utc>,
+        status: Option<CaptureStatus>,
+        interval: std::time::Duration,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let longest_wait = longest_wait(interval)?;
+        let transaction =
+            conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let last_tick = cw_store::control::get_health(&transaction, HealthKey::LastTick)?;
+        if status.is_some() {
+            cw_store::capture_states::mark_recorded(&transaction, started, longest_wait)?;
+        }
+        let unbroken =
+            last_tick.is_some_and(|tick| tick <= started && started - tick <= longest_wait);
+        let open = match (status, self.open.clone()) {
+            (None, _) => None,
+            (Some(status), Some((id, current))) if current == status && unbroken => {
+                cw_store::capture_states::extend(&transaction, id, started)?;
+                Some((id, current))
+            }
+            (Some(status), _) => {
+                let id = ulid::Ulid::generate();
+                cw_store::capture_states::insert(
+                    &transaction,
+                    &StateSpan {
+                        id,
+                        status: status.clone(),
+                        start_at: started,
+                        end_at: started,
+                    },
+                )?;
+                Some((id, status))
+            }
+        };
+        cw_store::control::set_health(&transaction, HealthKey::LastTick, started)?;
+        transaction.commit()?;
+
+        self.open = open;
+        Ok(())
+    }
 }
 
 /// The standing save failure: the spelling repeats are judged by, and the full message
@@ -341,21 +428,6 @@ fn save_failure_key(error: &cw_store::StoreError) -> String {
     }
 }
 
-fn mark_tick(
-    conn: &rusqlite::Connection,
-    health_written: &mut Option<std::time::Instant>,
-    at: chrono::DateTime<chrono::Utc>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let now = std::time::Instant::now();
-    if health_written.is_some_and(|last| now.duration_since(last) < HEALTH_TICK_INTERVAL) {
-        return Ok(());
-    }
-    cw_store::control::set_health(conn, HealthKey::LastTick, at)?;
-    *health_written = Some(now);
-
-    Ok(())
-}
-
 fn bgra_to_rgba(bgra: &[u8]) -> Vec<u8> {
     let mut rgba = bgra.to_vec();
     for pixel in rgba.as_chunks_mut::<4>().0 {
@@ -374,10 +446,479 @@ fn bgra_to_rgb(bgra: &[u8]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Stored, Subject, report_then_finish, save_failure_key};
+    use super::{Recorder, Stored, Subject, report_then_finish, save_failure_key};
+    use chrono::{DateTime, TimeDelta, Utc};
     use cw_capture::{CaptureError, Recoverable, Target};
     use cw_core::change::Thumbnail;
+    use cw_core::model::{CaptureState, CaptureStatus, StateSpan};
     use cw_store::StoreError;
+
+    const INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+    fn database() -> (tempfile::TempDir, rusqlite::Connection) {
+        let dir =
+            tempfile::tempdir().expect("the temporary database directory should be creatable");
+        let conn = cw_store::db::open(&dir.path().join("db.sqlite3"))
+            .expect("the fresh database should initialize");
+        (dir, conn)
+    }
+
+    fn seen(state: CaptureState) -> Option<CaptureStatus> {
+        Some(CaptureStatus {
+            state,
+            process: Some("editor.exe".to_owned()),
+            title: Some("Example Page".to_owned()),
+            detail: None,
+        })
+    }
+
+    fn spans(conn: &rusqlite::Connection) -> Vec<StateSpan> {
+        cw_store::capture_states::overlapping(
+            conn,
+            DateTime::<Utc>::UNIX_EPOCH,
+            Utc::now() + TimeDelta::days(1),
+        )
+        .expect("the spans should be readable")
+    }
+
+    fn bounds(spans: &[StateSpan], state: CaptureState) -> Vec<(DateTime<Utc>, DateTime<Utc>)> {
+        spans
+            .iter()
+            .filter(|span| span.status.state == state)
+            .map(|span| (span.start_at, span.end_at))
+            .collect()
+    }
+
+    #[test]
+    fn an_unchanged_status_extends_its_span() {
+        let (_dir, mut conn) = database();
+        let mut recorder = Recorder::default();
+        let first = Utc::now();
+        let second = first + TimeDelta::seconds(10);
+
+        recorder
+            .record(&mut conn, first, seen(CaptureState::Unchanged), INTERVAL)
+            .expect("the first tick should record");
+        recorder
+            .record(&mut conn, second, seen(CaptureState::Unchanged), INTERVAL)
+            .expect("the second tick should record");
+
+        let spans = spans(&conn);
+        assert_eq!(spans.len(), 1);
+        assert_eq!((spans[0].start_at, spans[0].end_at), (first, second));
+    }
+
+    #[test]
+    fn a_different_status_opens_a_new_span() {
+        let (_dir, mut conn) = database();
+        let mut recorder = Recorder::default();
+        let first = Utc::now();
+        let second = first + TimeDelta::seconds(10);
+        let mut retitled = seen(CaptureState::Unchanged);
+        if let Some(status) = &mut retitled {
+            status.title = Some("Other Page".to_owned());
+        }
+
+        recorder
+            .record(&mut conn, first, seen(CaptureState::Unchanged), INTERVAL)
+            .expect("the first tick should record");
+        recorder
+            .record(&mut conn, second, retitled, INTERVAL)
+            .expect("the second tick should record");
+
+        assert_eq!(
+            bounds(&spans(&conn), CaptureState::Unchanged),
+            [(first, first), (second, second)]
+        );
+    }
+
+    #[test]
+    fn a_stored_frame_closes_the_span() {
+        let (_dir, mut conn) = database();
+        let mut recorder = Recorder::default();
+        let first = Utc::now();
+        let third = first + TimeDelta::seconds(15);
+
+        for (at, status) in [
+            (first, seen(CaptureState::Unchanged)),
+            (first + TimeDelta::seconds(5), None),
+            (third, seen(CaptureState::Unchanged)),
+        ] {
+            recorder
+                .record(&mut conn, at, status, INTERVAL)
+                .expect("the tick should record");
+        }
+
+        assert_eq!(
+            bounds(&spans(&conn), CaptureState::Unchanged),
+            [(first, first), (third, third)]
+        );
+    }
+
+    fn store_frame(conn: &mut rusqlite::Connection, at: DateTime<Utc>) {
+        let frame = cw_core::model::Observation::new_screen(
+            cw_core::model::ScreenPayload {
+                width: 1,
+                height: 1,
+                image_path: None,
+                ocr_status: cw_core::model::OcrStatus::NoText,
+                ocr_error: None,
+                ocr_text: None,
+                ocr_langs: Vec::new(),
+                foreground_process: Some("editor.exe".to_owned()),
+                foreground_window_title: Some("Example Page".to_owned()),
+            },
+            at,
+        );
+        let transaction = conn
+            .transaction()
+            .expect("the frame's transaction should open");
+        cw_store::observations::insert(&transaction, &frame).expect("the frame should be stored");
+        cw_store::capture_states::mark_recorded(
+            &transaction,
+            at,
+            super::longest_wait(INTERVAL).expect("the interval should fit"),
+        )
+        .expect("the frame should account for the gap around it");
+        transaction
+            .commit()
+            .expect("the frame's transaction should commit");
+    }
+
+    #[test]
+    fn a_first_tick_that_stores_still_records_the_stretch_since_the_previous_run() {
+        let (_dir, mut conn) = database();
+        let started = Utc::now();
+        let previous_end = started - TimeDelta::hours(1);
+        cw_store::capture_states::insert(
+            &conn,
+            &StateSpan {
+                id: ulid::Ulid::generate(),
+                status: CaptureStatus {
+                    state: CaptureState::Paused,
+                    process: None,
+                    title: None,
+                    detail: None,
+                },
+                start_at: previous_end - TimeDelta::minutes(1),
+                end_at: previous_end,
+            },
+        )
+        .expect("the earlier run's span should be stored");
+        let frame = started + TimeDelta::seconds(1);
+        store_frame(&mut conn, frame);
+
+        Recorder::default()
+            .record(&mut conn, started, None, INTERVAL)
+            .expect("the first tick should record");
+
+        assert_eq!(
+            bounds(&spans(&conn), CaptureState::Unrecorded),
+            [(previous_end, frame)]
+        );
+    }
+
+    #[test]
+    fn a_tick_that_stalls_before_storing_leaves_the_stall_unrecorded() {
+        let (_dir, mut conn) = database();
+        let mut recorder = Recorder::default();
+        let first = Utc::now();
+        let stalled = first + TimeDelta::seconds(10);
+        let frame = first + TimeDelta::hours(1);
+
+        recorder
+            .record(&mut conn, first, seen(CaptureState::Unchanged), INTERVAL)
+            .expect("the first tick should record");
+        store_frame(&mut conn, frame);
+        recorder
+            .record(&mut conn, stalled, None, INTERVAL)
+            .expect("the stalled tick should record");
+
+        assert_eq!(
+            bounds(&spans(&conn), CaptureState::Unrecorded),
+            [(first, frame)]
+        );
+    }
+
+    #[test]
+    fn a_frame_captured_before_its_tick_started_ends_the_gap_at_the_frame() {
+        let (_dir, mut conn) = database();
+        let mut recorder = Recorder::default();
+        let first = Utc::now();
+        let frame = first + TimeDelta::seconds(3599);
+        let started = first + TimeDelta::hours(1);
+
+        recorder
+            .record(&mut conn, first, seen(CaptureState::Unchanged), INTERVAL)
+            .expect("the first tick should record");
+        store_frame(&mut conn, frame);
+        recorder
+            .record(&mut conn, started, None, INTERVAL)
+            .expect("the storing tick should record");
+
+        assert_eq!(
+            bounds(&spans(&conn), CaptureState::Unrecorded),
+            [(first, frame)]
+        );
+    }
+
+    #[test]
+    fn a_gap_starts_at_the_frame_the_last_tick_stored() {
+        let (_dir, mut conn) = database();
+        let mut recorder = Recorder::default();
+        let first = Utc::now();
+        let frame = first + TimeDelta::seconds(1);
+        let resumed = first + TimeDelta::hours(1);
+
+        store_frame(&mut conn, frame);
+        recorder
+            .record(&mut conn, first, None, INTERVAL)
+            .expect("the storing tick should record");
+        recorder
+            .record(&mut conn, resumed, seen(CaptureState::Unchanged), INTERVAL)
+            .expect("the resumed tick should record");
+
+        assert_eq!(
+            bounds(&spans(&conn), CaptureState::Unrecorded),
+            [(frame, resumed)]
+        );
+    }
+
+    #[test]
+    fn a_late_frame_inside_a_recorded_span_leaves_no_gap() {
+        let (_dir, mut conn) = database();
+        let first = Utc::now();
+        let frame = first + TimeDelta::milliseconds(3_589_999);
+        store_frame(&mut conn, first);
+        cw_store::capture_states::insert(
+            &conn,
+            &StateSpan {
+                id: ulid::Ulid::generate(),
+                status: seen(CaptureState::NoNewFrame).expect("a status"),
+                start_at: first + TimeDelta::seconds(10),
+                end_at: first + TimeDelta::seconds(3590),
+            },
+        )
+        .expect("the recorded span should be stored");
+        store_frame(&mut conn, frame);
+
+        Recorder::default()
+            .record(&mut conn, first + TimeDelta::hours(1), None, INTERVAL)
+            .expect("the storing tick should record");
+
+        assert_eq!(bounds(&spans(&conn), CaptureState::Unrecorded), []);
+    }
+
+    #[test]
+    fn a_late_frame_inside_a_gap_cuts_the_gap_at_the_frame() {
+        let (_dir, mut conn) = database();
+        let mut recorder = Recorder::default();
+        let first = Utc::now();
+        let resumed = first + TimeDelta::hours(1);
+        let frame = resumed - TimeDelta::milliseconds(1);
+
+        for at in [first, resumed] {
+            recorder
+                .record(&mut conn, at, seen(CaptureState::NoNewFrame), INTERVAL)
+                .expect("the tick should record");
+        }
+        store_frame(&mut conn, frame);
+        recorder
+            .record(&mut conn, resumed + TimeDelta::seconds(10), None, INTERVAL)
+            .expect("the storing tick should record");
+
+        assert_eq!(
+            bounds(&spans(&conn), CaptureState::Unrecorded),
+            [(first, frame)]
+        );
+    }
+
+    #[test]
+    fn a_tick_that_stores_a_late_frame_still_counts_as_a_tick_after_a_restart() {
+        let (_dir, mut conn) = database();
+        let mut recorder = Recorder::default();
+        let first = Utc::now();
+        let frame = first - TimeDelta::milliseconds(1);
+
+        recorder
+            .record(&mut conn, first, seen(CaptureState::Unchanged), INTERVAL)
+            .expect("the first tick should record");
+        store_frame(&mut conn, frame);
+        recorder
+            .record(
+                &mut conn,
+                first + TimeDelta::microseconds(10_000_500),
+                None,
+                INTERVAL,
+            )
+            .expect("the storing tick should record");
+        Recorder::default()
+            .record(
+                &mut conn,
+                first + TimeDelta::microseconds(20_001_000),
+                seen(CaptureState::NoNewFrame),
+                INTERVAL,
+            )
+            .expect("the first tick after the restart should record");
+
+        assert_eq!(bounds(&spans(&conn), CaptureState::Unrecorded), []);
+    }
+
+    #[test]
+    fn a_clock_set_back_starts_a_new_span_and_keeps_the_old_one() {
+        let (_dir, mut conn) = database();
+        let mut recorder = Recorder::default();
+        let first = Utc::now();
+        let set_back = first - TimeDelta::minutes(5);
+
+        for at in [first, first + TimeDelta::seconds(10), set_back] {
+            recorder
+                .record(&mut conn, at, seen(CaptureState::Unchanged), INTERVAL)
+                .expect("the tick should record");
+        }
+
+        assert_eq!(
+            bounds(&spans(&conn), CaptureState::Unchanged),
+            [
+                (set_back, set_back),
+                (first, first + TimeDelta::seconds(10))
+            ]
+        );
+    }
+
+    #[test]
+    fn a_frame_keeps_the_gap_before_it_when_its_tick_never_records() {
+        let (_dir, mut conn) = database();
+        let first = Utc::now();
+        let frame = first + TimeDelta::hours(1);
+
+        Recorder::default()
+            .record(&mut conn, first, seen(CaptureState::NoNewFrame), INTERVAL)
+            .expect("the first tick should record");
+        store_frame(&mut conn, frame);
+        Recorder::default()
+            .record(
+                &mut conn,
+                frame + TimeDelta::seconds(10),
+                seen(CaptureState::Unchanged),
+                INTERVAL,
+            )
+            .expect("the next tick should record");
+
+        assert_eq!(
+            bounds(&spans(&conn), CaptureState::Unrecorded),
+            [(first, frame)]
+        );
+    }
+
+    #[test]
+    fn a_status_seen_again_after_a_gap_another_writer_recorded_opens_a_new_span() {
+        let (_dir, mut conn) = database();
+        let mut recorder = Recorder::default();
+        let first = Utc::now();
+        let frame = first + TimeDelta::hours(1);
+        let resumed = frame + TimeDelta::seconds(1);
+
+        recorder
+            .record(&mut conn, first, seen(CaptureState::Unchanged), INTERVAL)
+            .expect("the first tick should record");
+        store_frame(&mut conn, frame);
+        recorder
+            .record(&mut conn, resumed, seen(CaptureState::Unchanged), INTERVAL)
+            .expect("the resumed tick should record");
+
+        let spans = spans(&conn);
+        let stopped = first + TimeDelta::minutes(30);
+        let utc = chrono::FixedOffset::east_opt(0).expect("UTC should be an offset");
+        assert!(cw_core::episode::build_episode(stopped, 5, utc, &[], &spans).is_none());
+        assert_eq!(bounds(&spans, CaptureState::Unrecorded), [(first, frame)]);
+        assert_eq!(
+            bounds(&spans, CaptureState::Unchanged),
+            [(first, first), (resumed, resumed)]
+        );
+    }
+
+    #[test]
+    fn a_frame_whose_tick_failed_to_record_still_ends_the_gap() {
+        let (_dir, mut conn) = database();
+        let mut recorder = Recorder::default();
+        let first = Utc::now();
+        let next = first + TimeDelta::seconds(25);
+
+        recorder
+            .record(&mut conn, first, seen(CaptureState::Unchanged), INTERVAL)
+            .expect("the first tick should record");
+        store_frame(&mut conn, first + TimeDelta::seconds(12));
+        recorder
+            .record(&mut conn, next, seen(CaptureState::Unchanged), INTERVAL)
+            .expect("the next tick should record");
+
+        assert_eq!(bounds(&spans(&conn), CaptureState::Unrecorded), []);
+    }
+
+    #[test]
+    fn a_gap_past_twice_the_interval_is_unrecorded_and_starts_a_new_span() {
+        let (_dir, mut conn) = database();
+        let mut recorder = Recorder::default();
+        let first = Utc::now();
+        let resumed = first + TimeDelta::seconds(30);
+
+        recorder
+            .record(&mut conn, first, seen(CaptureState::Unchanged), INTERVAL)
+            .expect("the first tick should record");
+        recorder
+            .record(&mut conn, resumed, seen(CaptureState::Unchanged), INTERVAL)
+            .expect("the resumed tick should record");
+
+        let spans = spans(&conn);
+        assert_eq!(bounds(&spans, CaptureState::Unrecorded), [(first, resumed)]);
+        assert_eq!(
+            bounds(&spans, CaptureState::Unchanged),
+            [(first, first), (resumed, resumed)]
+        );
+    }
+
+    #[test]
+    fn a_failed_tick_leaves_the_next_status_its_own_span() {
+        let (_dir, mut conn) = database();
+        let mut recorder = Recorder::default();
+        let first = Utc::now();
+        let second = first + TimeDelta::seconds(10);
+
+        recorder
+            .record(&mut conn, first, seen(CaptureState::Unchanged), INTERVAL)
+            .expect("the first tick should record");
+        recorder.open = None;
+        recorder
+            .record(&mut conn, second, seen(CaptureState::Unchanged), INTERVAL)
+            .expect("the tick after the failure should record");
+
+        assert_eq!(
+            bounds(&spans(&conn), CaptureState::Unchanged),
+            [(first, first), (second, second)]
+        );
+    }
+
+    #[test]
+    fn a_record_that_fails_leaves_the_recorder_as_it_was() {
+        let (_dir, mut conn) = database();
+        let mut recorder = Recorder::default();
+        let first = Utc::now();
+
+        recorder
+            .record(&mut conn, first, seen(CaptureState::Unchanged), INTERVAL)
+            .expect("the first tick should record");
+        let open = recorder.open.clone();
+        conn.execute_batch("DROP TABLE capture_states")
+            .expect("the table should drop");
+
+        let second = first + TimeDelta::seconds(10);
+        recorder
+            .record(&mut conn, second, seen(CaptureState::NoTarget), INTERVAL)
+            .expect_err("a record with nowhere to go should fail");
+
+        assert_eq!(recorder.open, open);
+    }
 
     fn stored_frame() -> Stored {
         Stored {
@@ -398,7 +939,7 @@ mod tests {
         });
         assert_eq!(reported, 1);
         assert_eq!(outcome.unwrap_err().to_string(), "refused");
-        assert!(report_then_finish(Ok(()), Some(&stored), |_| {}).is_ok());
+        assert!(report_then_finish(Ok(None), Some(&stored), |_| {}).is_ok());
     }
 
     fn target(hwnd: isize, pid: u32) -> Target {

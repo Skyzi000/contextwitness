@@ -10,7 +10,7 @@ Requires Windows 11 24H2 (build 26100) or later. Building requires the MSVC tool
 
 - Captures the foreground window every few seconds with Windows Graphics Capture, storing a frame only when enough pixels actually changed. Other windows and monitors are not captured; parts of the foreground window that other windows cover are.
 - Extracts on-screen text with the Windows OCR engine, using the first configured language an installed engine exists for (Japanese, then English, by default).
-- Groups captures into episode windows (5 minutes by default) rendered as a time-anchored activity log.
+- Groups captures into episode windows (5 minutes by default) rendered as a time-anchored activity log. The time between stored frames is logged too: no change above the capture threshold, no new frame received, no capturable foreground window, paused, skipped by the blacklist, capture or storage failures with their error text, and stretches with nothing recorded.
 - Stores everything locally first: episodes in SQLite, frames as WebP images with retention limits (14 days / 50 GiB by default).
 - Delivers episodes to Hindsight through a persistent outbox: if the server is down, episodes wait and are delivered when it returns.
 - Runs with a tray icon; `pause`/`resume` from the tray or the command line; optional start at logon.
@@ -61,8 +61,8 @@ Hindsight credentials never live in `config.toml`. `setup` writes them to `%USER
 ContextWitness records the screen. Know what that means before running it:
 
 - **It collects everything by default.** The foreground window is captured whatever it shows, including any parts other windows cover; all text OCR recognizes in it is stored, and each entry records the window's title and process name whenever they can be read.
-- **Everything stays on your machine except delivery to Hindsight.** Episode text — window titles and process names included — and its metadata (episode timing, local image paths) go to the Hindsight server you configured; nothing is sent anywhere else. The captured images themselves are never uploaded.
-- **`privacy.process_blacklist`** skips capture while a listed process (matched by executable name, case-insensitively) is in the foreground. When a blacklist is configured and the foreground process cannot be determined, the tick is skipped rather than risked.
+- **Everything stays on your machine except delivery to Hindsight.** Episode text — window titles, process names and capture status lines with their error text included — and its metadata (episode timing, local image paths) go to the Hindsight server you configured; nothing is sent anywhere else. The captured images themselves are never uploaded.
+- **`privacy.process_blacklist`** skips capture while a listed process (matched by executable name, case-insensitively) is in the foreground; the episode still records the skip and the process name that caused it. When a blacklist is configured and the foreground process cannot be determined, the tick is skipped rather than risked.
 - **Pause** stops the capture loop: from the tray menu, or `contextwitness pause 30m` (no duration means until `resume`).
 - **Retention** prunes stored images by age and total size. Episode text in the local database is kept indefinitely — it is the memory this tool exists to build.
 - **Logs are confidential.** They can contain captured content — window titles, process names, OCR text — for example where delivery diagnostics quote server-returned error text, which can quote a refused episode back. `contextwitness status` reprints the delivery error carried by the newest affected episode; treat its output the same way.

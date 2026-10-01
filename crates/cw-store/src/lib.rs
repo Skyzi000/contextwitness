@@ -1,6 +1,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 //! Persistent storage functionality for ContextWitness.
 
+pub mod capture_states;
 pub mod control;
 mod control_cursor;
 pub mod db;

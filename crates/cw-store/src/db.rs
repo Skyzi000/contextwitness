@@ -8,6 +8,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0001_init.sql"),
     include_str!("../migrations/0002_outbox_last_note.sql"),
     include_str!("../migrations/0003_image_budget_and_time_index.sql"),
+    include_str!("../migrations/0004_capture_states.sql"),
 ];
 
 /// The schema version this build understands.
@@ -677,9 +678,11 @@ CREATE TABLE control_state (        -- current state, and the one that is author
         assert_eq!(
             names,
             [
+                "capture_states",
                 "control_events",
                 "control_state",
                 "episodes",
+                "idx_capture_states_end",
                 "idx_images_time",
                 "idx_obs_time",
                 "image_budget",

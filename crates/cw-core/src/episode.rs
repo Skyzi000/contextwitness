@@ -37,7 +37,7 @@ pub struct EpisodeMetadata {
     pub episode_start: String,
     /// Window end, RFC 3339 UTC.
     pub episode_end: String,
-    /// Number of entries in `content` after folding, in decimal.
+    /// Number of observation entries in `content` after folding, in decimal.
     pub entry_count: String,
     /// Relative image paths of the rendered entries, in render order, as a JSON array string.
     /// Entries folded as duplicates and entries with no stored image are absent.
@@ -61,9 +61,12 @@ pub fn window_start(
         .expect("a truncated timestamp must still be representable")
 }
 
-/// Render the screen observations that fall in `[window_start, window_start + window_minutes)`
-/// into one episode. Returns `None` when none do — an empty window must not become an empty
-/// document.
+/// Render the screen observations that fall in `[window_start, window_start + window_minutes)`,
+/// and the capture-state spans that overlap it, into one episode. Returns `None` when there are
+/// neither — an empty window must not become an empty document.
+///
+/// A span is clipped to the window, except an `Unrecorded` one: that renders whole, and only in
+/// the window holding its end.
 ///
 /// `window_start` is taken down to the second it falls in, and that second's window is the one
 /// rendered.
@@ -87,6 +90,7 @@ pub fn build_episode(
     window_minutes: u32,
     render_offset: chrono::FixedOffset,
     observations: &[crate::model::Observation],
+    spans: &[crate::model::StateSpan],
 ) -> Option<Episode> {
     // Taken through `timestamp` rather than by truncating the subsecond field: that field also
     // carries a leap second, as a value at or above one second, and truncating leaves it in place.
@@ -117,36 +121,78 @@ pub fn build_episode(
             && current.ocr_text == previous.ocr_text
     });
 
-    if entries.is_empty() {
+    let states: Vec<_> = spans
+        .iter()
+        .filter_map(|span| {
+            if span.status.state == crate::model::CaptureState::Unrecorded {
+                (span.end_at >= window_start && span.end_at < end_at).then_some((
+                    span.start_at,
+                    span.end_at,
+                    span,
+                ))
+            } else {
+                (span.start_at < end_at && span.end_at >= window_start).then_some((
+                    span.start_at.max(window_start),
+                    span.end_at.min(end_at),
+                    span,
+                ))
+            }
+        })
+        .collect();
+
+    if entries.is_empty() && states.is_empty() {
         return None;
     }
 
-    let rendered_start = window_start
-        .with_timezone(&render_offset)
-        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    let rendered_end = end_at
-        .with_timezone(&render_offset)
-        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let render = |at: chrono::DateTime<chrono::Utc>| {
+        at.with_timezone(&render_offset)
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    };
+    let rendered_start = render(window_start);
+    let rendered_end = render(end_at);
     let mut lines = vec![format!(
         "[{rendered_start} - {rendered_end}] Screen episode"
     )];
+    let mut blocks = Vec::new();
     let mut image_paths = Vec::new();
 
+    for (from, to, span) in states {
+        let mut state_line = format!("{} - {}", render(from), render(to));
+        push_subject(
+            &mut state_line,
+            span.status.process.as_deref(),
+            span.status.title.as_deref(),
+        );
+        let note = match span.status.state {
+            crate::model::CaptureState::Paused => "capture paused",
+            crate::model::CaptureState::Excluded => "capture skipped by the process blacklist",
+            crate::model::CaptureState::NoTarget => "no capturable foreground window",
+            crate::model::CaptureState::CaptureFailed => "capture failed",
+            crate::model::CaptureState::NoNewFrame => "no new frame received",
+            crate::model::CaptureState::Unchanged => "no change above the capture threshold",
+            crate::model::CaptureState::SaveFailed => "storing the capture failed",
+            crate::model::CaptureState::Unrecorded => "nothing recorded",
+        };
+        let note = match &span.status.detail {
+            Some(detail) => format!("  [{note}: {detail}]"),
+            None => format!("  [{note}]"),
+        };
+        let order = if span.status.state == crate::model::CaptureState::Unrecorded {
+            (to, 0, span.id)
+        } else {
+            (from, 1, span.id)
+        };
+        blocks.push((order, vec![state_line, note]));
+    }
+
     for (observation, screen) in &entries {
-        let mut entry_line = observation
-            .observed_at
-            .with_timezone(&render_offset)
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        if let Some(process) = &screen.foreground_process {
-            entry_line.push_str(" [");
-            entry_line.push_str(process);
-            entry_line.push(']');
-        }
-        if let Some(title) = &screen.foreground_window_title {
-            entry_line.push(' ');
-            entry_line.push_str(title);
-        }
-        lines.push(entry_line);
+        let mut entry_line = render(observation.observed_at);
+        push_subject(
+            &mut entry_line,
+            screen.foreground_process.as_deref(),
+            screen.foreground_window_title.as_deref(),
+        );
+        let mut block = vec![entry_line];
 
         match &screen.ocr_status {
             crate::model::OcrStatus::Succeeded => {
@@ -158,7 +204,7 @@ pub fn build_episode(
                     while ocr_lines.last().is_some_and(|line| line.is_empty()) {
                         ocr_lines.pop();
                     }
-                    lines.extend(ocr_lines.into_iter().map(|line| {
+                    block.extend(ocr_lines.into_iter().map(|line| {
                         if line.is_empty() {
                             String::new()
                         } else {
@@ -169,15 +215,19 @@ pub fn build_episode(
             }
             crate::model::OcrStatus::NoText => {}
             crate::model::OcrStatus::Failed => match &screen.ocr_error {
-                Some(error) => lines.push(format!("  [OCR failed: {error}]")),
-                None => lines.push("  [OCR failed]".to_owned()),
+                Some(error) => block.push(format!("  [OCR failed: {error}]")),
+                None => block.push("  [OCR failed]".to_owned()),
             },
         }
 
         if let Some(image_path) = &screen.image_path {
             image_paths.push(image_path.clone());
         }
+        blocks.push(((observation.observed_at, 2, observation.id), block));
     }
+
+    blocks.sort_by_key(|(order, _)| *order);
+    lines.extend(blocks.into_iter().flat_map(|(_, block)| block));
 
     let episode_start = window_start.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let episode_end = end_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
@@ -198,11 +248,24 @@ pub fn build_episode(
     })
 }
 
+fn push_subject(line: &mut String, process: Option<&str>, title: Option<&str>) {
+    if let Some(process) = process {
+        line.push_str(" [");
+        line.push_str(process);
+        line.push(']');
+    }
+    if let Some(title) = title {
+        line.push(' ');
+        line.push_str(title);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::{
-        CURRENT_SCHEMA_VERSION, Observation, OcrStatus, ScreenPayload, SourcePayload,
+        CURRENT_SCHEMA_VERSION, CaptureState, CaptureStatus, Observation, OcrStatus, ScreenPayload,
+        SourcePayload, StateSpan,
     };
     use chrono::{DateTime, FixedOffset, Utc};
 
@@ -329,9 +392,9 @@ mod tests {
         let start = timestamp("2026-07-24T16:00:00Z");
         let offset = FixedOffset::east_opt(9 * 3600).expect("test offset should be valid");
 
-        let first = build_episode(start, 5, offset, &ordered)
+        let first = build_episode(start, 5, offset, &ordered, &[])
             .expect("the golden observations should build an episode");
-        let second = build_episode(start, 5, offset, &reversed_and_interleaved)
+        let second = build_episode(start, 5, offset, &reversed_and_interleaved, &[])
             .expect("the reordered observations should build an episode");
 
         assert_eq!(first, second);
@@ -360,9 +423,9 @@ mod tests {
         let forward_input = [lower.clone(), higher.clone()];
         let swapped_input = [higher, lower];
 
-        let forward = build_episode(start, 5, offset, &forward_input)
+        let forward = build_episode(start, 5, offset, &forward_input, &[])
             .expect("two observations should build an episode");
-        let swapped = build_episode(start, 5, offset, &swapped_input)
+        let swapped = build_episode(start, 5, offset, &swapped_input, &[])
             .expect("two observations should build an episode");
 
         assert_eq!(forward, swapped);
@@ -382,7 +445,7 @@ mod tests {
         let start = timestamp("2026-07-24T16:00:00Z");
         let offset = FixedOffset::east_opt(9 * 3600).expect("test offset should be valid");
         let observations = golden_observations();
-        let five_minute_episode = build_episode(start, 5, offset, &observations)
+        let five_minute_episode = build_episode(start, 5, offset, &observations, &[])
             .expect("the golden observations should build an episode");
 
         assert_eq!(
@@ -390,7 +453,7 @@ mod tests {
             "screen-2026-07-24T16:00:00Z-5m"
         );
 
-        let ten_minute_episode = build_episode(start, 10, offset, &observations)
+        let ten_minute_episode = build_episode(start, 10, offset, &observations, &[])
             .expect("the golden observations should build an episode");
 
         assert_ne!(
@@ -414,6 +477,7 @@ mod tests {
             5,
             offset,
             &observations,
+            &[],
         )
         .expect("an observation at the whole second belongs to the window that second starts");
 
@@ -441,9 +505,9 @@ mod tests {
             ordinary.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
         );
 
-        let from_ordinary = build_episode(ordinary, 5, offset, &observations)
+        let from_ordinary = build_episode(ordinary, 5, offset, &observations, &[])
             .expect("the golden observations should build an episode");
-        let from_leap = build_episode(leap, 5, offset, &observations)
+        let from_leap = build_episode(leap, 5, offset, &observations, &[])
             .expect("the leap start should build an episode of its own");
 
         assert_ne!(from_leap.document_id, from_ordinary.document_id);
@@ -456,6 +520,7 @@ mod tests {
             5,
             FixedOffset::east_opt(9 * 3600).expect("test offset should be valid"),
             &golden_observations(),
+            &[],
         )
         .expect("the golden observations should build an episode");
 
@@ -470,6 +535,7 @@ mod tests {
             5,
             FixedOffset::east_opt(9 * 3600).expect("test offset should be valid"),
             &golden_observations(),
+            &[],
         )
         .expect("the golden observations should build an episode");
         let golden = r#"[2026-07-25T01:00:00+09:00 - 2026-07-25T01:05:00+09:00] Screen episode
@@ -502,6 +568,7 @@ mod tests {
             5,
             FixedOffset::east_opt(9 * 3600).expect("test offset should be valid"),
             &golden_observations(),
+            &[],
         )
         .expect("the golden observations should build an episode");
         let metadata = serde_json::to_value(&episode.metadata)
@@ -544,6 +611,7 @@ mod tests {
             5,
             FixedOffset::east_opt(0).expect("UTC offset should be valid"),
             &observations,
+            &[],
         )
         .expect("the observations should build an episode");
 
@@ -568,6 +636,7 @@ mod tests {
             5,
             FixedOffset::east_opt(0).expect("UTC offset should be valid"),
             &hidden,
+            &[],
         )
         .expect("the hidden-text observations should build an episode");
         assert_eq!(episode.metadata.entry_count, "2");
@@ -600,6 +669,7 @@ mod tests {
             5,
             FixedOffset::east_opt(0).expect("UTC offset should be valid"),
             &observations,
+            &[],
         )
         .expect("the observations should build an episode");
 
@@ -631,6 +701,7 @@ mod tests {
             5,
             FixedOffset::east_opt(0).expect("UTC offset should be valid"),
             &observations,
+            &[],
         )
         .expect("the observations should build an episode");
 
@@ -666,6 +737,7 @@ mod tests {
             5,
             FixedOffset::east_opt(0).expect("UTC offset should be valid"),
             &observations,
+            &[],
         )
         .expect("the observations should build an episode");
 
@@ -700,6 +772,7 @@ mod tests {
             5,
             FixedOffset::east_opt(0).expect("UTC offset should be valid"),
             &observations,
+            &[],
         )
         .expect("the observations should build an episode");
 
@@ -736,6 +809,7 @@ mod tests {
             5,
             FixedOffset::east_opt(0).expect("UTC offset should be valid"),
             &identical,
+            &[],
         )
         .expect("the identical failures should build an episode");
 
@@ -747,6 +821,7 @@ mod tests {
             5,
             FixedOffset::east_opt(0).expect("UTC offset should be valid"),
             &different,
+            &[],
         )
         .expect("the different failures should build an episode");
 
@@ -783,6 +858,7 @@ mod tests {
             5,
             FixedOffset::east_opt(0).expect("UTC offset should be valid"),
             &observations,
+            &[],
         )
         .expect("the observations should build an episode");
 
@@ -815,6 +891,7 @@ mod tests {
             5,
             FixedOffset::east_opt(0).expect("UTC offset should be valid"),
             &observations,
+            &[],
         )
         .expect("the observations should build an episode");
 
@@ -828,6 +905,7 @@ mod tests {
                 timestamp("2026-07-24T16:00:00Z"),
                 5,
                 FixedOffset::east_opt(0).expect("UTC offset should be valid"),
+                &[],
                 &[],
             ),
             None
@@ -855,6 +933,7 @@ mod tests {
                 5,
                 FixedOffset::east_opt(0).expect("UTC offset should be valid"),
                 &observations,
+                &[],
             ),
             None
         );
@@ -885,6 +964,7 @@ mod tests {
             5,
             FixedOffset::east_opt(0).expect("UTC offset should be valid"),
             &observations,
+            &[],
         )
         .expect("the screen observation should build an episode");
 
@@ -905,6 +985,7 @@ mod tests {
             5,
             FixedOffset::east_opt(0).expect("UTC offset should be valid"),
             &observations,
+            &[],
         )
         .expect("the failed OCR observation should build an episode");
 
@@ -945,6 +1026,7 @@ mod tests {
             5,
             FixedOffset::east_opt(0).expect("UTC offset should be valid"),
             &observations,
+            &[],
         )
         .expect("the observations should build an episode");
 
@@ -967,6 +1049,7 @@ mod tests {
             5,
             FixedOffset::east_opt(0).expect("UTC offset should be valid"),
             &trailing,
+            &[],
         )
         .expect("the observation should build an episode");
 
@@ -983,10 +1066,366 @@ mod tests {
             5,
             FixedOffset::east_opt(0).expect("UTC offset should be valid"),
             &interior,
+            &[],
         )
         .expect("the observation should build an episode");
 
         assert!(interior_episode.content.ends_with("\n  a\n\n  b"));
         assert!(!interior_episode.content.ends_with('\n'));
+    }
+
+    fn status(
+        state: CaptureState,
+        process: Option<&str>,
+        title: Option<&str>,
+        detail: Option<&str>,
+    ) -> CaptureStatus {
+        CaptureStatus {
+            state,
+            process: process.map(str::to_owned),
+            title: title.map(str::to_owned),
+            detail: detail.map(str::to_owned),
+        }
+    }
+
+    fn span(id: u128, start_at: &str, end_at: &str, status: CaptureStatus) -> StateSpan {
+        StateSpan {
+            id: ulid::Ulid::from(id),
+            status,
+            start_at: timestamp(start_at),
+            end_at: timestamp(end_at),
+        }
+    }
+
+    fn bare(state: CaptureState) -> CaptureStatus {
+        status(state, None, None, None)
+    }
+
+    #[test]
+    fn a_window_holding_only_capture_states_builds_an_episode() {
+        let spans = [span(
+            1,
+            "2026-07-24T16:01:00Z",
+            "2026-07-24T16:02:00Z",
+            bare(CaptureState::Paused),
+        )];
+
+        let episode = build_episode(
+            timestamp("2026-07-24T16:00:00Z"),
+            5,
+            FixedOffset::east_opt(0).expect("UTC offset should be valid"),
+            &[],
+            &spans,
+        )
+        .expect("a span alone should build an episode");
+
+        assert_eq!(
+            episode.content,
+            "[2026-07-24T16:00:00Z - 2026-07-24T16:05:00Z] Screen episode\n\
+             2026-07-24T16:01:00Z - 2026-07-24T16:02:00Z\n  [capture paused]"
+        );
+        assert_eq!(episode.metadata.entry_count, "0");
+        assert_eq!(episode.metadata.image_paths, "[]");
+    }
+
+    #[test]
+    fn episode_content_interleaves_every_capture_state_golden() {
+        let observations = [
+            observation(
+                1,
+                "2026-07-24T16:01:10Z",
+                ScreenPayload {
+                    image_path: Some("images/a.webp".to_owned()),
+                    foreground_process: Some("editor.exe".to_owned()),
+                    foreground_window_title: Some("Example Page".to_owned()),
+                    ..screen_payload(OcrStatus::Succeeded, Some("hello world"))
+                },
+            ),
+            observation(
+                2,
+                "2026-07-24T16:03:00Z",
+                ScreenPayload {
+                    image_path: Some("images/b.webp".to_owned()),
+                    foreground_process: Some("editor.exe".to_owned()),
+                    foreground_window_title: Some("notes.txt".to_owned()),
+                    ..screen_payload(OcrStatus::Succeeded, Some("line one"))
+                },
+            ),
+        ];
+        let page = |state| status(state, Some("editor.exe"), Some("Example Page"), None);
+        let spans = [
+            span(
+                10,
+                "2026-07-24T15:52:10Z",
+                "2026-07-24T16:00:00Z",
+                bare(CaptureState::Unrecorded),
+            ),
+            span(
+                11,
+                "2026-07-24T15:58:00Z",
+                "2026-07-24T16:00:20Z",
+                bare(CaptureState::Paused),
+            ),
+            span(
+                12,
+                "2026-07-24T16:00:30Z",
+                "2026-07-24T16:00:50Z",
+                status(CaptureState::Excluded, None, None, Some("private.exe")),
+            ),
+            span(
+                13,
+                "2026-07-24T16:01:00Z",
+                "2026-07-24T16:01:00Z",
+                status(CaptureState::NoTarget, Some("editor.exe"), None, None),
+            ),
+            span(
+                14,
+                "2026-07-24T16:01:20Z",
+                "2026-07-24T16:02:00Z",
+                page(CaptureState::Unchanged),
+            ),
+            span(
+                15,
+                "2026-07-24T16:02:10Z",
+                "2026-07-24T16:02:20Z",
+                page(CaptureState::NoNewFrame),
+            ),
+            span(
+                16,
+                "2026-07-24T16:02:30Z",
+                "2026-07-24T16:02:30Z",
+                status(
+                    CaptureState::CaptureFailed,
+                    Some("viewer.exe"),
+                    Some("Example Image"),
+                    Some("capture session ended"),
+                ),
+            ),
+            span(
+                17,
+                "2026-07-24T16:02:40Z",
+                "2026-07-24T16:02:50Z",
+                status(
+                    CaptureState::SaveFailed,
+                    Some("editor.exe"),
+                    Some("notes.txt"),
+                    Some("image io: disk full"),
+                ),
+            ),
+            span(
+                18,
+                "2026-07-24T16:03:10Z",
+                "2026-07-24T16:07:30Z",
+                status(
+                    CaptureState::Unchanged,
+                    Some("editor.exe"),
+                    Some("notes.txt"),
+                    None,
+                ),
+            ),
+            span(
+                19,
+                "2026-07-24T16:04:00Z",
+                "2026-07-24T16:06:00Z",
+                bare(CaptureState::Unrecorded),
+            ),
+            span(
+                20,
+                "2026-07-24T16:05:00Z",
+                "2026-07-24T16:06:00Z",
+                bare(CaptureState::Paused),
+            ),
+            span(
+                21,
+                "2026-07-24T15:50:00Z",
+                "2026-07-24T15:59:59Z",
+                bare(CaptureState::Paused),
+            ),
+        ];
+
+        let episode = build_episode(
+            timestamp("2026-07-24T16:00:00Z"),
+            5,
+            FixedOffset::east_opt(9 * 3600).expect("test offset should be valid"),
+            &observations,
+            &spans,
+        )
+        .expect("the golden entries and spans should build an episode");
+        let golden = r#"[2026-07-25T01:00:00+09:00 - 2026-07-25T01:05:00+09:00] Screen episode
+2026-07-25T00:52:10+09:00 - 2026-07-25T01:00:00+09:00
+  [nothing recorded]
+2026-07-25T01:00:00+09:00 - 2026-07-25T01:00:20+09:00
+  [capture paused]
+2026-07-25T01:00:30+09:00 - 2026-07-25T01:00:50+09:00
+  [capture skipped by the process blacklist: private.exe]
+2026-07-25T01:01:00+09:00 - 2026-07-25T01:01:00+09:00 [editor.exe]
+  [no capturable foreground window]
+2026-07-25T01:01:10+09:00 [editor.exe] Example Page
+  hello world
+2026-07-25T01:01:20+09:00 - 2026-07-25T01:02:00+09:00 [editor.exe] Example Page
+  [no change above the capture threshold]
+2026-07-25T01:02:10+09:00 - 2026-07-25T01:02:20+09:00 [editor.exe] Example Page
+  [no new frame received]
+2026-07-25T01:02:30+09:00 - 2026-07-25T01:02:30+09:00 [viewer.exe] Example Image
+  [capture failed: capture session ended]
+2026-07-25T01:02:40+09:00 - 2026-07-25T01:02:50+09:00 [editor.exe] notes.txt
+  [storing the capture failed: image io: disk full]
+2026-07-25T01:03:00+09:00 [editor.exe] notes.txt
+  line one
+2026-07-25T01:03:10+09:00 - 2026-07-25T01:05:00+09:00 [editor.exe] notes.txt
+  [no change above the capture threshold]"#;
+
+        assert_eq!(episode.content, golden);
+        assert_eq!(episode.metadata.entry_count, "2");
+        assert_eq!(
+            episode.metadata.image_paths,
+            "[\"images/a.webp\",\"images/b.webp\"]"
+        );
+    }
+
+    #[test]
+    fn a_span_is_clipped_to_both_window_edges() {
+        let spans = [span(
+            1,
+            "2026-07-24T15:58:00Z",
+            "2026-07-24T16:07:00Z",
+            bare(CaptureState::Unchanged),
+        )];
+
+        let episode = build_episode(
+            timestamp("2026-07-24T16:00:00Z"),
+            5,
+            FixedOffset::east_opt(0).expect("UTC offset should be valid"),
+            &[],
+            &spans,
+        )
+        .expect("a span covering the window should build an episode");
+
+        assert!(
+            episode
+                .content
+                .ends_with("\n2026-07-24T16:00:00Z - 2026-07-24T16:05:00Z\n  [no change above the capture threshold]")
+        );
+    }
+
+    #[test]
+    fn an_unrecorded_span_renders_whole_and_only_in_the_window_holding_its_end() {
+        let spans = [span(
+            1,
+            "2026-07-24T15:50:00Z",
+            "2026-07-24T16:12:30Z",
+            bare(CaptureState::Unrecorded),
+        )];
+        let build = |start: &str| {
+            build_episode(
+                timestamp(start),
+                5,
+                FixedOffset::east_opt(0).expect("UTC offset should be valid"),
+                &[],
+                &spans,
+            )
+        };
+
+        for elsewhere in [
+            "2026-07-24T15:50:00Z",
+            "2026-07-24T16:00:00Z",
+            "2026-07-24T16:05:00Z",
+            "2026-07-24T16:15:00Z",
+        ] {
+            assert_eq!(build(elsewhere), None, "{elsewhere}");
+        }
+        let episode = build("2026-07-24T16:10:00Z")
+            .expect("the window holding the end should build an episode");
+        assert!(
+            episode
+                .content
+                .ends_with("\n2026-07-24T15:50:00Z - 2026-07-24T16:12:30Z\n  [nothing recorded]")
+        );
+    }
+
+    #[test]
+    fn a_span_renders_before_an_entry_at_the_same_instant_and_spans_tie_by_id() {
+        let observations = [observation(
+            1,
+            "2026-07-24T16:01:00Z",
+            ScreenPayload {
+                foreground_window_title: Some("Entry".to_owned()),
+                ..screen_payload(OcrStatus::NoText, None)
+            },
+        )];
+        let spans = [
+            span(
+                3,
+                "2026-07-24T16:01:00Z",
+                "2026-07-24T16:01:00Z",
+                status(CaptureState::NoNewFrame, None, Some("Higher"), None),
+            ),
+            span(
+                2,
+                "2026-07-24T16:01:00Z",
+                "2026-07-24T16:01:00Z",
+                status(CaptureState::Unchanged, None, Some("Lower"), None),
+            ),
+        ];
+
+        let episode = build_episode(
+            timestamp("2026-07-24T16:00:00Z"),
+            5,
+            FixedOffset::east_opt(0).expect("UTC offset should be valid"),
+            &observations,
+            &spans,
+        )
+        .expect("the tied entry and spans should build an episode");
+
+        assert_eq!(
+            episode.content,
+            "[2026-07-24T16:00:00Z - 2026-07-24T16:05:00Z] Screen episode\n\
+             2026-07-24T16:01:00Z - 2026-07-24T16:01:00Z Lower\n  [no change above the capture threshold]\n\
+             2026-07-24T16:01:00Z - 2026-07-24T16:01:00Z Higher\n  [no new frame received]\n\
+             2026-07-24T16:01:00Z Entry"
+        );
+    }
+
+    #[test]
+    fn an_unrecorded_span_renders_where_recording_resumed() {
+        let observations = [observation(
+            1,
+            "2026-07-24T16:01:00Z",
+            ScreenPayload {
+                foreground_window_title: Some("Before".to_owned()),
+                ..screen_payload(OcrStatus::NoText, None)
+            },
+        )];
+        let spans = [
+            span(
+                2,
+                "2026-07-24T16:03:00Z",
+                "2026-07-24T16:03:00Z",
+                status(CaptureState::NoNewFrame, None, Some("After"), None),
+            ),
+            span(
+                3,
+                "2026-07-24T16:01:00Z",
+                "2026-07-24T16:03:00Z",
+                bare(CaptureState::Unrecorded),
+            ),
+        ];
+
+        let episode = build_episode(
+            timestamp("2026-07-24T16:00:00Z"),
+            5,
+            FixedOffset::east_opt(0).expect("UTC offset should be valid"),
+            &observations,
+            &spans,
+        )
+        .expect("the entry and spans should build an episode");
+
+        assert_eq!(
+            episode.content,
+            "[2026-07-24T16:00:00Z - 2026-07-24T16:05:00Z] Screen episode\n\
+             2026-07-24T16:01:00Z Before\n\
+             2026-07-24T16:01:00Z - 2026-07-24T16:03:00Z\n  [nothing recorded]\n\
+             2026-07-24T16:03:00Z - 2026-07-24T16:03:00Z After\n  [no new frame received]"
+        );
     }
 }

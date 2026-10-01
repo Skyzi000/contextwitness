@@ -141,7 +141,17 @@ pub fn save(
     at: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), StoreError> {
     save_registering(
-        conn, root, id, None, relative, pixels, width, height, quality, at,
+        conn,
+        root,
+        id,
+        None,
+        relative,
+        pixels,
+        width,
+        height,
+        quality,
+        at,
+        |_| Ok(()),
     )
 }
 
@@ -153,6 +163,8 @@ pub fn save(
 /// stays and every episode carrying that observation carries the dead name with it. A crash before
 /// this commit leaves at most an unregistered file, which is what [`save`] leaves and what
 /// [`sweep_orphan_files`] collects.
+///
+/// `within` writes in the same transaction, after both rows; an error from it commits nothing.
 #[allow(clippy::too_many_arguments)]
 pub fn save_with_observation(
     conn: &mut rusqlite::Connection,
@@ -164,6 +176,7 @@ pub fn save_with_observation(
     height: u32,
     quality: f32,
     at: chrono::DateTime<chrono::Utc>,
+    within: impl FnOnce(&rusqlite::Connection) -> Result<(), StoreError>,
 ) -> Result<(), StoreError> {
     save_registering(
         conn,
@@ -176,6 +189,7 @@ pub fn save_with_observation(
         height,
         quality,
         at,
+        within,
     )
 }
 
@@ -194,6 +208,7 @@ fn save_registering(
     height: u32,
     quality: f32,
     at: chrono::DateTime<chrono::Utc>,
+    within: impl FnOnce(&rusqlite::Connection) -> Result<(), StoreError>,
 ) -> Result<(), StoreError> {
     let id_text = id.to_string();
     // 16,383 is the encoder's dimension limit, not one imposed by this program.
@@ -295,6 +310,11 @@ fn save_registering(
             return Err(StoreError::ImageAlreadyRegistered { id: id_text });
         }
         return Err(StoreError::Sql { source });
+    }
+
+    if let Err(error) = within(&transaction) {
+        discard_written_file(&file);
+        return Err(error);
     }
 
     match cw_core::atomic_file::rename_without_replacing(&file, &destination) {
@@ -1166,6 +1186,7 @@ mod tests {
             HEIGHT,
             75.0,
             taken_at,
+            |_| Ok(()),
         )
         .expect("a long image path should be saved");
 
