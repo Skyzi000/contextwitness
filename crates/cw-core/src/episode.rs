@@ -334,10 +334,33 @@ fn changed_lines(old: &[&str], new: &[&str]) -> Option<Vec<String>> {
     ops.extend(old[old.len() - suffix..].iter().map(|line| (' ', *line)));
 
     let changed = |k: usize| ops.get(k).is_some_and(|(op, _)| *op != ' ');
-    let mut body: Vec<_> = (0..ops.len())
-        .filter(|&k| changed(k) || changed(k + 1) || k.checked_sub(1).is_some_and(changed))
-        .map(|k| format!("  {} {}", ops[k].0, ops[k].1))
+    let marked: Vec<_> = (0..ops.len())
+        .map(|k| {
+            let shown = changed(k) || changed(k + 1) || k.checked_sub(1).is_some_and(changed);
+            (shown, ops[k].0, ops[k].1)
+        })
         .collect();
+    let range = |before: usize, count: usize| match count {
+        0 => format!("{before},0"),
+        1 => format!("{}", before + 1),
+        _ => format!("{},{count}", before + 1),
+    };
+    let mut body = Vec::new();
+    let (mut old_before, mut new_before) = (0, 0);
+    for run in marked.chunk_by(|a, b| a.0 == b.0) {
+        let old_count = run.iter().filter(|(_, op, _)| *op != '+').count();
+        let new_count = run.iter().filter(|(_, op, _)| *op != '-').count();
+        if run[0].0 {
+            body.push(format!(
+                "  @@ -{} +{} @@",
+                range(old_before, old_count),
+                range(new_before, new_count)
+            ));
+            body.extend(run.iter().map(|(_, op, line)| format!("  {op} {line}")));
+        }
+        old_before += old_count;
+        new_before += new_count;
+    }
     if body.is_empty() {
         body.push("  (no text change)".to_owned());
     }
@@ -1706,7 +1729,7 @@ mod tests {
         assert_eq!(
             blocks[blocks.len() - 1],
             format!(
-                "{}\n    \n  - \n  + line 4\n    line 5\n  - line 6\n  + \n    ",
+                "{}\n  @@ -3,5 +3,5 @@\n    \n  - \n  + line 4\n    line 5\n  - line 6\n  + \n    ",
                 headers[6]
             )
         );
@@ -1782,6 +1805,7 @@ mod tests {
     fn a_window_seen_again_renders_the_lines_changed_since_its_previous_capture() {
         let first = [
             "Title", "line 2", "line 3", "line 4", "line 5", "line 6", "line 7", "line 8",
+            "line 9", "line 10", "line 11",
         ];
         let again = [
             "Title",
@@ -1793,6 +1817,9 @@ mod tests {
             "line 7",
             "line 8",
             "line 9",
+            "line 10",
+            "line 11",
+            "line 12",
         ];
         let observations = [
             capture(
@@ -1837,17 +1864,22 @@ mod tests {
   line 6
   line 7
   line 8
+  line 9
+  line 10
+  line 11
 
 2026-07-25T01:00:02+09:00 [viewer.exe] Other Page
   Status: Done
 
 2026-07-25T01:00:03+09:00 [editor.exe] Example Page (changes since 2026-07-25T01:00:01+09:00)
+  @@ -2,3 +2,3 @@
     line 2
   - line 3
   + line 3 edited
     line 4
-    line 8
-  + line 9"#;
+  @@ -11 +11,2 @@
+    line 11
+  + line 12"#;
 
         assert_eq!(episode.content, golden);
         assert_eq!(episode.metadata.entry_count, "3");
@@ -1861,21 +1893,21 @@ mod tests {
                 "2026-07-24T16:00:01Z",
                 "editor.exe",
                 "Example Page",
-                "Title\nStatus: Done\nOwner: A\nline 4\nline 5\nline 6\nline 7",
+                "Title\nStatus: Done\nOwner: A\nline 4\nline 5\nline 6\nline 7\nline 8",
             ),
             capture(
                 2,
                 "2026-07-24T16:00:02Z",
                 "editor.exe",
                 "Example Page",
-                "Title\nStatus: Open\nOwner: A\nline 4\nline 5\nline 6\nline 7",
+                "Title\nStatus: Open\nOwner: A\nline 4\nline 5\nline 6\nline 7\nline 8",
             ),
         ]);
 
         assert_eq!(
             blocks[2..],
             [format!(
-                "{SECOND_SINCE_FIRST}\n    Title\n  - Status: Done\n  + Status: Open\n    Owner: A"
+                "{SECOND_SINCE_FIRST}\n  @@ -1,3 +1,3 @@\n    Title\n  - Status: Done\n  + Status: Open\n    Owner: A"
             )]
         );
     }
@@ -1910,8 +1942,8 @@ mod tests {
         assert_eq!(
             blocks[2..],
             [
-                format!("{SECOND_SINCE_FIRST}\n    line 3\n  - x\n    line 5"),
-                "2026-07-24T16:00:03Z [editor.exe] Example Page (changes since 2026-07-24T16:00:02Z)\n    line 3\n  + x\n    line 5".to_owned(),
+                format!("{SECOND_SINCE_FIRST}\n  @@ -3,3 +3,2 @@\n    line 3\n  - x\n    line 5"),
+                "2026-07-24T16:00:03Z [editor.exe] Example Page (changes since 2026-07-24T16:00:02Z)\n  @@ -3,2 +3,3 @@\n    line 3\n  + x\n    line 5".to_owned(),
             ]
         );
     }
@@ -2027,7 +2059,7 @@ mod tests {
                 "2026-07-24T16:00:01Z",
                 "editor.exe",
                 "Example Page",
-                "Title\nStatus: Done\nOwner: A\nline 4\nline 5\nline 6\nline 7",
+                "Title\nStatus: Done\nOwner: A\nline 4\nline 5\nline 6\nline 7\nline 8",
             ),
             observation(
                 2,
@@ -2053,7 +2085,7 @@ mod tests {
                 "2026-07-24T16:00:04Z",
                 "editor.exe",
                 "Example Page",
-                "Title\nStatus: Open\nOwner: A\nline 4\nline 5\nline 6\nline 7",
+                "Title\nStatus: Open\nOwner: A\nline 4\nline 5\nline 6\nline 7\nline 8",
             ),
         ]);
 
@@ -2062,7 +2094,7 @@ mod tests {
             [
                 format!("{SECOND_ENTRY_HEADER}\n  [OCR failed: engine unavailable]"),
                 "2026-07-24T16:00:03Z [editor.exe] Example Page".to_owned(),
-                "2026-07-24T16:00:04Z [editor.exe] Example Page (changes since 2026-07-24T16:00:01Z)\n    Title\n  - Status: Done\n  + Status: Open\n    Owner: A".to_owned(),
+                "2026-07-24T16:00:04Z [editor.exe] Example Page (changes since 2026-07-24T16:00:01Z)\n  @@ -1,3 +1,3 @@\n    Title\n  - Status: Done\n  + Status: Open\n    Owner: A".to_owned(),
             ]
         );
     }
@@ -2115,11 +2147,15 @@ mod tests {
             assert_eq!(lines.next(), Some(expected_header));
             reassembled.extend(lines.map(str::to_owned));
         }
-        let expected: Vec<_> = std::iter::once(format!("    {}", line(49, "x")))
-            .chain((50..70).map(|n| format!("  - {}", line(n, "x"))))
-            .chain((50..70).map(|n| format!("  + {}", line(n, "y"))))
-            .chain(std::iter::once(format!("    {}", line(70, "x"))))
-            .collect();
+        let expected: Vec<_> = [
+            "  @@ -49,22 +49,22 @@".to_owned(),
+            format!("    {}", line(49, "x")),
+        ]
+        .into_iter()
+        .chain((50..70).map(|n| format!("  - {}", line(n, "x"))))
+        .chain((50..70).map(|n| format!("  + {}", line(n, "y"))))
+        .chain(std::iter::once(format!("    {}", line(70, "x"))))
+        .collect();
         assert_eq!(reassembled, expected);
     }
 
@@ -2155,7 +2191,7 @@ mod tests {
         assert_eq!(
             at_limit.last(),
             Some(&format!(
-                "{SECOND_SINCE_FIRST}\n  - first old\n  + first new\n    line 2\n    line 999\n  - last old\n  + last new"
+                "{SECOND_SINCE_FIRST}\n  @@ -1,2 +1,2 @@\n  - first old\n  + first new\n    line 2\n  @@ -999,2 +999,2 @@\n    line 999\n  - last old\n  + last new"
             ))
         );
 
@@ -2164,7 +2200,7 @@ mod tests {
         assert_eq!(
             pair(&long, &edited).last(),
             Some(&format!(
-                "{SECOND_SINCE_FIRST}\n    line 749\n  - line 750\n  + line 750 edited\n    line 751"
+                "{SECOND_SINCE_FIRST}\n  @@ -749,3 +749,3 @@\n    line 749\n  - line 750\n  + line 750 edited\n    line 751"
             ))
         );
     }
@@ -2191,8 +2227,73 @@ mod tests {
         assert_eq!(
             blocks[2],
             format!(
-                "{SECOND_SINCE_FIRST}\n    line 3\n  - a1\n  - a2\n  + A1\n  + A2\n    line 6\n  - b\n  + B\n    line 8"
+                "{SECOND_SINCE_FIRST}\n  @@ -3,6 +3,6 @@\n    line 3\n  - a1\n  - a2\n  + A1\n  + A2\n    line 6\n  - b\n  + B\n    line 8"
             )
+        );
+    }
+
+    #[test]
+    fn the_same_edit_at_different_lines_renders_different_hunk_headers() {
+        let base = "Item A\nDescription\nValue: 100\nUnit: yen\nItem B\nDescription\nValue: 100\nUnit: yen";
+        let edited_at = |index: usize| {
+            let mut lines: Vec<_> = base.lines().collect();
+            lines[index] = "Value: 200";
+            episode_blocks(&[
+                capture(
+                    1,
+                    "2026-07-24T16:00:01Z",
+                    "editor.exe",
+                    "Example Page",
+                    base,
+                ),
+                capture(
+                    2,
+                    "2026-07-24T16:00:02Z",
+                    "editor.exe",
+                    "Example Page",
+                    &lines.join("\n"),
+                ),
+            ])
+        };
+
+        assert_eq!(
+            edited_at(2)[2..],
+            [format!(
+                "{SECOND_SINCE_FIRST}\n  @@ -2,3 +2,3 @@\n    Description\n  - Value: 100\n  + Value: 200\n    Unit: yen"
+            )]
+        );
+        assert_eq!(
+            edited_at(6)[2..],
+            [format!(
+                "{SECOND_SINCE_FIRST}\n  @@ -6,3 +6,3 @@\n    Description\n  - Value: 100\n  + Value: 200\n    Unit: yen"
+            )]
+        );
+    }
+
+    #[test]
+    fn text_after_a_capture_with_no_lines_renders_in_full() {
+        let blocks = episode_blocks(&[
+            capture(1, "2026-07-24T16:00:01Z", "editor.exe", "Example Page", ""),
+            capture(
+                2,
+                "2026-07-24T16:00:02Z",
+                "editor.exe",
+                "Example Page",
+                "Item A\nValue: 100",
+            ),
+        ]);
+
+        assert_eq!(
+            blocks[2..],
+            [format!("{SECOND_ENTRY_HEADER}\n  Item A\n  Value: 100")]
+        );
+        assert_eq!(
+            changed_lines(&[], &["Item A"]),
+            Some(vec!["  @@ -0,0 +1 @@".to_owned(), "  + Item A".to_owned()])
+        );
+        assert_eq!(
+            changed_lines(&["Item A"], &[]),
+            Some(vec!["  @@ -1 +0,0 @@".to_owned(), "  - Item A".to_owned()])
         );
     }
 }
