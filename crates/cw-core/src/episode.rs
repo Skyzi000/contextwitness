@@ -6,6 +6,9 @@ const SCREEN_SOURCE: &str = "screen";
 /// of `retain_chunk_size` characters, 3000 by default; a block this long reaches a chunk whole.
 const BLOCK_CHARS: usize = 1000;
 
+/// The line diff fills a table of old by new lines; a pair of captures past this many cells is rendered in full.
+const MAX_DIFF_CELLS: usize = 1_000_000;
+
 /// A finished episode: the exact text and metadata that will be stored and delivered.
 ///
 /// There is deliberately no `id` field — the ULID is assigned by the store when the row is
@@ -154,8 +157,11 @@ pub fn build_episode(
     };
     let rendered_start = render(window_start);
     let rendered_end = render(end_at);
+    let rendered_chars =
+        |lines: &[String]| -> usize { lines.iter().map(|line| line.chars().count() + 1).sum() };
     let mut blocks = Vec::new();
     let mut image_paths = Vec::new();
+    let mut bases: std::collections::HashMap<_, (_, Vec<_>)> = std::collections::HashMap::new();
 
     for (from, to, span) in states {
         let mut state_line = format!("{} - {}", render(from), render(to));
@@ -186,27 +192,36 @@ pub fn build_episode(
         blocks.push((order, vec![format!("{state_line}\n{note}")]));
     }
 
-    for (observation, screen) in &entries {
-        let mut entry_line = render(observation.observed_at);
-        push_subject(
-            &mut entry_line,
+    for &(observation, screen) in &entries {
+        let window = (
             screen.foreground_process.as_deref(),
             screen.foreground_window_title.as_deref(),
         );
+        let mut entry_line = render(observation.observed_at);
+        push_subject(&mut entry_line, window.0, window.1);
         let mut body = Vec::new();
 
         match &screen.ocr_status {
             crate::model::OcrStatus::Succeeded => {
-                if let Some(text) = &screen.ocr_text {
-                    let mut ocr_lines: Vec<_> = text
-                        .lines()
-                        .map(|line| line.trim_end_matches('\r'))
-                        .collect();
-                    while ocr_lines.last().is_some_and(|line| line.is_empty()) {
-                        ocr_lines.pop();
-                    }
-                    body.extend(ocr_lines.into_iter().map(|line| format!("  {line}")));
+                let mut ocr_lines: Vec<_> = screen
+                    .ocr_text
+                    .as_deref()
+                    .unwrap_or_default()
+                    .lines()
+                    .map(|line| line.trim_end_matches('\r'))
+                    .collect();
+                while ocr_lines.last().is_some_and(|line| line.is_empty()) {
+                    ocr_lines.pop();
                 }
+                body.extend(ocr_lines.iter().map(|line| format!("  {line}")));
+                if let Some((base_at, base_lines)) = bases.get(&window)
+                    && let Some(changes) = changed_lines(base_lines, &ocr_lines)
+                    && rendered_chars(&changes) < rendered_chars(&body)
+                {
+                    entry_line = format!("{entry_line} (changes since {})", render(*base_at));
+                    body = changes;
+                }
+                bases.insert(window, (observation.observed_at, ocr_lines));
             }
             crate::model::OcrStatus::NoText => {}
             crate::model::OcrStatus::Failed => match &screen.ocr_error {
@@ -271,6 +286,63 @@ fn entry_blocks(header: &str, body: &[String]) -> Vec<String> {
     blocks.push(block);
 
     blocks
+}
+
+fn changed_lines(old: &[&str], new: &[&str]) -> Option<Vec<String>> {
+    let prefix = old.iter().zip(new).take_while(|(a, b)| a == b).count();
+    let suffix = old[prefix..]
+        .iter()
+        .rev()
+        .zip(new[prefix..].iter().rev())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let old_middle = &old[prefix..old.len() - suffix];
+    let new_middle = &new[prefix..new.len() - suffix];
+    if old_middle.len().saturating_mul(new_middle.len()) > MAX_DIFF_CELLS {
+        return None;
+    }
+
+    let width = new_middle.len() + 1;
+    let mut lengths = vec![0_u16; (old_middle.len() + 1) * width];
+    for i in (0..old_middle.len()).rev() {
+        for j in (0..new_middle.len()).rev() {
+            lengths[i * width + j] = if old_middle[i] == new_middle[j] {
+                lengths[(i + 1) * width + j + 1] + 1
+            } else {
+                lengths[(i + 1) * width + j].max(lengths[i * width + j + 1])
+            };
+        }
+    }
+
+    let mut ops: Vec<_> = old[..prefix].iter().map(|line| (' ', *line)).collect();
+    let (mut i, mut j) = (0, 0);
+    while i < old_middle.len() || j < new_middle.len() {
+        if i < old_middle.len() && j < new_middle.len() && old_middle[i] == new_middle[j] {
+            ops.push((' ', old_middle[i]));
+            i += 1;
+            j += 1;
+        } else if j == new_middle.len()
+            || (i < old_middle.len() && lengths[(i + 1) * width + j] >= lengths[i * width + j + 1])
+        {
+            ops.push(('-', old_middle[i]));
+            i += 1;
+        } else {
+            ops.push(('+', new_middle[j]));
+            j += 1;
+        }
+    }
+    ops.extend(old[old.len() - suffix..].iter().map(|line| (' ', *line)));
+
+    let changed = |k: usize| ops.get(k).is_some_and(|(op, _)| *op != ' ');
+    let mut body: Vec<_> = (0..ops.len())
+        .filter(|&k| changed(k) || changed(k + 1) || k.checked_sub(1).is_some_and(changed))
+        .map(|k| format!("  {} {}", ops[k].0, ops[k].1))
+        .collect();
+    if body.is_empty() {
+        body.push("  (no text change)".to_owned());
+    }
+
+    Some(body)
 }
 
 fn push_subject(line: &mut String, process: Option<&str>, title: Option<&str>) {
@@ -1584,6 +1656,20 @@ mod tests {
                     ..screen_payload(OcrStatus::Succeeded, Some(&long.join("\n\n")))
                 },
             ),
+            capture(
+                4,
+                "2026-07-24T16:00:04Z",
+                "viewer.exe",
+                "Example Page",
+                "line 1\nline 2\n\n\nline 5\nline 6\n\nline 8\nline 9\nline 10",
+            ),
+            capture(
+                5,
+                "2026-07-24T16:00:05Z",
+                "viewer.exe",
+                "Example Page",
+                "line 1\nline 2\n\nline 4\nline 5\n\n\nline 8\nline 9\nline 10",
+            ),
         ];
         let spans = [span(
             3,
@@ -1606,14 +1692,23 @@ mod tests {
             "2026-07-24T16:00:02Z - 2026-07-24T16:00:02Z",
             "2026-07-24T16:00:03Z [editor.exe] Other Page",
             "2026-07-24T16:00:03Z [editor.exe] Other Page (continued)",
+            "2026-07-24T16:00:04Z [viewer.exe] Example Page",
+            "2026-07-24T16:00:05Z [viewer.exe] Example Page (changes since 2026-07-24T16:00:04Z)",
         ];
 
         assert!(!episode.content.contains("\n\n\n"));
         assert!(!episode.content.starts_with('\n') && !episode.content.ends_with('\n'));
         let blocks: Vec<_> = episode.content.split("\n\n").collect();
         assert!(
-            blocks.len() > 4,
+            blocks.len() > 6,
             "the long entry should span several blocks"
+        );
+        assert_eq!(
+            blocks[blocks.len() - 1],
+            format!(
+                "{}\n    \n  - \n  + line 4\n    line 5\n  - line 6\n  + \n    ",
+                headers[6]
+            )
         );
         assert_eq!(blocks[0], EPISODE_HEADER);
         for block in &blocks[1..] {
@@ -1649,6 +1744,455 @@ mod tests {
             overflows.content.split("\n\n").count(),
             3,
             "one character past the limit should start a new block"
+        );
+    }
+
+    fn capture(id: u128, observed_at: &str, process: &str, title: &str, text: &str) -> Observation {
+        observation(
+            id,
+            observed_at,
+            ScreenPayload {
+                foreground_process: Some(process.to_owned()),
+                foreground_window_title: Some(title.to_owned()),
+                ..screen_payload(OcrStatus::Succeeded, Some(text))
+            },
+        )
+    }
+
+    fn episode_blocks(observations: &[Observation]) -> Vec<String> {
+        build_episode(
+            timestamp("2026-07-24T16:00:00Z"),
+            5,
+            FixedOffset::east_opt(0).expect("UTC offset should be valid"),
+            observations,
+            &[],
+        )
+        .expect("the observations should build an episode")
+        .content
+        .split("\n\n")
+        .map(str::to_owned)
+        .collect()
+    }
+
+    const SECOND_ENTRY_HEADER: &str = "2026-07-24T16:00:02Z [editor.exe] Example Page";
+    const SECOND_SINCE_FIRST: &str =
+        "2026-07-24T16:00:02Z [editor.exe] Example Page (changes since 2026-07-24T16:00:01Z)";
+
+    #[test]
+    fn a_window_seen_again_renders_the_lines_changed_since_its_previous_capture() {
+        let first = [
+            "Title", "line 2", "line 3", "line 4", "line 5", "line 6", "line 7", "line 8",
+        ];
+        let again = [
+            "Title",
+            "line 2",
+            "line 3 edited",
+            "line 4",
+            "line 5",
+            "line 6",
+            "line 7",
+            "line 8",
+            "line 9",
+        ];
+        let observations = [
+            capture(
+                1,
+                "2026-07-24T16:00:01Z",
+                "editor.exe",
+                "Example Page",
+                &first.join("\n"),
+            ),
+            capture(
+                2,
+                "2026-07-24T16:00:02Z",
+                "viewer.exe",
+                "Other Page",
+                "Status: Done",
+            ),
+            capture(
+                3,
+                "2026-07-24T16:00:03Z",
+                "editor.exe",
+                "Example Page",
+                &again.join("\n"),
+            ),
+        ];
+
+        let episode = build_episode(
+            timestamp("2026-07-24T16:00:00Z"),
+            5,
+            FixedOffset::east_opt(9 * 3600).expect("test offset should be valid"),
+            &observations,
+            &[],
+        )
+        .expect("the observations should build an episode");
+        let golden = r#"[2026-07-25T01:00:00+09:00 - 2026-07-25T01:05:00+09:00] Screen episode
+
+2026-07-25T01:00:01+09:00 [editor.exe] Example Page
+  Title
+  line 2
+  line 3
+  line 4
+  line 5
+  line 6
+  line 7
+  line 8
+
+2026-07-25T01:00:02+09:00 [viewer.exe] Other Page
+  Status: Done
+
+2026-07-25T01:00:03+09:00 [editor.exe] Example Page (changes since 2026-07-25T01:00:01+09:00)
+    line 2
+  - line 3
+  + line 3 edited
+    line 4
+    line 8
+  + line 9"#;
+
+        assert_eq!(episode.content, golden);
+        assert_eq!(episode.metadata.entry_count, "3");
+    }
+
+    #[test]
+    fn a_replaced_line_renders_as_its_deletion_then_its_insertion() {
+        let blocks = episode_blocks(&[
+            capture(
+                1,
+                "2026-07-24T16:00:01Z",
+                "editor.exe",
+                "Example Page",
+                "Title\nStatus: Done\nOwner: A\nline 4\nline 5\nline 6\nline 7",
+            ),
+            capture(
+                2,
+                "2026-07-24T16:00:02Z",
+                "editor.exe",
+                "Example Page",
+                "Title\nStatus: Open\nOwner: A\nline 4\nline 5\nline 6\nline 7",
+            ),
+        ]);
+
+        assert_eq!(
+            blocks[2..],
+            [format!(
+                "{SECOND_SINCE_FIRST}\n    Title\n  - Status: Done\n  + Status: Open\n    Owner: A"
+            )]
+        );
+    }
+
+    #[test]
+    fn a_line_that_returns_is_inserted_against_the_capture_that_lacked_it() {
+        let with_x = "line 1\nline 2\nline 3\nx\nline 5\nline 6\nline 7";
+        let blocks = episode_blocks(&[
+            capture(
+                1,
+                "2026-07-24T16:00:01Z",
+                "editor.exe",
+                "Example Page",
+                with_x,
+            ),
+            capture(
+                2,
+                "2026-07-24T16:00:02Z",
+                "editor.exe",
+                "Example Page",
+                "line 1\nline 2\nline 3\nline 5\nline 6\nline 7",
+            ),
+            capture(
+                3,
+                "2026-07-24T16:00:03Z",
+                "editor.exe",
+                "Example Page",
+                with_x,
+            ),
+        ]);
+
+        assert_eq!(
+            blocks[2..],
+            [
+                format!("{SECOND_SINCE_FIRST}\n    line 3\n  - x\n    line 5"),
+                "2026-07-24T16:00:03Z [editor.exe] Example Page (changes since 2026-07-24T16:00:02Z)\n    line 3\n  + x\n    line 5".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn identical_text_seen_again_in_the_same_window_renders_no_text_change() {
+        let text = "Status: Done\nline 2\nline 3";
+        let blocks = episode_blocks(&[
+            capture(
+                1,
+                "2026-07-24T16:00:01Z",
+                "editor.exe",
+                "Example Page",
+                text,
+            ),
+            capture(2, "2026-07-24T16:00:02Z", "editor.exe", "Other Page", text),
+            capture(
+                3,
+                "2026-07-24T16:00:03Z",
+                "viewer.exe",
+                "Example Page",
+                text,
+            ),
+            capture(
+                4,
+                "2026-07-24T16:00:04Z",
+                "editor.exe",
+                "Example Page",
+                text,
+            ),
+        ]);
+
+        assert_eq!(
+            blocks[2..],
+            [
+                "2026-07-24T16:00:02Z [editor.exe] Other Page\n  Status: Done\n  line 2\n  line 3",
+                "2026-07-24T16:00:03Z [viewer.exe] Example Page\n  Status: Done\n  line 2\n  line 3",
+                "2026-07-24T16:00:04Z [editor.exe] Example Page (changes since 2026-07-24T16:00:01Z)\n  (no text change)",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_change_list_no_shorter_than_the_full_text_renders_in_full() {
+        let blocks = episode_blocks(&[
+            capture(
+                1,
+                "2026-07-24T16:00:01Z",
+                "editor.exe",
+                "Example Page",
+                "line 1\nline 2\nline 3",
+            ),
+            capture(
+                2,
+                "2026-07-24T16:00:02Z",
+                "editor.exe",
+                "Example Page",
+                "line 4\nline 5\nline 6",
+            ),
+        ]);
+        assert_eq!(
+            blocks[2],
+            format!("{SECOND_ENTRY_HEADER}\n  line 4\n  line 5\n  line 6")
+        );
+
+        let seen_twice = |text: &str| {
+            episode_blocks(&[
+                capture(
+                    1,
+                    "2026-07-24T16:00:01Z",
+                    "editor.exe",
+                    "Example Page",
+                    text,
+                ),
+                capture(
+                    2,
+                    "2026-07-24T16:00:02Z",
+                    "viewer.exe",
+                    "Other Page",
+                    "line 1",
+                ),
+                capture(
+                    3,
+                    "2026-07-24T16:00:03Z",
+                    "editor.exe",
+                    "Example Page",
+                    text,
+                ),
+            ])
+            .pop()
+            .expect("the episode should hold a last block")
+        };
+        let header = "2026-07-24T16:00:03Z [editor.exe] Example Page";
+        assert_eq!(
+            "  line 3 of a page".chars().count(),
+            "  (no text change)".chars().count()
+        );
+        assert_eq!(
+            seen_twice("line 3 of a page"),
+            format!("{header}\n  line 3 of a page")
+        );
+        assert_eq!(
+            seen_twice("line 13 of a page"),
+            format!("{header} (changes since 2026-07-24T16:00:01Z)\n  (no text change)")
+        );
+    }
+
+    #[test]
+    fn a_failed_capture_neither_shows_changes_nor_becomes_the_base() {
+        let blocks = episode_blocks(&[
+            capture(
+                1,
+                "2026-07-24T16:00:01Z",
+                "editor.exe",
+                "Example Page",
+                "Title\nStatus: Done\nOwner: A\nline 4\nline 5\nline 6\nline 7",
+            ),
+            observation(
+                2,
+                "2026-07-24T16:00:02Z",
+                ScreenPayload {
+                    foreground_process: Some("editor.exe".to_owned()),
+                    foreground_window_title: Some("Example Page".to_owned()),
+                    ocr_error: Some("engine unavailable".to_owned()),
+                    ..screen_payload(OcrStatus::Failed, None)
+                },
+            ),
+            observation(
+                3,
+                "2026-07-24T16:00:03Z",
+                ScreenPayload {
+                    foreground_process: Some("editor.exe".to_owned()),
+                    foreground_window_title: Some("Example Page".to_owned()),
+                    ..screen_payload(OcrStatus::NoText, None)
+                },
+            ),
+            capture(
+                4,
+                "2026-07-24T16:00:04Z",
+                "editor.exe",
+                "Example Page",
+                "Title\nStatus: Open\nOwner: A\nline 4\nline 5\nline 6\nline 7",
+            ),
+        ]);
+
+        assert_eq!(
+            blocks[2..],
+            [
+                format!("{SECOND_ENTRY_HEADER}\n  [OCR failed: engine unavailable]"),
+                "2026-07-24T16:00:03Z [editor.exe] Example Page".to_owned(),
+                "2026-07-24T16:00:04Z [editor.exe] Example Page (changes since 2026-07-24T16:00:01Z)\n    Title\n  - Status: Done\n  + Status: Open\n    Owner: A".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_change_list_longer_than_a_block_continues_under_its_changes_since_header() {
+        let line = |n: usize, fill: &str| format!("line {n} {}", fill.repeat(40));
+        let page = |changed: &str| {
+            (1..=200)
+                .map(|n| line(n, if (50..70).contains(&n) { changed } else { "x" }))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let blocks = episode_blocks(&[
+            capture(
+                1,
+                "2026-07-24T16:00:01Z",
+                "editor.exe",
+                "Example Page",
+                &page("x"),
+            ),
+            capture(
+                2,
+                "2026-07-24T16:00:02Z",
+                "editor.exe",
+                "Example Page",
+                &page("y"),
+            ),
+        ]);
+        let continued = format!("{SECOND_SINCE_FIRST} (continued)");
+        let start = blocks
+            .iter()
+            .position(|block| block.starts_with(SECOND_ENTRY_HEADER))
+            .expect("the second capture should be rendered");
+        let entry = &blocks[start..];
+        assert!(
+            entry.len() > 2,
+            "the change list should span several blocks"
+        );
+
+        let mut reassembled = Vec::new();
+        for (index, block) in entry.iter().enumerate() {
+            assert!(block.chars().count() <= BLOCK_CHARS);
+            let mut lines = block.lines();
+            let expected_header = if index == 0 {
+                SECOND_SINCE_FIRST
+            } else {
+                continued.as_str()
+            };
+            assert_eq!(lines.next(), Some(expected_header));
+            reassembled.extend(lines.map(str::to_owned));
+        }
+        let expected: Vec<_> = std::iter::once(format!("    {}", line(49, "x")))
+            .chain((50..70).map(|n| format!("  - {}", line(n, "x"))))
+            .chain((50..70).map(|n| format!("  + {}", line(n, "y"))))
+            .chain(std::iter::once(format!("    {}", line(70, "x"))))
+            .collect();
+        assert_eq!(reassembled, expected);
+    }
+
+    #[test]
+    fn only_the_lines_between_the_common_ends_count_against_the_diff_limit() {
+        let page = |count: usize, first: &str, last: &str| {
+            std::iter::once(first.to_owned())
+                .chain((2..count).map(|n| format!("line {n}")))
+                .chain(std::iter::once(last.to_owned()))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let pair = |old: &str, new: &str| {
+            episode_blocks(&[
+                capture(1, "2026-07-24T16:00:01Z", "editor.exe", "Example Page", old),
+                capture(2, "2026-07-24T16:00:02Z", "editor.exe", "Example Page", new),
+            ])
+        };
+
+        let over = pair(
+            &page(1001, "first old", "last old"),
+            &page(1001, "first new", "last new"),
+        );
+        assert!(over.iter().all(|block| !block.contains("changes since")));
+        assert!(over.iter().any(|block| {
+            block.starts_with(&format!("{SECOND_ENTRY_HEADER}\n  first new\n  line 2\n"))
+        }));
+
+        let at_limit = pair(
+            &page(1000, "first old", "last old"),
+            &page(1000, "first new", "last new"),
+        );
+        assert_eq!(
+            at_limit.last(),
+            Some(&format!(
+                "{SECOND_SINCE_FIRST}\n  - first old\n  + first new\n    line 2\n    line 999\n  - last old\n  + last new"
+            ))
+        );
+
+        let long = page(1500, "line 1", "line 1500");
+        let edited = long.replace("\nline 750\n", "\nline 750 edited\n");
+        assert_eq!(
+            pair(&long, &edited).last(),
+            Some(&format!(
+                "{SECOND_SINCE_FIRST}\n    line 749\n  - line 750\n  + line 750 edited\n    line 751"
+            ))
+        );
+    }
+
+    #[test]
+    fn a_common_line_between_two_changes_shows_once_and_distant_ones_not_at_all() {
+        let blocks = episode_blocks(&[
+            capture(
+                1,
+                "2026-07-24T16:00:01Z",
+                "editor.exe",
+                "Example Page",
+                "line 1\nline 2\nline 3\na1\na2\nline 6\nb\nline 8\nline 9\nline 10\nline 11\nline 12",
+            ),
+            capture(
+                2,
+                "2026-07-24T16:00:02Z",
+                "editor.exe",
+                "Example Page",
+                "line 1\nline 2\nline 3\nA1\nA2\nline 6\nB\nline 8\nline 9\nline 10\nline 11\nline 12",
+            ),
+        ]);
+
+        assert_eq!(
+            blocks[2],
+            format!(
+                "{SECOND_SINCE_FIRST}\n    line 3\n  - a1\n  - a2\n  + A1\n  + A2\n    line 6\n  - b\n  + B\n    line 8"
+            )
         );
     }
 }

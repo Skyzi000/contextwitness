@@ -10,7 +10,7 @@ Requires Windows 11 24H2 (build 26100) or later. Building requires the MSVC tool
 
 - Captures the foreground window every few seconds with Windows Graphics Capture, storing a frame only when enough pixels actually changed. Other windows and monitors are not captured; parts of the foreground window that other windows cover are.
 - Extracts on-screen text with the Windows OCR engine, using the first configured language an installed engine exists for (Japanese, then English, by default).
-- Groups captures into episode windows (5 minutes by default) rendered as a time-anchored activity log. The time between stored frames is logged too: no change above the capture threshold, no new frame received, no capturable foreground window, paused, skipped by the blacklist, capture or storage failures with their error text, and stretches with nothing recorded.
+- Groups captures into episode windows (5 minutes by default) rendered as a time-anchored activity log; a window captured again within an episode is logged as the lines that changed since its previous capture, its first capture in the episode in full. The time between stored frames is logged too: no change above the capture threshold, no new frame received, no capturable foreground window, paused, skipped by the blacklist, capture or storage failures with their error text, and stretches with nothing recorded.
 - Stores everything locally first: episodes in SQLite, frames as WebP images with retention limits (14 days / 50 GiB by default).
 - Delivers episodes to Hindsight through a persistent outbox: if the server is down, episodes wait and are delivered when it returns.
 - Runs with a tray icon; `pause`/`resume` from the tray or the command line; optional start at logon.
