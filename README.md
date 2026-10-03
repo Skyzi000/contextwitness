@@ -61,7 +61,7 @@ Hindsight credentials never live in `config.toml`. `setup` writes them to `%USER
 ContextWitness records the screen. Know what that means before running it:
 
 - **It collects everything by default.** The foreground window is captured whatever it shows, including any parts other windows cover; all text OCR recognizes in it is stored, and each entry records the window's title and process name whenever they can be read.
-- **Everything stays on your machine except delivery to Hindsight.** Episode text — window titles, process names and capture status lines with their error text included — and its metadata (episode timing, local image paths) go to the Hindsight server you configured; nothing is sent anywhere else. The captured images themselves are never uploaded.
+- **Everything stays on your machine except delivery to Hindsight.** Episode text — window titles, process names and capture status lines with their error text included — and its metadata (episode timing and entry count) go to the Hindsight server you configured; nothing is sent anywhere else. The captured images themselves are never uploaded.
 - **`privacy.process_blacklist`** skips capture while a listed process (matched by executable name, case-insensitively) is in the foreground; the episode still records the skip and the process name that caused it. When a blacklist is configured and the foreground process cannot be determined, the tick is skipped rather than risked.
 - **Pause** stops the capture loop: from the tray menu, or `contextwitness pause 30m` (no duration means until `resume`).
 - **Retention** prunes stored images by age and total size. Episode text in the local database is kept indefinitely — it is the memory this tool exists to build.

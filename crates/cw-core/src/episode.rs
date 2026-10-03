@@ -46,9 +46,6 @@ pub struct EpisodeMetadata {
     pub episode_end: String,
     /// Number of observation entries in `content` after folding, in decimal.
     pub entry_count: String,
-    /// Relative image paths of the rendered entries, in render order, as a JSON array string.
-    /// Entries folded as duplicates and entries with no stored image are absent.
-    pub image_paths: String,
 }
 
 /// Truncate `at` down to a multiple of `window_minutes` counted from the Unix epoch.
@@ -160,7 +157,6 @@ pub fn build_episode(
     let rendered_chars =
         |lines: &[String]| -> usize { lines.iter().map(|line| line.chars().count() + 1).sum() };
     let mut blocks = Vec::new();
-    let mut image_paths = Vec::new();
     let mut bases: std::collections::HashMap<_, (_, Vec<_>)> = std::collections::HashMap::new();
 
     for (from, to, span) in states {
@@ -233,9 +229,6 @@ pub fn build_episode(
             },
         }
 
-        if let Some(image_path) = &screen.image_path {
-            image_paths.push(image_path.clone());
-        }
         blocks.push((
             (observation.observed_at, 2, observation.id),
             entry_blocks(&entry_line, &body),
@@ -262,8 +255,6 @@ pub fn build_episode(
             episode_start,
             episode_end,
             entry_count: entries.len().to_string(),
-            image_paths: serde_json::to_string(&image_paths)
-                .expect("a list of strings must serialise"),
         },
     })
 }
@@ -684,8 +675,7 @@ mod tests {
             serde_json::json!({
                 "episode_start": "2026-07-24T16:00:00Z",
                 "episode_end": "2026-07-24T16:05:00Z",
-                "entry_count": "4",
-                "image_paths": "[\"images/a.webp\",\"images/e.webp\",\"images/c.webp\"]"
+                "entry_count": "4"
             })
         );
     }
@@ -1160,7 +1150,6 @@ mod tests {
         .expect("the observations should build an episode");
 
         assert_eq!(episode.metadata.entry_count, "1");
-        assert_eq!(episode.metadata.image_paths, "[\"images/a.webp\"]");
         assert!(episode.content.contains("\n2026-07-24T16:00:01Z"));
         assert!(!episode.content.contains("\n2026-07-24T16:00:02Z"));
         assert!(!episode.content.contains("\n2026-07-24T16:00:03Z"));
@@ -1254,7 +1243,6 @@ mod tests {
              2026-07-24T16:01:00Z - 2026-07-24T16:02:00Z\n  [capture paused]"
         );
         assert_eq!(episode.metadata.entry_count, "0");
-        assert_eq!(episode.metadata.image_paths, "[]");
     }
 
     #[test]
@@ -1417,10 +1405,6 @@ mod tests {
 
         assert_eq!(episode.content, golden);
         assert_eq!(episode.metadata.entry_count, "2");
-        assert_eq!(
-            episode.metadata.image_paths,
-            "[\"images/a.webp\",\"images/b.webp\"]"
-        );
     }
 
     #[test]
