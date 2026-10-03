@@ -2,6 +2,10 @@
 
 const SCREEN_SOURCE: &str = "screen";
 
+/// Hindsight splits retained text at blank lines before line breaks and packs the pieces into chunks
+/// of `retain_chunk_size` characters, 3000 by default; a block this long reaches a chunk whole.
+const BLOCK_CHARS: usize = 1000;
+
 /// A finished episode: the exact text and metadata that will be stored and delivered.
 ///
 /// There is deliberately no `id` field — the ULID is assigned by the store when the row is
@@ -150,9 +154,6 @@ pub fn build_episode(
     };
     let rendered_start = render(window_start);
     let rendered_end = render(end_at);
-    let mut lines = vec![format!(
-        "[{rendered_start} - {rendered_end}] Screen episode"
-    )];
     let mut blocks = Vec::new();
     let mut image_paths = Vec::new();
 
@@ -182,7 +183,7 @@ pub fn build_episode(
         } else {
             (from, 1, span.id)
         };
-        blocks.push((order, vec![state_line, note]));
+        blocks.push((order, vec![format!("{state_line}\n{note}")]));
     }
 
     for (observation, screen) in &entries {
@@ -192,7 +193,7 @@ pub fn build_episode(
             screen.foreground_process.as_deref(),
             screen.foreground_window_title.as_deref(),
         );
-        let mut block = vec![entry_line];
+        let mut body = Vec::new();
 
         match &screen.ocr_status {
             crate::model::OcrStatus::Succeeded => {
@@ -204,30 +205,31 @@ pub fn build_episode(
                     while ocr_lines.last().is_some_and(|line| line.is_empty()) {
                         ocr_lines.pop();
                     }
-                    block.extend(ocr_lines.into_iter().map(|line| {
-                        if line.is_empty() {
-                            String::new()
-                        } else {
-                            format!("  {line}")
-                        }
-                    }));
+                    body.extend(ocr_lines.into_iter().map(|line| format!("  {line}")));
                 }
             }
             crate::model::OcrStatus::NoText => {}
             crate::model::OcrStatus::Failed => match &screen.ocr_error {
-                Some(error) => block.push(format!("  [OCR failed: {error}]")),
-                None => block.push("  [OCR failed]".to_owned()),
+                Some(error) => body.push(format!("  [OCR failed: {error}]")),
+                None => body.push("  [OCR failed]".to_owned()),
             },
         }
 
         if let Some(image_path) = &screen.image_path {
             image_paths.push(image_path.clone());
         }
-        blocks.push(((observation.observed_at, 2, observation.id), block));
+        blocks.push((
+            (observation.observed_at, 2, observation.id),
+            entry_blocks(&entry_line, &body),
+        ));
     }
 
     blocks.sort_by_key(|(order, _)| *order);
-    lines.extend(blocks.into_iter().flat_map(|(_, block)| block));
+    let header = format!("[{rendered_start} - {rendered_end}] Screen episode");
+    let content = std::iter::once(header)
+        .chain(blocks.into_iter().flat_map(|(_, blocks)| blocks))
+        .collect::<Vec<_>>()
+        .join("\n\n");
 
     let episode_start = window_start.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let episode_end = end_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
@@ -237,7 +239,7 @@ pub fn build_episode(
         start_at: window_start,
         end_at,
         document_id: format!("{SCREEN_SOURCE}-{episode_start}-{window_minutes}m"),
-        content: lines.join("\n"),
+        content,
         metadata: EpisodeMetadata {
             episode_start,
             episode_end,
@@ -246,6 +248,29 @@ pub fn build_episode(
                 .expect("a list of strings must serialise"),
         },
     })
+}
+
+fn entry_blocks(header: &str, body: &[String]) -> Vec<String> {
+    let mut blocks = Vec::new();
+    let mut block = header.to_owned();
+    let mut block_chars = header.chars().count();
+
+    for (index, line) in body.iter().enumerate() {
+        let line_chars = line.chars().count();
+        if index > 0 && block_chars + 1 + line_chars > BLOCK_CHARS {
+            blocks.push(std::mem::replace(
+                &mut block,
+                format!("{header} (continued)"),
+            ));
+            block_chars = block.chars().count();
+        }
+        block.push('\n');
+        block.push_str(line);
+        block_chars += 1 + line_chars;
+    }
+    blocks.push(block);
+
+    blocks
 }
 
 fn push_subject(line: &mut String, process: Option<&str>, title: Option<&str>) {
@@ -539,12 +564,16 @@ mod tests {
         )
         .expect("the golden observations should build an episode");
         let golden = r#"[2026-07-25T01:00:00+09:00 - 2026-07-25T01:05:00+09:00] Screen episode
+
 2026-07-25T01:00:02+09:00 [firefox.exe] Example Page
   line one
   line two
+
 2026-07-25T01:00:30+09:00
+
 2026-07-25T01:01:14+09:00 [Code.exe] contextwitness - Visual Studio Code
   fn main() {}
+
 2026-07-25T01:02:00+09:00 [Code.exe] contextwitness - Visual Studio Code
   [OCR failed: engine unavailable]"#;
 
@@ -1070,7 +1099,7 @@ mod tests {
         )
         .expect("the observation should build an episode");
 
-        assert!(interior_episode.content.ends_with("\n  a\n\n  b"));
+        assert!(interior_episode.content.ends_with("\n  a\n  \n  b"));
         assert!(!interior_episode.content.ends_with('\n'));
     }
 
@@ -1121,7 +1150,7 @@ mod tests {
 
         assert_eq!(
             episode.content,
-            "[2026-07-24T16:00:00Z - 2026-07-24T16:05:00Z] Screen episode\n\
+            "[2026-07-24T16:00:00Z - 2026-07-24T16:05:00Z] Screen episode\n\n\
              2026-07-24T16:01:00Z - 2026-07-24T16:02:00Z\n  [capture paused]"
         );
         assert_eq!(episode.metadata.entry_count, "0");
@@ -1252,26 +1281,37 @@ mod tests {
         )
         .expect("the golden entries and spans should build an episode");
         let golden = r#"[2026-07-25T01:00:00+09:00 - 2026-07-25T01:05:00+09:00] Screen episode
+
 2026-07-25T00:52:10+09:00 - 2026-07-25T01:00:00+09:00
   [nothing recorded]
+
 2026-07-25T01:00:00+09:00 - 2026-07-25T01:00:20+09:00
   [capture paused]
+
 2026-07-25T01:00:30+09:00 - 2026-07-25T01:00:50+09:00
   [capture skipped by the process blacklist: private.exe]
+
 2026-07-25T01:01:00+09:00 - 2026-07-25T01:01:00+09:00 [editor.exe]
   [no capturable foreground window]
+
 2026-07-25T01:01:10+09:00 [editor.exe] Example Page
   hello world
+
 2026-07-25T01:01:20+09:00 - 2026-07-25T01:02:00+09:00 [editor.exe] Example Page
   [no change above the capture threshold]
+
 2026-07-25T01:02:10+09:00 - 2026-07-25T01:02:20+09:00 [editor.exe] Example Page
   [no new frame received]
+
 2026-07-25T01:02:30+09:00 - 2026-07-25T01:02:30+09:00 [viewer.exe] Example Image
   [capture failed: capture session ended]
+
 2026-07-25T01:02:40+09:00 - 2026-07-25T01:02:50+09:00 [editor.exe] notes.txt
   [storing the capture failed: image io: disk full]
+
 2026-07-25T01:03:00+09:00 [editor.exe] notes.txt
   line one
+
 2026-07-25T01:03:10+09:00 - 2026-07-25T01:05:00+09:00 [editor.exe] notes.txt
   [no change above the capture threshold]"#;
 
@@ -1304,7 +1344,7 @@ mod tests {
         assert!(
             episode
                 .content
-                .ends_with("\n2026-07-24T16:00:00Z - 2026-07-24T16:05:00Z\n  [no change above the capture threshold]")
+                .ends_with("\n\n2026-07-24T16:00:00Z - 2026-07-24T16:05:00Z\n  [no change above the capture threshold]")
         );
     }
 
@@ -1339,7 +1379,7 @@ mod tests {
         assert!(
             episode
                 .content
-                .ends_with("\n2026-07-24T15:50:00Z - 2026-07-24T16:12:30Z\n  [nothing recorded]")
+                .ends_with("\n\n2026-07-24T15:50:00Z - 2026-07-24T16:12:30Z\n  [nothing recorded]")
         );
     }
 
@@ -1379,9 +1419,9 @@ mod tests {
 
         assert_eq!(
             episode.content,
-            "[2026-07-24T16:00:00Z - 2026-07-24T16:05:00Z] Screen episode\n\
-             2026-07-24T16:01:00Z - 2026-07-24T16:01:00Z Lower\n  [no change above the capture threshold]\n\
-             2026-07-24T16:01:00Z - 2026-07-24T16:01:00Z Higher\n  [no new frame received]\n\
+            "[2026-07-24T16:00:00Z - 2026-07-24T16:05:00Z] Screen episode\n\n\
+             2026-07-24T16:01:00Z - 2026-07-24T16:01:00Z Lower\n  [no change above the capture threshold]\n\n\
+             2026-07-24T16:01:00Z - 2026-07-24T16:01:00Z Higher\n  [no new frame received]\n\n\
              2026-07-24T16:01:00Z Entry"
         );
     }
@@ -1422,10 +1462,193 @@ mod tests {
 
         assert_eq!(
             episode.content,
-            "[2026-07-24T16:00:00Z - 2026-07-24T16:05:00Z] Screen episode\n\
-             2026-07-24T16:01:00Z Before\n\
-             2026-07-24T16:01:00Z - 2026-07-24T16:03:00Z\n  [nothing recorded]\n\
+            "[2026-07-24T16:00:00Z - 2026-07-24T16:05:00Z] Screen episode\n\n\
+             2026-07-24T16:01:00Z Before\n\n\
+             2026-07-24T16:01:00Z - 2026-07-24T16:03:00Z\n  [nothing recorded]\n\n\
              2026-07-24T16:03:00Z - 2026-07-24T16:03:00Z After\n  [no new frame received]"
+        );
+    }
+
+    const EPISODE_HEADER: &str = "[2026-07-24T16:00:00Z - 2026-07-24T16:05:00Z] Screen episode";
+    const ENTRY_HEADER: &str = "2026-07-24T16:00:01Z [editor.exe] Example Page";
+
+    fn single_entry_episode(text: &str) -> Episode {
+        let observations = [observation(
+            1,
+            "2026-07-24T16:00:01Z",
+            ScreenPayload {
+                foreground_process: Some("editor.exe".to_owned()),
+                foreground_window_title: Some("Example Page".to_owned()),
+                ..screen_payload(OcrStatus::Succeeded, Some(text))
+            },
+        )];
+
+        build_episode(
+            timestamp("2026-07-24T16:00:00Z"),
+            5,
+            FixedOffset::east_opt(0).expect("UTC offset should be valid"),
+            &observations,
+            &[],
+        )
+        .expect("the observation should build an episode")
+    }
+
+    #[test]
+    fn an_entry_longer_than_a_block_continues_under_its_own_header() {
+        let ocr_lines: Vec<_> = (1..=80)
+            .map(|n| format!("line {n} {}", "x".repeat(40)))
+            .collect();
+        let episode = single_entry_episode(&ocr_lines.join("\n"));
+        let blocks: Vec<_> = episode.content.split("\n\n").collect();
+        let continued = format!("{ENTRY_HEADER} (continued)");
+
+        assert_eq!(blocks[0], EPISODE_HEADER);
+        let entry = &blocks[1..];
+        assert!(entry.len() > 2, "the entry should span several blocks");
+
+        let mut reassembled = Vec::new();
+        for (index, block) in entry.iter().enumerate() {
+            assert!(
+                block.chars().count() <= BLOCK_CHARS,
+                "block {index} holds {} characters",
+                block.chars().count()
+            );
+            let mut lines = block.lines();
+            let first = lines.next().expect("a block should have a first line");
+            if index == 0 {
+                assert_eq!(first, ENTRY_HEADER);
+                reassembled.push(first);
+            } else {
+                assert_eq!(first, continued);
+            }
+            reassembled.extend(lines);
+        }
+        let expected: Vec<_> = std::iter::once(ENTRY_HEADER.to_owned())
+            .chain(ocr_lines.iter().map(|line| format!("  {line}")))
+            .collect();
+        assert_eq!(reassembled, expected);
+
+        for pair in entry.windows(2) {
+            let next_line = pair[1]
+                .lines()
+                .nth(1)
+                .expect("a continuation block should hold a line after its header");
+            assert!(
+                pair[0].chars().count() + 1 + next_line.chars().count() > BLOCK_CHARS,
+                "a block should close only when its next line would not fit"
+            );
+        }
+    }
+
+    #[test]
+    fn an_ocr_line_longer_than_a_block_stays_whole() {
+        let long = "y".repeat(BLOCK_CHARS + 200);
+        let episode = single_entry_episode(&format!("{long}\nline 2\n{long}"));
+        let continued = format!("{ENTRY_HEADER} (continued)");
+
+        assert_eq!(
+            episode.content.split("\n\n").collect::<Vec<_>>(),
+            [
+                EPISODE_HEADER.to_owned(),
+                format!("{ENTRY_HEADER}\n  {long}"),
+                format!("{continued}\n  line 2"),
+                format!("{continued}\n  {long}"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_blank_line_only_ever_separates_blocks() {
+        let long: Vec<_> = (1..=40)
+            .map(|n| format!("line {n} {}", "x".repeat(40)))
+            .collect();
+        let observations = [
+            observation(
+                1,
+                "2026-07-24T16:00:01Z",
+                ScreenPayload {
+                    foreground_process: Some("editor.exe".to_owned()),
+                    foreground_window_title: Some("Example Page".to_owned()),
+                    ..screen_payload(
+                        OcrStatus::Succeeded,
+                        Some("\nline 1\n\nline 2\r\n\r\n\r\nline 3\n\n"),
+                    )
+                },
+            ),
+            observation(
+                2,
+                "2026-07-24T16:00:03Z",
+                ScreenPayload {
+                    foreground_process: Some("editor.exe".to_owned()),
+                    foreground_window_title: Some("Other Page".to_owned()),
+                    ..screen_payload(OcrStatus::Succeeded, Some(&long.join("\n\n")))
+                },
+            ),
+        ];
+        let spans = [span(
+            3,
+            "2026-07-24T16:00:02Z",
+            "2026-07-24T16:00:02Z",
+            bare(CaptureState::Unchanged),
+        )];
+
+        let episode = build_episode(
+            timestamp("2026-07-24T16:00:00Z"),
+            5,
+            FixedOffset::east_opt(0).expect("UTC offset should be valid"),
+            &observations,
+            &spans,
+        )
+        .expect("the entries and the span should build an episode");
+        let headers = [
+            EPISODE_HEADER,
+            ENTRY_HEADER,
+            "2026-07-24T16:00:02Z - 2026-07-24T16:00:02Z",
+            "2026-07-24T16:00:03Z [editor.exe] Other Page",
+            "2026-07-24T16:00:03Z [editor.exe] Other Page (continued)",
+        ];
+
+        assert!(!episode.content.contains("\n\n\n"));
+        assert!(!episode.content.starts_with('\n') && !episode.content.ends_with('\n'));
+        let blocks: Vec<_> = episode.content.split("\n\n").collect();
+        assert!(
+            blocks.len() > 4,
+            "the long entry should span several blocks"
+        );
+        assert_eq!(blocks[0], EPISODE_HEADER);
+        for block in &blocks[1..] {
+            let first = block.lines().next().expect("a block should not be empty");
+            assert!(
+                headers[1..].contains(&first),
+                "a block should start at a header, not at `{first}`"
+            );
+        }
+        assert_eq!(
+            blocks[1],
+            format!("{ENTRY_HEADER}\n  \n  line 1\n  \n  line 2\n  \n  \n  line 3")
+        );
+    }
+
+    #[test]
+    fn a_block_is_measured_in_characters_not_bytes() {
+        let first = "あ".repeat(400);
+        let filling = BLOCK_CHARS - ENTRY_HEADER.chars().count() - (1 + 2 + 400) - (1 + 2);
+
+        let fits = single_entry_episode(&format!("{first}\n{}", "あ".repeat(filling)));
+        let blocks: Vec<_> = fits.content.split("\n\n").collect();
+        assert_eq!(
+            blocks.len(),
+            2,
+            "a block of exactly the limit should stay whole"
+        );
+        assert_eq!(blocks[1].chars().count(), BLOCK_CHARS);
+        assert!(blocks[1].len() > BLOCK_CHARS);
+
+        let overflows = single_entry_episode(&format!("{first}\n{}", "あ".repeat(filling + 1)));
+        assert_eq!(
+            overflows.content.split("\n\n").count(),
+            3,
+            "one character past the limit should start a new block"
         );
     }
 }
