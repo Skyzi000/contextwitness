@@ -533,6 +533,8 @@ mod tests {
                 ocr_langs: Vec::new(),
                 foreground_process: None,
                 foreground_window_title: None,
+                foreground_hwnd: None,
+                foreground_pid: None,
             },
             at("2026-07-25T12:01:00Z"),
         );
@@ -567,6 +569,8 @@ mod tests {
                 ocr_langs: Vec::new(),
                 foreground_process: None,
                 foreground_window_title: None,
+                foreground_hwnd: None,
+                foreground_pid: None,
             },
             at("2026-07-25T12:00:00Z"),
         );

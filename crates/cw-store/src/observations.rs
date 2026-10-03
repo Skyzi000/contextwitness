@@ -212,6 +212,8 @@ mod tests {
             ocr_langs: vec!["ja-JP".to_owned(), "en-US".to_owned()],
             foreground_process: Some("notepad.exe".to_owned()),
             foreground_window_title: Some("議事録 — メモ帳".to_owned()),
+            foreground_hwnd: Some(0x10),
+            foreground_pid: Some(42),
         }
     }
 
@@ -672,6 +674,8 @@ mod tests {
                 ocr_langs: vec!["ja-JP".to_owned()],
                 foreground_process: Some("notepad.exe".to_owned()),
                 foreground_window_title: Some("メモ帳".to_owned()),
+                foreground_hwnd: None,
+                foreground_pid: None,
             })
         );
     }

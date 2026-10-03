@@ -214,14 +214,17 @@ pub fn build_episode(
                     ocr_lines.pop();
                 }
                 body.extend(ocr_lines.iter().map(|line| format!("  {line}")));
-                if let Some((base_at, base_lines)) = bases.get(&window)
-                    && let Some(changes) = changed_lines(base_lines, &ocr_lines)
-                    && rendered_chars(&changes) < rendered_chars(&body)
-                {
-                    entry_line = format!("{entry_line} (changes since {})", render(*base_at));
-                    body = changes;
+                if let (Some(hwnd), Some(pid)) = (screen.foreground_hwnd, screen.foreground_pid) {
+                    let key = (hwnd, pid, window);
+                    if let Some((base_at, base_lines)) = bases.get(&key)
+                        && let Some(changes) = changed_lines(base_lines, &ocr_lines)
+                        && rendered_chars(&changes) < rendered_chars(&body)
+                    {
+                        entry_line = format!("{entry_line} (changes since {})", render(*base_at));
+                        body = changes;
+                    }
+                    bases.insert(key, (observation.observed_at, ocr_lines));
                 }
-                bases.insert(window, (observation.observed_at, ocr_lines));
             }
             crate::model::OcrStatus::NoText => {}
             crate::model::OcrStatus::Failed => match &screen.ocr_error {
@@ -406,6 +409,8 @@ mod tests {
             ocr_langs: Vec::new(),
             foreground_process: None,
             foreground_window_title: None,
+            foreground_hwnd: None,
+            foreground_pid: None,
         }
     }
 
@@ -1777,9 +1782,19 @@ mod tests {
             ScreenPayload {
                 foreground_process: Some(process.to_owned()),
                 foreground_window_title: Some(title.to_owned()),
+                foreground_hwnd: Some(1),
+                foreground_pid: Some(10),
                 ..screen_payload(OcrStatus::Succeeded, Some(text))
             },
         )
+    }
+
+    fn with_ids(mut observation: Observation, hwnd: Option<i64>, pid: Option<u32>) -> Observation {
+        if let SourcePayload::Screen(screen) = &mut observation.payload {
+            screen.foreground_hwnd = hwnd;
+            screen.foreground_pid = pid;
+        }
+        observation
     }
 
     fn episode_blocks(observations: &[Observation]) -> Vec<String> {
@@ -2294,6 +2309,119 @@ mod tests {
         assert_eq!(
             changed_lines(&["Item A"], &[]),
             Some(vec!["  @@ -1 +0,0 @@".to_owned(), "  - Item A".to_owned()])
+        );
+    }
+
+    fn page(status: &str, owner: &str) -> String {
+        format!("Title\nStatus: {status}\nOwner: {owner}\nline 4\nline 5\nline 6\nline 7\nline 8")
+    }
+
+    fn in_full(header: &str, text: &str) -> String {
+        std::iter::once(header.to_owned())
+            .chain(text.lines().map(|line| format!("  {line}")))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    const OWNER_CHANGED_SINCE_FIRST: &str = " (changes since 2026-07-24T16:00:01Z)\n  @@ -2,3 +2,3 @@\n    Status: Done\n  - Owner: A\n  + Owner: B\n    line 4";
+
+    #[test]
+    fn another_window_with_the_same_process_and_title_keeps_its_own_base() {
+        for (hwnd, pid) in [(2, 10), (1, 11)] {
+            let blocks = episode_blocks(&[
+                capture(
+                    1,
+                    "2026-07-24T16:00:01Z",
+                    "editor.exe",
+                    "Example Page",
+                    &page("Done", "A"),
+                ),
+                with_ids(
+                    capture(
+                        2,
+                        "2026-07-24T16:00:02Z",
+                        "editor.exe",
+                        "Example Page",
+                        &page("Open", "A"),
+                    ),
+                    Some(hwnd),
+                    Some(pid),
+                ),
+                capture(
+                    3,
+                    "2026-07-24T16:00:03Z",
+                    "editor.exe",
+                    "Example Page",
+                    &page("Done", "B"),
+                ),
+            ]);
+
+            assert_eq!(
+                blocks[2..],
+                [
+                    in_full(SECOND_ENTRY_HEADER, &page("Open", "A")),
+                    format!(
+                        "2026-07-24T16:00:03Z [editor.exe] Example Page{OWNER_CHANGED_SINCE_FIRST}"
+                    ),
+                ],
+                "hwnd {hwnd}, pid {pid}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_capture_without_window_ids_neither_uses_nor_becomes_a_base() {
+        let blocks = episode_blocks(&[
+            capture(
+                1,
+                "2026-07-24T16:00:01Z",
+                "editor.exe",
+                "Example Page",
+                &page("Done", "A"),
+            ),
+            with_ids(
+                capture(
+                    2,
+                    "2026-07-24T16:00:02Z",
+                    "editor.exe",
+                    "Example Page",
+                    &page("Open", "A"),
+                ),
+                None,
+                None,
+            ),
+            with_ids(
+                capture(
+                    3,
+                    "2026-07-24T16:00:03Z",
+                    "editor.exe",
+                    "Example Page",
+                    &page("Open", "B"),
+                ),
+                None,
+                None,
+            ),
+            capture(
+                4,
+                "2026-07-24T16:00:04Z",
+                "editor.exe",
+                "Example Page",
+                &page("Done", "B"),
+            ),
+        ]);
+
+        assert_eq!(
+            blocks[2..],
+            [
+                in_full(SECOND_ENTRY_HEADER, &page("Open", "A")),
+                in_full(
+                    "2026-07-24T16:00:03Z [editor.exe] Example Page",
+                    &page("Open", "B")
+                ),
+                format!(
+                    "2026-07-24T16:00:04Z [editor.exe] Example Page{OWNER_CHANGED_SINCE_FIRST}"
+                ),
+            ]
         );
     }
 }

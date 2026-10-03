@@ -1034,6 +1034,8 @@ mod tests {
                 ocr_langs: vec!["en".to_owned()],
                 foreground_process: None,
                 foreground_window_title: None,
+                foreground_hwnd: None,
+                foreground_pid: None,
             },
             observed_at,
         );

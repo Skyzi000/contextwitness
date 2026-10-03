@@ -21,6 +21,8 @@ pub struct ScreenPayload {
     pub ocr_langs: Vec<String>,
     pub foreground_process: Option<String>,
     pub foreground_window_title: Option<String>,
+    pub foreground_hwnd: Option<i64>,
+    pub foreground_pid: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -140,6 +142,8 @@ mod tests {
             ocr_langs: vec!["ja-JP".to_owned(), "en-US".to_owned()],
             foreground_process: Some("notepad.exe".to_owned()),
             foreground_window_title: Some("メモ帳".to_owned()),
+            foreground_hwnd: Some(0x10),
+            foreground_pid: Some(42),
         }
     }
 
@@ -173,7 +177,7 @@ mod tests {
                 .expect("screen payload should serialize"),
         )
         .expect("payload JSON should spell as a string");
-        let golden = r#"{"foreground_process":"notepad.exe","foreground_window_title":"メモ帳","height":1080,"image_path":"screens/observation.png","ocr_error":"non-fatal OCR warning","ocr_langs":["ja-JP","en-US"],"ocr_status":"succeeded","ocr_text":"テスト","width":1920}"#;
+        let golden = r#"{"foreground_hwnd":16,"foreground_pid":42,"foreground_process":"notepad.exe","foreground_window_title":"メモ帳","height":1080,"image_path":"screens/observation.png","ocr_error":"non-fatal OCR warning","ocr_langs":["ja-JP","en-US"],"ocr_status":"succeeded","ocr_text":"テスト","width":1920}"#;
 
         assert_eq!(json, golden);
         assert!(

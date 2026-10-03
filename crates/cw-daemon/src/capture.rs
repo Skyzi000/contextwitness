@@ -232,6 +232,8 @@ pub(crate) fn pass(
         ocr_langs: ocr.langs,
         foreground_process: foreground.process.clone(),
         foreground_window_title: foreground.title.clone(),
+        foreground_hwnd: Some(target.hwnd as i64),
+        foreground_pid: Some(target.pid),
     };
     let mut observation = Observation::new_screen(payload, captured_at);
     let offset =
@@ -567,6 +569,8 @@ mod tests {
                 ocr_langs: Vec::new(),
                 foreground_process: Some("editor.exe".to_owned()),
                 foreground_window_title: Some("Example Page".to_owned()),
+                foreground_hwnd: None,
+                foreground_pid: None,
             },
             at,
         );
