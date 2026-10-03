@@ -188,13 +188,29 @@ pub fn build_episode(
         blocks.push((order, vec![format!("{state_line}\n{note}")]));
     }
 
-    for &(observation, screen) in &entries {
+    let headers: Vec<_> = entries
+        .iter()
+        .map(|(observation, screen)| {
+            let mut header = render(observation.observed_at);
+            push_subject(
+                &mut header,
+                screen.foreground_process.as_deref(),
+                screen.foreground_window_title.as_deref(),
+            );
+            header
+        })
+        .collect();
+    let mut header_counts = std::collections::HashMap::new();
+    for header in &headers {
+        *header_counts.entry(header.as_str()).or_insert(0) += 1;
+    }
+
+    for (&(observation, screen), header) in entries.iter().zip(&headers) {
         let window = (
             screen.foreground_process.as_deref(),
             screen.foreground_window_title.as_deref(),
         );
-        let mut entry_line = render(observation.observed_at);
-        push_subject(&mut entry_line, window.0, window.1);
+        let mut entry_line = header.clone();
         let mut body = Vec::new();
 
         match &screen.ocr_status {
@@ -219,7 +235,13 @@ pub fn build_episode(
                         entry_line = format!("{entry_line} (changes since {})", render(*base_at));
                         body = changes;
                     }
-                    bases.insert(key, (observation.observed_at, ocr_lines));
+                    // A change entry names its base by header alone: a capture sharing its header
+                    // can be no base, and the capture after it cannot name its previous one.
+                    if header_counts[header.as_str()] == 1 {
+                        bases.insert(key, (observation.observed_at, ocr_lines));
+                    } else {
+                        bases.remove(&key);
+                    }
                 }
             }
             crate::model::OcrStatus::NoText => {}
@@ -1945,6 +1967,88 @@ mod tests {
                 "2026-07-24T16:00:03Z [editor.exe] Example Page (changes since 2026-07-24T16:00:02Z)\n  @@ -3,2 +3,3 @@\n    line 3\n  + x\n    line 5".to_owned(),
             ]
         );
+    }
+
+    #[test]
+    fn a_header_two_entries_share_never_names_a_base() {
+        let text = |second: &str| {
+            let rest: Vec<_> = (3..=20).map(|n| format!("line {n}")).collect();
+            format!("Title\n{second}\n{}", rest.join("\n"))
+        };
+        let shared_second = "2026-07-24T16:00:01.700Z";
+        let partners = [
+            capture(
+                3,
+                shared_second,
+                "editor.exe",
+                "Example Page",
+                &text("line 2 edited twice"),
+            ),
+            with_ids(
+                capture(
+                    3,
+                    shared_second,
+                    "editor.exe",
+                    "Example Page",
+                    &text("another window"),
+                ),
+                Some(2),
+                Some(20),
+            ),
+            observation(
+                3,
+                shared_second,
+                ScreenPayload {
+                    foreground_process: Some("editor.exe".to_owned()),
+                    foreground_window_title: Some("Example Page".to_owned()),
+                    foreground_hwnd: Some(1),
+                    foreground_pid: Some(10),
+                    ..screen_payload(OcrStatus::Failed, None)
+                },
+            ),
+        ];
+
+        for partner in partners {
+            let blocks = episode_blocks(&[
+                capture(
+                    1,
+                    "2026-07-24T16:00:00Z",
+                    "editor.exe",
+                    "Example Page",
+                    &text("line 2"),
+                ),
+                capture(
+                    2,
+                    "2026-07-24T16:00:01.200Z",
+                    "editor.exe",
+                    "Example Page",
+                    &text("line 2 edited"),
+                ),
+                partner,
+                capture(
+                    4,
+                    "2026-07-24T16:00:02Z",
+                    "editor.exe",
+                    "Example Page",
+                    &text("line 2 edited again"),
+                ),
+            ]);
+
+            assert!(
+                blocks
+                    .iter()
+                    .all(|block| !block.contains("(changes since 2026-07-24T16:00:01Z)")),
+                "two entries are headed at 16:00:01, so no change entry may name it: {blocks:#?}"
+            );
+            assert_eq!(
+                blocks.last(),
+                Some(&format!(
+                    "{SECOND_ENTRY_HEADER}\n  {}",
+                    text("line 2 edited again").replace('\n', "\n  ")
+                )),
+                "the capture after them cannot name its previous capture, so it renders in full"
+            );
+        }
     }
 
     #[test]
