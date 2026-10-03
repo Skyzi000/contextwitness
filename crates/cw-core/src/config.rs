@@ -39,7 +39,7 @@ process_blacklist = []
 # Memory bank that receives episodes.
 bank_id = "contextwitness"
 # Context label sent with every episode.
-context_label = "Time-stamped OCR text of the foreground window, with its application and window title where known. May contain OCR errors; shows what was displayed, not what the user read, wrote, or did."
+context_label = "Time-stamped OCR text of the foreground window, with its application and window title where known; a bracketed note under a time range says why nothing was captured then. An entry headed (changes since <time>) lists only the lines that changed on that window since its capture at that time: lines marked - disappeared from the screen, lines marked + appeared on it, and unmarked lines are unchanged lines next to a change; the full text is rebuilt from the last full capture of the window and the changes after it, all in the same document. May contain OCR errors; shows what was displayed, not what the user read, wrote, or did."
 
 [episode]
 # Observations are grouped into episodes of this length (1-1440).
@@ -180,8 +180,15 @@ impl Default for HindsightConfig {
         Self {
             bank_id: "contextwitness".into(),
             context_label: "Time-stamped OCR text of the foreground window, with its \
-                            application and window title where known. May contain OCR errors; \
-                            shows what was displayed, not what the user read, wrote, or did."
+                            application and window title where known; a bracketed note under a \
+                            time range says why nothing was captured then. An entry headed \
+                            (changes since <time>) lists only the lines that changed on that \
+                            window since its capture at that time: lines marked - disappeared \
+                            from the screen, lines marked + appeared on it, and unmarked lines \
+                            are unchanged lines next to a change; the full text is rebuilt from \
+                            the last full capture of the window and the changes after it, all in \
+                            the same document. May contain OCR errors; shows what was displayed, \
+                            not what the user read, wrote, or did."
                 .into(),
         }
     }
@@ -523,8 +530,13 @@ mod tests {
         assert_eq!(
             config.hindsight.context_label,
             "Time-stamped OCR text of the foreground window, with its application and \
-             window title where known. May contain OCR errors; shows what was displayed, not \
-             what the user read, wrote, or did."
+             window title where known; a bracketed note under a time range says why nothing was \
+             captured then. An entry headed (changes since <time>) lists only the lines that \
+             changed on that window since its capture at that time: lines marked - disappeared \
+             from the screen, lines marked + appeared on it, and unmarked lines are unchanged \
+             lines next to a change; the full text is rebuilt from the last full capture of the \
+             window and the changes after it, all in the same document. May contain OCR errors; \
+             shows what was displayed, not what the user read, wrote, or did."
         );
         assert_eq!(config.episode.window_minutes, 5);
     }
