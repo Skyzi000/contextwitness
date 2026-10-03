@@ -31,11 +31,11 @@ contextwitness setup
 contextwitness run
 ```
 
-`setup` は Hindsight API URL・API トークン(任意)・データディレクトリを尋ねて書き込みます。`run` はトレイアイコンを出してキャプチャを開始し、止められるまで動き続けます。その他のコマンド: `status`(このインストールが何をしているかの 1 画面サマリ)、`pause [30m|2h|...]`、`resume`、`autostart enable|disable`(ログオン時の自動起動)、`capture-once`(パイプライン確認用の手動キャプチャ 1 回。`pause` を無視します)。
+`setup` は Hindsight API URL・API トークン(任意)・データディレクトリを尋ねて書き込みます。`run` はトレイアイコンを出してキャプチャを開始し、止められるまで動き続けます。その他のコマンド: `status`(このインストールが何をしているかの 1 画面サマリ)、`pause [30m|2h|...]`、`resume`、`defaults`(全設定の既定値と意味を表示)、`autostart enable|disable`(ログオン時の自動起動)、`capture-once`(パイプライン確認用の手動キャプチャ 1 回。`pause` を無視します)。
 
 ## 設定
 
-`%APPDATA%\ContextWitness\config.toml`。`setup` または `run` が最初に必要としたときに、以下の既定値で書き出されます:
+`%APPDATA%\ContextWitness\config.toml`。`setup` または `run` が最初に必要としたときに、`storage.data_dir` と `hindsight.bank_id` だけを書いて作られます。書かれていない設定は実行中のバージョンの既定値に従うので、後のバージョンの既定値もそのまま届きます。全設定の既定値は `contextwitness defaults` で表示できます。既定値:
 
 | キー | 既定値 | 意味 |
 | --- | --- | --- |

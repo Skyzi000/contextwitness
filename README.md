@@ -31,11 +31,11 @@ contextwitness setup
 contextwitness run
 ```
 
-`setup` asks for the Hindsight API URL, an optional API token, and the data directory, and writes them. `run` starts capturing with the tray icon up and keeps running until stopped. Other commands: `status` (one-screen summary of what this installation is doing), `pause [30m|2h|...]`, `resume`, `autostart enable|disable` (start at logon), and `capture-once` (one manual capture pass, for checking the pipeline; it ignores `pause`).
+`setup` asks for the Hindsight API URL, an optional API token, and the data directory, and writes them. `run` starts capturing with the tray icon up and keeps running until stopped. Other commands: `status` (one-screen summary of what this installation is doing), `pause [30m|2h|...]`, `resume`, `defaults` (prints every setting with its built-in default and meaning), `autostart enable|disable` (start at logon), and `capture-once` (one manual capture pass, for checking the pipeline; it ignores `pause`).
 
 ## Configuration
 
-`%APPDATA%\ContextWitness\config.toml`, written with the defaults below the first time `setup` or `run` needs it:
+`%APPDATA%\ContextWitness\config.toml`. The first time `setup` or `run` needs it, it is written holding only `storage.data_dir` and `hindsight.bank_id`; a setting it leaves out follows the built-in default of the running version, so a later version's defaults reach it. `contextwitness defaults` prints every setting with its default. The defaults:
 
 | Key | Default | Meaning |
 | --- | --- | --- |

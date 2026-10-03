@@ -1,10 +1,9 @@
 use crate::atomic_file::{create_temporary_beside, delete_by_handle, rename_without_replacing};
 use serde::{Deserialize, Serialize};
 
-/// Commented TOML listing every setting at its built-in default. Written on first run so the
-/// user has a discoverable, editable starting point.
-pub const DEFAULT_CONFIG_TOML: &str = r#"# ContextWitness configuration.
-# Every value below is the built-in default; delete a line to keep using that default.
+/// Every setting at its built-in default, with what it means. Printed by `contextwitness defaults`.
+pub const DEFAULT_CONFIG_TOML: &str = r#"# Built-in defaults of this ContextWitness version.
+# Copy a line into config.toml to change that setting; a setting config.toml leaves out follows the default.
 
 [capture]
 # Seconds between capture attempts (1-30).
@@ -45,6 +44,22 @@ context_label = "Time-stamped OCR text of the foreground window, with its applic
 [episode]
 # Observations are grouped into episodes of this length (1-1440).
 window_minutes = 5
+"#;
+
+/// Written on first run: the data location only, so every other setting follows the running
+/// version's default.
+pub const INITIAL_CONFIG_TOML: &str = r#"# ContextWitness configuration.
+# A setting left out follows the built-in default of the running version;
+# `contextwitness defaults` prints every setting with its default and what it means.
+
+[storage]
+# Where captures and the database live. Empty means the per-user local data directory.
+# An absolute path: a relative one names a different directory in every process that reads it.
+data_dir = ""
+
+[hindsight]
+# Memory bank that receives episodes.
+bank_id = "contextwitness"
 "#;
 
 /// Complete ContextWitness configuration.
@@ -297,7 +312,7 @@ impl Config {
         Ok(())
     }
 
-    /// Create `path` (and any missing parent directories) containing [`DEFAULT_CONFIG_TOML`]
+    /// Create `path` (and any missing parent directories) containing [`INITIAL_CONFIG_TOML`]
     /// when it does not exist yet. Returns `true` when this call created the file, `false` when
     /// the name was already taken — by the config another process published first (publishing is
     /// what tests for it), or by whatever else stands at the name; [`Config::load_from_path`] is
@@ -329,7 +344,7 @@ impl Config {
                 path: path.to_path_buf(),
                 source,
             })?;
-        let write_result = std::io::Write::write_all(&mut file, DEFAULT_CONFIG_TOML.as_bytes())
+        let write_result = std::io::Write::write_all(&mut file, INITIAL_CONFIG_TOML.as_bytes())
             .and_then(|()| file.sync_all());
         if let Err(source) = write_result {
             let _ = delete_by_handle(&file);
@@ -528,15 +543,25 @@ mod tests {
     }
 
     #[test]
-    fn default_config_template_parses_to_defaults() {
-        let config = Config::from_toml_str(DEFAULT_CONFIG_TOML)
-            .expect("the built-in default config template should parse");
+    fn the_defaults_listing_spells_every_setting_at_its_default() {
+        let listed: toml::Table = DEFAULT_CONFIG_TOML
+            .parse()
+            .expect("the defaults listing should parse as TOML");
+        let defaults =
+            toml::Table::try_from(Config::default()).expect("the defaults should serialize");
 
         assert_eq!(
-            config,
-            Config::default(),
-            "the built-in config template should stay aligned with the defaults"
+            listed, defaults,
+            "the defaults listing should name every setting, each at its built-in default"
         );
+    }
+
+    #[test]
+    fn the_initial_config_parses_to_defaults() {
+        let config =
+            Config::from_toml_str(INITIAL_CONFIG_TOML).expect("the first-run config should parse");
+
+        assert_eq!(config, Config::default());
     }
 
     #[test]
@@ -553,8 +578,8 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&path)
                 .expect("the newly created default config should be readable"),
-            DEFAULT_CONFIG_TOML,
-            "the created file should contain the exact default config template"
+            INITIAL_CONFIG_TOML,
+            "the created file should contain the exact first-run config"
         );
 
         std::fs::write(&path, "user-owned contents")

@@ -3,7 +3,9 @@ use std::io::Write as _;
 use crate::{autostart, capture, delivery, episodes, logging, maintenance, tray};
 use clap::{Parser, Subcommand};
 use cw_core::atomic_file::create_temporary_beside;
-use cw_core::config::{Config, ConfigError, DataPaths, StorageConfig, default_config_path};
+use cw_core::config::{
+    Config, ConfigError, DEFAULT_CONFIG_TOML, DataPaths, StorageConfig, default_config_path,
+};
 use cw_store::control::{HealthKey, Pause};
 use tracing::{error, info};
 use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, HANDLE};
@@ -63,6 +65,8 @@ enum Command {
     Resume,
     /// Ask for the Hindsight credentials and the data directory, and write them.
     Setup,
+    /// Print every setting with its built-in default.
+    Defaults,
     /// Start at logon, or stop doing so.
     Autostart {
         #[command(subcommand)]
@@ -87,6 +91,7 @@ pub fn main() {
         Command::Pause { duration } => pause(duration),
         Command::Resume => resume(),
         Command::Setup => setup(),
+        Command::Defaults => defaults(),
         Command::Autostart { action } => set_autostart(&action),
         Command::CaptureOnce => capture_once(),
     };
@@ -490,6 +495,12 @@ fn setup() -> Result<(), Failure> {
     Ok(())
 }
 
+fn defaults() -> Result<(), Failure> {
+    print!("{DEFAULT_CONFIG_TOML}");
+
+    Ok(())
+}
+
 fn setup_credentials() -> Result<(), Failure> {
     println!("Hindsight delivery. An empty URL leaves the current credentials alone.");
     let api_url = ask("  API URL: ")?;
@@ -777,8 +788,9 @@ impl Drop for EchoOff {
 
 #[cfg(test)]
 mod tests {
-    use super::{claim_mutex, closing_report, last_error_line};
+    use super::{claim_mutex, closing_report, data_dir_line, last_error_line};
     use crate::capture::{SaveFailure, Stored};
+    use cw_core::config::INITIAL_CONFIG_TOML;
     use cw_store::outbox::NewestError;
 
     #[test]
@@ -807,6 +819,11 @@ mod tests {
         }
         .expect("the squatting event should be creatable");
         assert!(claim_mutex(&name).is_err());
+    }
+
+    #[test]
+    fn the_first_run_config_carries_the_data_dir_line_setup_rewrites() {
+        assert!(data_dir_line(INITIAL_CONFIG_TOML).is_some());
     }
 
     #[test]
