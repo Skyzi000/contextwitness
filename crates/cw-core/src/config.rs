@@ -39,7 +39,7 @@ process_blacklist = []
 # Memory bank that receives episodes.
 bank_id = "contextwitness"
 # Context label sent with every episode.
-context_label = "Time-stamped OCR text of the foreground window, with its application and window title where known. An entry headed (changes since <time>) is a unified diff of OCR lines against that window's entry at <time>: search memories for <time> and use the entry headed by that time in the same document. May contain OCR errors; shows what was displayed, not what the user read, wrote, or did."
+context_label = "Time-stamped OCR text of the foreground window, with its application and window title where known. An entry headed (changes since <time>) is a unified diff of OCR lines against that window's entry at <time>: to read that entry, call list_memories with q set to <time> (a substring search, not relevance-ranked recall) and use the entry headed by that time in the same document, repeating while it is itself a change entry. May contain OCR errors; shows what was displayed, not what the user read, wrote, or did."
 
 [episode]
 # Observations are grouped into episodes of this length (1-1440).
@@ -182,9 +182,11 @@ impl Default for HindsightConfig {
             context_label: "Time-stamped OCR text of the foreground window, with its \
                             application and window title where known. An entry headed (changes \
                             since <time>) is a unified diff of OCR lines against that window's \
-                            entry at <time>: search memories for <time> and use the entry headed \
-                            by that time in the same document. May contain OCR errors; shows what \
-                            was displayed, not what the user read, wrote, or did."
+                            entry at <time>: to read that entry, call list_memories with q set to \
+                            <time> (a substring search, not relevance-ranked recall) and use the \
+                            entry headed by that time in the same document, repeating while it is \
+                            itself a change entry. May contain OCR errors; shows what was \
+                            displayed, not what the user read, wrote, or did."
                 .into(),
         }
     }
@@ -527,9 +529,11 @@ mod tests {
             config.hindsight.context_label,
             "Time-stamped OCR text of the foreground window, with its application and \
              window title where known. An entry headed (changes since <time>) is a unified diff \
-             of OCR lines against that window's entry at <time>: search memories for <time> and \
-             use the entry headed by that time in the same document. May contain OCR errors; \
-             shows what was displayed, not what the user read, wrote, or did."
+             of OCR lines against that window's entry at <time>: to read that entry, call \
+             list_memories with q set to <time> (a substring search, not relevance-ranked recall) \
+             and use the entry headed by that time in the same document, repeating while it is \
+             itself a change entry. May contain OCR errors; shows what was displayed, not what \
+             the user read, wrote, or did."
         );
         assert_eq!(config.episode.window_minutes, 5);
     }
