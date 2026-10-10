@@ -37,7 +37,7 @@ toml = "1"
 dirs = "7"
 clap = { version = "4.6", features = ["derive"] }
 winreg = "0.56"
-tray-icon = "0.25"
+tray-icon = "0.26"
 tao = "0.37"
 windows = { version = "0.62", features = [
     "Win32_Globalization",
