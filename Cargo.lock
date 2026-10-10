@@ -419,7 +419,7 @@ checksum = "a31eee39dddec8330830986fcd7625edb5a24ec90ea038215273bbc3adb08ac6"
 
 [[package]]
 name = "cw-capture"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "chrono",
  "thiserror 2.0.21",
@@ -430,7 +430,7 @@ dependencies = [
 
 [[package]]
 name = "cw-core"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "chrono",
  "dirs",
@@ -445,7 +445,7 @@ dependencies = [
 
 [[package]]
 name = "cw-daemon"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "chrono",
  "clap",
@@ -469,7 +469,7 @@ dependencies = [
 
 [[package]]
 name = "cw-ocr"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "cw-core",
  "image",
@@ -478,7 +478,7 @@ dependencies = [
 
 [[package]]
 name = "cw-sink-hindsight"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "chrono",
  "cw-core",
@@ -491,7 +491,7 @@ dependencies = [
 
 [[package]]
 name = "cw-store"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "chrono",
  "cw-core",
