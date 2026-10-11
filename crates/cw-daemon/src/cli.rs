@@ -1,6 +1,6 @@
 use std::io::Write as _;
 
-use crate::{autostart, capture, delivery, episodes, logging, maintenance, tray};
+use crate::{audio, autostart, capture, delivery, episodes, logging, maintenance, tray};
 use clap::{Parser, Subcommand};
 use cw_core::atomic_file::create_temporary_beside;
 use cw_core::config::{
@@ -74,6 +74,14 @@ enum Command {
     },
     /// Capture, read and store the way a tick would, then exit.
     CaptureOnce,
+    /// Record and transcribe what applications play, for the `run` that started this.
+    #[command(hide = true)]
+    AudioWorker {
+        #[arg(long)]
+        config: std::path::PathBuf,
+        #[arg(long)]
+        data_dir: std::path::PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -94,6 +102,7 @@ pub fn main() {
         Command::Defaults => defaults(),
         Command::Autostart { action } => set_autostart(&action),
         Command::CaptureOnce => capture_once(),
+        Command::AudioWorker { config, data_dir } => audio::worker(&config, data_dir),
     };
 
     if let Err(error) = outcome {
@@ -125,6 +134,12 @@ fn daemon() -> ! {
     if created {
         info!(path = %config_path.display(), "wrote the default config");
     }
+    if let Err(error) = std::fs::create_dir_all(paths.models()) {
+        error!(
+            "creating the models folder {} failed: {error}",
+            paths.models().display()
+        );
+    }
 
     if !dpi_aware {
         error!(
@@ -148,6 +163,20 @@ fn daemon() -> ! {
         Ok(registered) => info!(registered, "registered windows that closed while stopped"),
         Err(error) => error!("the startup episode rescan failed: {error}"),
     }
+    match episodes::close_due_audio(
+        &mut conn,
+        config.episode.window_minutes,
+        chrono::Utc::now(),
+        false,
+    ) {
+        Ok(0) => {}
+        Ok(registered) => info!(
+            registered,
+            "registered audio windows that closed while stopped"
+        ),
+        Err(error) => error!("the startup audio episode rescan failed: {error}"),
+    }
+    let audio_worker_alive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     spawn("delivery", {
         let conn = open_for("delivery", &paths);
@@ -158,7 +187,8 @@ fn daemon() -> ! {
     spawn("episodes", {
         let conn = open_for("episodes", &paths);
         let config = config.clone();
-        move || episodes::run(conn, config, cursor)
+        let audio_worker_alive = audio_worker_alive.clone();
+        move || episodes::run(conn, config, cursor, audio_worker_alive)
     });
     spawn("maintenance", {
         let conn = open_for("maintenance", &paths);
@@ -166,6 +196,22 @@ fn daemon() -> ! {
         let paths = DataPaths::new(paths.root.clone());
         move || maintenance::run(conn, paths, config)
     });
+    if config.audio.enabled {
+        spawn("audio", {
+            let conn = open_for("audio", &paths);
+            let data_dir = paths.root.clone();
+            let window_minutes = config.episode.window_minutes;
+            move || {
+                audio::supervise(
+                    &conn,
+                    &config_path,
+                    &data_dir,
+                    window_minutes,
+                    &audio_worker_alive,
+                )
+            }
+        });
+    }
     tray::spawn(DataPaths::new(paths.root.clone()));
 
     info!(
@@ -282,6 +328,7 @@ fn status() -> Result<(), Failure> {
     for (label, key) in [
         ("last tick", HealthKey::LastTick),
         ("last capture", HealthKey::LastCapture),
+        ("audio worker", HealthKey::AudioSettled),
         ("last delivery", HealthKey::LastDelivery),
     ] {
         field(

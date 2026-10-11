@@ -5,6 +5,7 @@
 //! them. The manifest's detached console allocation policy (Windows 11 24H2+) keeps the logon
 //! autostart windowless.
 
+mod audio;
 mod autostart;
 mod capture;
 mod cli;

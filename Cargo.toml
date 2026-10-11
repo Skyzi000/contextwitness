@@ -5,6 +5,7 @@ members = [
     "crates/cw-capture",
     "crates/cw-ocr",
     "crates/cw-store",
+    "crates/cw-audio",
     "crates/cw-sink-hindsight",
     "crates/cw-daemon",
 ]
@@ -21,6 +22,7 @@ cw-core = { path = "crates/cw-core" }
 cw-capture = { path = "crates/cw-capture" }
 cw-ocr = { path = "crates/cw-ocr" }
 cw-store = { path = "crates/cw-store" }
+cw-audio = { path = "crates/cw-audio" }
 cw-sink-hindsight = { path = "crates/cw-sink-hindsight" }
 image = { version = "0.25", default-features = false }
 webp = "0.3"
@@ -68,3 +70,7 @@ reqwest = { version = "0.13", default-features = false, features = [
     "json",
     "rustls",
 ] }
+# Pinned exactly: scripts/fetch-sherpa-onnx.ps1 fetches the native libraries of this same version,
+# the bindings are only valid against them, and THIRD-PARTY-NATIVE-LICENSES.txt lists what they link.
+sherpa-onnx = { version = "=1.13.8", default-features = false, features = ["static"] }
+wasapi = "0.26"

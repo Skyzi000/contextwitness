@@ -1,3 +1,8 @@
 [target.x86_64-pc-windows-msvc]
 # Portable ZIP promise: the exe must run on a machine without the VC++ redistributable.
 rustflags = ["-C", "target-feature=+crt-static"]
+
+[env]
+# The no-TTS build that scripts/fetch-sherpa-onnx.ps1 fetches. Unset, sherpa-onnx-sys downloads its
+# default archive, which links the GPL-licensed espeak-ng into the executable.
+SHERPA_ONNX_LIB_DIR = { value = "target/vendor/sherpa-onnx/lib", relative = true, force = true }

@@ -6,14 +6,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 /// for as long as it wants file logs — `let _ = init(..)` would drop it at once and lose them.
 #[must_use]
 pub fn init(paths: &DataPaths) -> Option<tracing_appender::non_blocking::WorkerGuard> {
-    let level = std::env::var("CONTEXTWITNESS_LOG")
-        .ok()
-        .and_then(|value| {
-            value
-                .parse::<tracing_subscriber::filter::LevelFilter>()
-                .ok()
-        })
-        .unwrap_or(tracing_subscriber::filter::LevelFilter::INFO);
+    let level = level();
     let (file_layer, guard) = match appender(&paths.logs()) {
         Ok(appender) => {
             let (writer, guard) = tracing_appender::non_blocking(appender);
@@ -39,6 +32,13 @@ pub fn init(paths: &DataPaths) -> Option<tracing_appender::non_blocking::WorkerG
         .init();
 
     guard
+}
+
+pub fn level() -> tracing_subscriber::filter::LevelFilter {
+    std::env::var("CONTEXTWITNESS_LOG")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(tracing_subscriber::filter::LevelFilter::INFO)
 }
 
 fn appender(
