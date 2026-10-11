@@ -14,6 +14,8 @@ jobs:
       STAGE: contextwitness-${{ github.ref_name }}-windows-x86_64
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Check the tag matches the crate version
         shell: pwsh
         # The tag name is untrusted input: it reaches the script as an environment
