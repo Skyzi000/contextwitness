@@ -344,7 +344,7 @@ fn deliver_batch(
             document_id: &entry.document_id,
             content: &entry.content,
             timestamp: entry.end_at,
-            context: &config.hindsight.context_label,
+            context: context_label(&config.hindsight, &entry.source),
             metadata: &metadata,
         };
 
@@ -453,10 +453,30 @@ fn deliver_batch(
     Ok(Pass::Progressed(progressed))
 }
 
+fn context_label<'a>(hindsight: &'a cw_core::config::HindsightConfig, source: &str) -> &'a str {
+    if source == "audio" {
+        &hindsight.audio_context_label
+    } else {
+        &hindsight.context_label
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::TimeDelta;
     use cw_store::StoreError;
+
+    #[test]
+    fn an_episode_is_sent_under_the_label_of_its_source() {
+        let hindsight = cw_core::config::HindsightConfig {
+            context_label: "seen".to_owned(),
+            audio_context_label: "heard".to_owned(),
+            ..cw_core::config::HindsightConfig::default()
+        };
+
+        assert_eq!(super::context_label(&hindsight, "screen"), "seen");
+        assert_eq!(super::context_label(&hindsight, "audio"), "heard");
+    }
 
     #[test]
     fn the_poll_delay_grows_with_the_episodes_age() {

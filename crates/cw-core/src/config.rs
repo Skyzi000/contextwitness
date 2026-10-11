@@ -21,6 +21,22 @@ webp_quality = 75
 # Languages offered to the OCR engine, most important first.
 languages = ["ja", "en"]
 
+[audio]
+# Record the speech that applications play, as text. The audio itself is not kept.
+enabled = false
+# What turns speech into text: "local" runs a model on this PC; "api" sends each utterance's
+# audio to an OpenAI-compatible transcription API, whose URL and key go in credentials.toml
+# next to config.toml.
+backend = "local"
+# For "local": the folder holding a SenseVoice model (model.int8.onnx and tokens.txt). Empty means
+# models\sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17 in the data directory; otherwise
+# an absolute path.
+model_dir = ""
+# For "api": the model name to request.
+api_model = ""
+# Language of the speech, e.g. "ja". Empty lets the transcriber detect it.
+language = ""
+
 [storage]
 # Where captures and the database live. Empty means the per-user local data directory.
 # An absolute path: a relative one names a different directory in every process that reads it.
@@ -31,15 +47,18 @@ image_retention_days = 14
 image_retention_max_gib = 50
 
 [privacy]
-# Capture stops entirely while one of these executables is in the foreground.
+# Capture stops entirely while one of these executables is in the foreground, and audio played
+# by one of them, or by a program it started, is not recorded.
 # Matched case-insensitively against the executable file name, e.g. ["KeePass.exe"].
 process_blacklist = []
 
 [hindsight]
 # Memory bank that receives episodes.
 bank_id = "contextwitness"
-# Context label sent with every episode.
+# Context label sent with every screen episode.
 context_label = "Time-stamped OCR text of the foreground window, with its application and window title where known. An entry headed (changes since <time>) is a unified diff of OCR lines against that window's entry at <time>: to read that entry, call list_memories with q set to <time> (a substring search, not relevance-ranked recall) and use the entry headed by that time in the same document, repeating while it is itself a change entry. May contain OCR errors; shows what was displayed, not what the user read, wrote, or did."
+# Context label sent with every audio episode.
+audio_context_label = "Machine transcripts of speech that applications played on this PC. Each entry is headed by a time range and the application the audio was captured from, which can include sound from programs that application started; each line begins with the local time its utterance started. Expect misheard words, especially names. Shows what was played, not what the user listened to or did."
 
 [episode]
 # Observations are grouped into episodes of this length (1-1440).
@@ -71,6 +90,8 @@ pub struct Config {
     pub capture: CaptureConfig,
     /// OCR settings.
     pub ocr: OcrConfig,
+    /// Audio transcription settings.
+    pub audio: AudioConfig,
     /// Local storage settings.
     pub storage: StorageConfig,
     /// Privacy settings.
@@ -132,6 +153,35 @@ impl Default for OcrConfig {
     }
 }
 
+/// Audio transcription settings.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+#[serde(default)]
+pub struct AudioConfig {
+    /// Whether speech that applications play is recorded as text.
+    pub enabled: bool,
+    /// What turns speech into text.
+    pub backend: AudioBackend,
+    /// Folder of the model [`AudioBackend::Local`] runs: empty for the default one, or an absolute
+    /// path.
+    pub model_dir: String,
+    /// Model name [`AudioBackend::Api`] requests.
+    pub api_model: String,
+    /// Language of the speech, or an empty string to let the backend detect it.
+    pub language: String,
+}
+
+/// What turns speech into text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AudioBackend {
+    /// A model run on this machine.
+    #[default]
+    Local,
+    /// An OpenAI-compatible transcription API.
+    Api,
+}
+
 /// Local storage settings.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -171,8 +221,10 @@ pub struct PrivacyConfig {
 pub struct HindsightConfig {
     /// Hindsight bank identifier.
     pub bank_id: String,
-    /// Context label sent with every episode.
+    /// Context label sent with every screen episode.
     pub context_label: String,
+    /// Context label sent with every audio episode.
+    pub audio_context_label: String,
 }
 
 impl Default for HindsightConfig {
@@ -187,6 +239,14 @@ impl Default for HindsightConfig {
                             entry headed by that time in the same document, repeating while it is \
                             itself a change entry. May contain OCR errors; shows what was \
                             displayed, not what the user read, wrote, or did."
+                .into(),
+            audio_context_label: "Machine transcripts of speech that applications played on this \
+                                  PC. Each entry is headed by a time range and the application \
+                                  the audio was captured from, which can include sound from \
+                                  programs that application started; each line begins with the \
+                                  local time its utterance started. Expect misheard words, \
+                                  especially names. Shows what was played, not what the user \
+                                  listened to or did."
                 .into(),
         }
     }
@@ -311,6 +371,16 @@ impl Config {
             return Err(ConfigError::Invalid {
                 field: "hindsight.bank_id",
                 reason: "must not be empty",
+            });
+        }
+
+        if !self.audio.model_dir.is_empty()
+            && !std::path::Path::new(&self.audio.model_dir).is_absolute()
+        {
+            return Err(ConfigError::Invalid {
+                field: "audio.model_dir",
+                reason: "must be an absolute path; a relative one names a different directory in \
+                         every process that reads it",
             });
         }
 
@@ -468,6 +538,20 @@ impl StorageConfig {
     }
 }
 
+const DEFAULT_MODEL_FOLDER: &str = "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17";
+
+impl AudioConfig {
+    /// Empty model_dir -> the default model's folder under [`DataPaths::models`]; otherwise the
+    /// configured path.
+    pub fn resolve_model_dir(&self, paths: &DataPaths) -> std::path::PathBuf {
+        if self.model_dir.is_empty() {
+            paths.models().join(DEFAULT_MODEL_FOLDER)
+        } else {
+            std::path::PathBuf::from(&self.model_dir)
+        }
+    }
+}
+
 /// Layout under the resolved data directory.
 pub struct DataPaths {
     /// Resolved root data directory.
@@ -493,6 +577,11 @@ impl DataPaths {
     /// Returns `root/logs`.
     pub fn logs(&self) -> std::path::PathBuf {
         self.root.join("logs")
+    }
+
+    /// Returns `root/models`.
+    pub fn models(&self) -> std::path::PathBuf {
+        self.root.join("models")
     }
 }
 
@@ -535,7 +624,75 @@ mod tests {
              itself a change entry. May contain OCR errors; shows what was displayed, not what \
              the user read, wrote, or did."
         );
+        assert_eq!(
+            config.hindsight.audio_context_label,
+            "Machine transcripts of speech that applications played on this PC. Each entry is \
+             headed by a time range and the application the audio was captured from, which can \
+             include sound from programs that application started; each line begins with the \
+             local time its utterance started. Expect misheard words, especially names. Shows \
+             what was played, not what the user listened to or did."
+        );
         assert_eq!(config.episode.window_minutes, 5);
+        assert!(!config.audio.enabled);
+        assert_eq!(config.audio.backend, AudioBackend::Local);
+        assert_eq!(config.audio.model_dir, "");
+        assert_eq!(config.audio.api_model, "");
+        assert_eq!(config.audio.language, "");
+    }
+
+    #[test]
+    fn the_audio_backend_is_spelled_local_or_api() {
+        let config = Config::from_toml_str("[audio]\nbackend = \"api\"\n")
+            .expect("the api backend should parse");
+
+        assert_eq!(config.audio.backend, AudioBackend::Api);
+        assert!(Config::from_toml_str("[audio]\nbackend = \"Api\"\n").is_err());
+        assert!(Config::from_toml_str("[audio]\nbackend = \"cloud\"\n").is_err());
+        assert!(Config::from_toml_str("[audio]\nmodel = \"x\"\n").is_err());
+    }
+
+    #[test]
+    fn validate_refuses_a_relative_audio_model_dir() {
+        let mut config = Config::default();
+        config.audio.model_dir = "D:/models/speech".to_owned();
+        config
+            .validate()
+            .expect("an absolute model directory should be accepted");
+
+        for relative in ["models", "./models", "D:models", "\\models"] {
+            config.audio.model_dir = relative.to_owned();
+            let error = config
+                .validate()
+                .expect_err("a relative model directory should be refused");
+
+            assert!(
+                matches!(
+                    error,
+                    ConfigError::Invalid {
+                        field: "audio.model_dir",
+                        ..
+                    }
+                ),
+                "`{relative}` would name a different directory per process, got {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_model_dir_names_the_default_model_under_the_data_directory() {
+        let paths = DataPaths::new("D:/data".into());
+        let mut audio = AudioConfig::default();
+        assert_eq!(
+            audio.resolve_model_dir(&paths),
+            std::path::Path::new("D:/data/models")
+                .join("sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17")
+        );
+
+        audio.model_dir = "E:/elsewhere".to_owned();
+        assert_eq!(
+            audio.resolve_model_dir(&paths),
+            std::path::Path::new("E:/elsewhere")
+        );
     }
 
     #[test]

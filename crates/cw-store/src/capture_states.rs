@@ -17,7 +17,9 @@ const SELECT_ACROSS: &str = "SELECT id, state, start_at, end_at, process, title,
 /// SQLite takes a bare column in a `max()` query from the row the maximum came from.
 const SELECT_RECORDED_UNTIL: &str = "SELECT id, max(at) FROM (\
      SELECT id, max(end_at) AS at FROM capture_states WHERE end_at < ?1 \
-     UNION ALL SELECT id, max(observed_at) FROM observations WHERE observed_at < ?1 \
+     UNION ALL SELECT id, max(observed_at) FROM observations \
+     WHERE source = 'screen' AND observed_at < ?1 AND observed_at > coalesce(\
+     (SELECT max(end_at) FROM capture_states WHERE end_at < ?1), '') \
      UNION ALL SELECT id, ?1 FROM capture_states WHERE end_at >= ?1 AND start_at < ?1)";
 
 /// How a state is spelled in the `state` column.
@@ -176,7 +178,8 @@ fn split_unrecorded_at(
 }
 
 /// How far the record reaches toward `at`: `at` itself when a span starts before it and ends at or
-/// after it, otherwise the latest span end or observation before it, or `None` when there is none.
+/// after it, otherwise the latest span end or screen observation before it, or `None` when there
+/// is none.
 fn recorded_until(
     conn: &rusqlite::Connection,
     at: chrono::DateTime<chrono::Utc>,
@@ -261,11 +264,13 @@ fn decode(row: &rusqlite::Row<'_>) -> Result<StateSpan, Box<dyn std::error::Erro
 
 #[cfg(test)]
 mod tests {
-    use super::{INSERT, extend, insert, overlapping, recorded_until, split_unrecorded_at};
+    use super::{
+        INSERT, extend, insert, mark_recorded, overlapping, recorded_until, split_unrecorded_at,
+    };
     use crate::{StoreError, db, observations, timestamp};
     use chrono::{DateTime, Utc};
     use cw_core::model::{
-        CaptureState, CaptureStatus, Observation, OcrStatus, ScreenPayload, StateSpan,
+        AudioPayload, CaptureState, CaptureStatus, Observation, OcrStatus, ScreenPayload, StateSpan,
     };
     use tempfile::{TempDir, tempdir};
 
@@ -589,6 +594,94 @@ mod tests {
         assert_eq!(
             recorded_until(&conn, at("2026-07-25T12:00:00Z")).expect("readable"),
             None
+        );
+    }
+
+    #[test]
+    fn an_utterance_inside_a_gap_leaves_the_unrecorded_span_whole() {
+        let (_dir, conn) = database();
+        let screen = Observation::new_screen(
+            ScreenPayload {
+                width: 1,
+                height: 1,
+                image_path: None,
+                ocr_status: OcrStatus::NoText,
+                ocr_error: None,
+                ocr_text: None,
+                ocr_langs: Vec::new(),
+                foreground_process: None,
+                foreground_window_title: None,
+                foreground_hwnd: None,
+                foreground_pid: None,
+            },
+            at("2026-07-25T12:00:00Z"),
+        );
+        let utterance = Observation::new_audio(
+            AudioPayload {
+                process: "talk.exe".to_owned(),
+                text: Some("one two three".to_owned()),
+                error: None,
+            },
+            at("2026-07-25T19:59:55Z"),
+            2_000,
+        );
+        observations::insert(&conn, &screen).expect("the screen observation should be stored");
+        observations::insert(&conn, &utterance).expect("the utterance should be stored");
+
+        mark_recorded(
+            &conn,
+            at("2026-07-25T20:00:00Z"),
+            chrono::TimeDelta::seconds(60),
+        )
+        .expect("the record should be accounted for");
+
+        let gaps: Vec<_> = everything(&conn)
+            .into_iter()
+            .filter(|span| span.status.state == CaptureState::Unrecorded)
+            .map(|span| (span.start_at, span.end_at))
+            .collect();
+        assert_eq!(
+            gaps,
+            [(at("2026-07-25T12:00:00Z"), at("2026-07-25T20:00:00Z"))]
+        );
+    }
+
+    #[test]
+    fn finding_the_last_screen_record_does_not_grow_with_the_screen_rows() {
+        let steps = |screen_rows: i64| {
+            let (_dir, conn) = database();
+            let first = at("2026-07-01T00:00:00Z");
+            conn.execute_batch("BEGIN")
+                .expect("the transaction should begin");
+            for n in 0..screen_rows {
+                conn.execute(
+                    "INSERT INTO observations (id, source, observed_at, schema_version, payload) \
+                     VALUES (?1, 'screen', ?2, 2, '{}')",
+                    rusqlite::params![
+                        ulid::Ulid::from(n as u128 + 1).to_string(),
+                        timestamp::to_sql(first + chrono::TimeDelta::seconds(n))
+                            .expect("the test timestamp should be spellable"),
+                    ],
+                )
+                .expect("the row should be writable");
+            }
+            conn.execute_batch("COMMIT; ANALYZE")
+                .expect("the rows should commit");
+            let mut statement = conn
+                .prepare(super::SELECT_RECORDED_UNTIL)
+                .expect("the query should prepare");
+            let later = timestamp::to_sql(at("2026-08-01T00:00:00Z"))
+                .expect("the test timestamp should be spellable");
+            statement
+                .query_row([later], |_| Ok(()))
+                .expect("the query should run");
+            statement.get_status(rusqlite::StatementStatus::VmStep)
+        };
+        let (small, large) = (steps(20), steps(2_000));
+
+        assert!(
+            large <= small * 2,
+            "a hundred times the rows took {large} steps instead of {small}"
         );
     }
 

@@ -1,6 +1,7 @@
 //! Grouping observations into fixed-length episodes for delivery.
 
 const SCREEN_SOURCE: &str = "screen";
+const AUDIO_SOURCE: &str = "audio";
 
 /// Hindsight splits retained text at blank lines before line breaks and packs the pieces into chunks
 /// of `retain_chunk_size` characters, 3000 by default; a block this long reaches a chunk whole.
@@ -9,6 +10,8 @@ const BLOCK_CHARS: usize = 1000;
 /// The line diff fills a table of old by new lines; a pair of captures past this many cells is rendered in full.
 const MAX_DIFF_CELLS: usize = 1_000_000;
 
+const UNBELIEVABLE_UTTERANCE_MS: i64 = 24 * 60 * 60 * 1000;
+
 /// A finished episode: the exact text and metadata that will be stored and delivered.
 ///
 /// There is deliberately no `id` field — the ULID is assigned by the store when the row is
@@ -16,8 +19,8 @@ const MAX_DIFF_CELLS: usize = 1_000_000;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Episode {
     /// Source that produced this episode; goes straight into the `episodes.source` column, and
-    /// `build_episode` derives the prefix of `document_id` from this same value rather than from a
-    /// second spelling of it.
+    /// `build_episode` and `build_audio_episode` derive the prefix of `document_id` from this same
+    /// value rather than from a second spelling of it.
     pub source: &'static str,
     /// Inclusive start of the window.
     pub start_at: chrono::DateTime<chrono::Utc>,
@@ -44,7 +47,8 @@ pub struct EpisodeMetadata {
     pub episode_start: String,
     /// Window end, RFC 3339 UTC.
     pub episode_end: String,
-    /// Number of observation entries in `content` after folding, in decimal.
+    /// Number of entries in `content`, in decimal: screen observations after folding, or the
+    /// per-process entries of an audio episode.
     pub entry_count: String,
 }
 
@@ -96,11 +100,7 @@ pub fn build_episode(
     observations: &[crate::model::Observation],
     spans: &[crate::model::StateSpan],
 ) -> Option<Episode> {
-    // Taken through `timestamp` rather than by truncating the subsecond field: that field also
-    // carries a leap second, as a value at or above one second, and truncating leaves it in place.
-    let window_start = chrono::DateTime::from_timestamp(window_start.timestamp(), 0)
-        .expect("a whole second taken from an instant must still be representable");
-    let end_at = window_start + chrono::Duration::minutes(i64::from(window_minutes));
+    let (window_start, end_at) = window_bounds(window_start, window_minutes);
     let mut entries: Vec<_> = observations
         .iter()
         .filter_map(|observation| match &observation.payload {
@@ -259,26 +259,180 @@ pub fn build_episode(
 
     blocks.sort_by_key(|(order, _)| *order);
     let header = format!("[{rendered_start} - {rendered_end}] Screen episode");
-    let content = std::iter::once(header)
-        .chain(blocks.into_iter().flat_map(|(_, blocks)| blocks))
-        .collect::<Vec<_>>()
-        .join("\n\n");
 
+    Some(assemble(
+        SCREEN_SOURCE,
+        window_start,
+        end_at,
+        window_minutes,
+        std::iter::once(header).chain(blocks.into_iter().flat_map(|(_, blocks)| blocks)),
+        entries.len(),
+    ))
+}
+
+/// `window_start` and `render_offset` are read as [`build_episode`] reads them. The panics are
+/// the same, with one more rendered bound: an entry's end, less than a day after the start of an
+/// utterance in the window.
+pub fn build_audio_episode(
+    window_start: chrono::DateTime<chrono::Utc>,
+    window_minutes: u32,
+    render_offset: chrono::FixedOffset,
+    observations: &[crate::model::Observation],
+    spans: &[crate::model::StateSpan],
+) -> Option<Episode> {
+    let (window_start, end_at) = window_bounds(window_start, window_minutes);
+    let pauses: Vec<_> = spans
+        .iter()
+        .filter(|span| {
+            span.status.state == crate::model::CaptureState::Paused
+                && span.start_at < end_at
+                && span.end_at >= window_start
+        })
+        .map(|span| {
+            (
+                span.start_at.max(window_start),
+                span.end_at.min(end_at),
+                span.id,
+            )
+        })
+        .collect();
+    let mut utterances: Vec<_> = observations
+        .iter()
+        .filter_map(|observation| match &observation.payload {
+            crate::model::SourcePayload::Audio(audio)
+                if observation.observed_at >= window_start && observation.observed_at < end_at =>
+            {
+                let line = match audio.error.as_deref().map(one_line) {
+                    Some(reason) if reason.is_empty() => "[transcription failed]".to_owned(),
+                    Some(reason) => format!("[transcription failed: {reason}]"),
+                    None => one_line(audio.text.as_deref().unwrap_or_default()),
+                };
+                (!line.is_empty()).then_some((observation, audio.process.as_str(), line))
+            }
+            _ => None,
+        })
+        .collect();
+    if utterances.is_empty() {
+        return None;
+    }
+    utterances.sort_by_key(|(observation, ..)| (observation.observed_at, observation.id));
+
+    let render = |at: chrono::DateTime<chrono::Utc>| {
+        at.with_timezone(&render_offset)
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    };
+    let mut entries: std::collections::HashMap<_, (_, _, _, Vec<_>)> =
+        std::collections::HashMap::new();
+    for (observation, process, line) in utterances {
+        let at = observation.observed_at;
+        let pauses_before = pauses.iter().filter(|(from, ..)| *from <= at).count();
+        let end = observation
+            .duration_ms
+            .and_then(|ms| i64::try_from(ms).ok())
+            .filter(|ms| *ms < UNBELIEVABLE_UTTERANCE_MS)
+            .and_then(|ms| at.checked_add_signed(chrono::TimeDelta::milliseconds(ms)))
+            .unwrap_or(at);
+        let entry = entries.entry((pauses_before, process)).or_insert((
+            at,
+            observation.id,
+            end,
+            Vec::new(),
+        ));
+        entry.2 = entry.2.max(end);
+        entry.3.push(format!(
+            "  {} {line}",
+            at.with_timezone(&render_offset).format("%H:%M:%S")
+        ));
+    }
+    let entry_count = entries.len();
+
+    let mut blocks: Vec<_> = pauses
+        .into_iter()
+        .map(|(from, to, id)| {
+            let state = format!(
+                "{} - {}\n  [audio capture pause requested for this period]",
+                render(from),
+                render(to)
+            );
+            ((from, 0, id), vec![state])
+        })
+        .collect();
+    for ((_, process), (first_at, first_id, end, lines)) in entries {
+        let mut header = format!("{} - {}", render(first_at), render(end));
+        push_subject(&mut header, Some(process), None);
+        blocks.push(((first_at, 1, first_id), entry_blocks(&header, &lines)));
+    }
+    blocks.sort_by_key(|(order, _)| *order);
+    let header = format!(
+        "[{} - {}] Audio episode",
+        render(window_start),
+        render(end_at)
+    );
+
+    Some(assemble(
+        AUDIO_SOURCE,
+        window_start,
+        end_at,
+        window_minutes,
+        std::iter::once(header).chain(blocks.into_iter().flat_map(|(_, blocks)| blocks)),
+        entry_count,
+    ))
+}
+
+fn window_bounds(
+    window_start: chrono::DateTime<chrono::Utc>,
+    window_minutes: u32,
+) -> (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>) {
+    // Taken through `timestamp` rather than by truncating the subsecond field: that field also
+    // carries a leap second, as a value at or above one second, and truncating leaves it in place.
+    let window_start = chrono::DateTime::from_timestamp(window_start.timestamp(), 0)
+        .expect("a whole second taken from an instant must still be representable");
+
+    (
+        window_start,
+        window_start + chrono::Duration::minutes(i64::from(window_minutes)),
+    )
+}
+
+fn assemble(
+    source: &'static str,
+    window_start: chrono::DateTime<chrono::Utc>,
+    end_at: chrono::DateTime<chrono::Utc>,
+    window_minutes: u32,
+    blocks: impl Iterator<Item = String>,
+    entry_count: usize,
+) -> Episode {
     let episode_start = window_start.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let episode_end = end_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
-    Some(Episode {
-        source: SCREEN_SOURCE,
+    Episode {
+        source,
         start_at: window_start,
         end_at,
-        document_id: format!("{SCREEN_SOURCE}-{episode_start}-{window_minutes}m"),
-        content,
+        document_id: format!("{source}-{episode_start}-{window_minutes}m"),
+        content: blocks.collect::<Vec<_>>().join("\n\n"),
         metadata: EpisodeMetadata {
             episode_start,
             episode_end,
-            entry_count: entries.len().to_string(),
+            entry_count: entry_count.to_string(),
         },
-    })
+    }
+}
+
+fn one_line(text: &str) -> String {
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        if line
+            .chars()
+            .next_back()
+            .is_some_and(|before| !(crate::is_cjk(before) && word.starts_with(crate::is_cjk)))
+        {
+            line.push(' ');
+        }
+        line.push_str(word);
+    }
+
+    line
 }
 
 fn entry_blocks(header: &str, body: &[String]) -> Vec<String> {
@@ -400,8 +554,8 @@ fn push_subject(line: &mut String, process: Option<&str>, title: Option<&str>) {
 mod tests {
     use super::*;
     use crate::model::{
-        CURRENT_SCHEMA_VERSION, CaptureState, CaptureStatus, Observation, OcrStatus, ScreenPayload,
-        SourcePayload, StateSpan,
+        AudioPayload, CURRENT_SCHEMA_VERSION, CaptureState, CaptureStatus, Observation, OcrStatus,
+        ScreenPayload, SourcePayload, StateSpan,
     };
     use chrono::{DateTime, FixedOffset, Utc};
 
@@ -2510,6 +2664,535 @@ mod tests {
                     "2026-07-24T16:00:04Z [editor.exe] Example Page{OWNER_CHANGED_SINCE_FIRST}"
                 ),
             ]
+        );
+    }
+
+    fn heard(
+        id: u128,
+        observed_at: &str,
+        duration_ms: u64,
+        process: &str,
+        text: Option<&str>,
+        error: Option<&str>,
+    ) -> Observation {
+        Observation {
+            id: ulid::Ulid::from(id),
+            observed_at: timestamp(observed_at),
+            duration_ms: Some(duration_ms),
+            schema_version: CURRENT_SCHEMA_VERSION,
+            payload: SourcePayload::Audio(AudioPayload {
+                process: process.to_owned(),
+                text: text.map(str::to_owned),
+                error: error.map(str::to_owned),
+            }),
+        }
+    }
+
+    fn utterance(
+        id: u128,
+        observed_at: &str,
+        duration_ms: u64,
+        process: &str,
+        text: &str,
+    ) -> Observation {
+        heard(id, observed_at, duration_ms, process, Some(text), None)
+    }
+
+    fn audio_episode(observations: &[Observation], spans: &[StateSpan]) -> Option<Episode> {
+        build_audio_episode(
+            timestamp("2026-07-24T16:00:00Z"),
+            5,
+            FixedOffset::east_opt(9 * 3600).expect("test offset should be valid"),
+            observations,
+            spans,
+        )
+    }
+
+    fn golden_utterances() -> Vec<Observation> {
+        vec![
+            utterance(
+                1,
+                "2026-07-24T16:00:12Z",
+                5_000,
+                "talk.exe",
+                "来週のリリース、チェックリストはもう終わっていますか。",
+            ),
+            utterance(
+                2,
+                "2026-07-24T16:00:19Z",
+                3_000,
+                "talk.exe",
+                "はい、残りは告知文だけです。",
+            ),
+            utterance(
+                3,
+                "2026-07-24T16:00:21Z",
+                5_000,
+                "player.exe",
+                "Figure one shows the release flow.",
+            ),
+            utterance(
+                4,
+                "2026-07-24T16:01:36Z",
+                4_500,
+                "talk.exe",
+                "では金曜に出しましょう。",
+            ),
+        ]
+    }
+
+    #[test]
+    fn audio_episode_content_renders_golden_text() {
+        let spans = [span(
+            1,
+            "2026-07-24T16:02:00Z",
+            "2026-07-24T16:09:00Z",
+            bare(CaptureState::Paused),
+        )];
+
+        let episode = audio_episode(&golden_utterances(), &spans)
+            .expect("the golden utterances should build an episode");
+        let golden = r#"[2026-07-25T01:00:00+09:00 - 2026-07-25T01:05:00+09:00] Audio episode
+
+2026-07-25T01:00:12+09:00 - 2026-07-25T01:01:40+09:00 [talk.exe]
+  01:00:12 来週のリリース、チェックリストはもう終わっていますか。
+  01:00:19 はい、残りは告知文だけです。
+  01:01:36 では金曜に出しましょう。
+
+2026-07-25T01:00:21+09:00 - 2026-07-25T01:00:26+09:00 [player.exe]
+  01:00:21 Figure one shows the release flow.
+
+2026-07-25T01:02:00+09:00 - 2026-07-25T01:05:00+09:00
+  [audio capture pause requested for this period]"#;
+
+        assert_eq!(episode.content, golden);
+        assert_eq!(episode.source, "audio");
+        assert_eq!(episode.document_id, "audio-2026-07-24T16:00:00Z-5m");
+        assert_eq!(episode.start_at, timestamp("2026-07-24T16:00:00Z"));
+        assert_eq!(episode.end_at, timestamp("2026-07-24T16:05:00Z"));
+        assert_eq!(
+            serde_json::to_value(&episode.metadata)
+                .expect("episode metadata should serialize to JSON"),
+            serde_json::json!({
+                "episode_start": "2026-07-24T16:00:00Z",
+                "episode_end": "2026-07-24T16:05:00Z",
+                "entry_count": "2"
+            })
+        );
+    }
+
+    #[test]
+    fn an_audio_episode_is_the_same_whatever_order_its_utterances_arrive_in() {
+        let ordered = golden_utterances();
+        let mut reversed = ordered.clone();
+        reversed.reverse();
+        let forward = audio_episode(&ordered, &[]);
+
+        assert!(forward.is_some());
+        assert_eq!(forward, audio_episode(&reversed, &[]));
+    }
+
+    #[test]
+    fn a_pause_splits_a_process_into_two_entries_and_no_other_state_renders() {
+        let observations = [
+            utterance(1, "2026-07-24T16:00:12Z", 2_000, "talk.exe", "before one"),
+            utterance(2, "2026-07-24T16:00:30Z", 2_000, "player.exe", "between"),
+            utterance(3, "2026-07-24T16:01:36Z", 2_000, "talk.exe", "before two"),
+            utterance(4, "2026-07-24T16:03:30Z", 2_500, "talk.exe", "after"),
+        ];
+        let spans = [
+            span(
+                1,
+                "2026-07-24T16:02:00Z",
+                "2026-07-24T16:03:00Z",
+                bare(CaptureState::Paused),
+            ),
+            span(
+                2,
+                "2026-07-24T16:00:40Z",
+                "2026-07-24T16:00:50Z",
+                status(CaptureState::Excluded, Some("vault.exe"), None, None),
+            ),
+            span(
+                3,
+                "2026-07-24T16:04:00Z",
+                "2026-07-24T16:04:10Z",
+                bare(CaptureState::Unchanged),
+            ),
+            span(
+                4,
+                "2026-07-24T15:50:00Z",
+                "2026-07-24T16:04:30Z",
+                bare(CaptureState::Unrecorded),
+            ),
+        ];
+
+        let episode =
+            audio_episode(&observations, &spans).expect("the utterances should build an episode");
+
+        assert_eq!(
+            episode.content.split("\n\n").collect::<Vec<_>>()[1..],
+            [
+                "2026-07-25T01:00:12+09:00 - 2026-07-25T01:01:38+09:00 [talk.exe]\n  \
+                 01:00:12 before one\n  01:01:36 before two",
+                "2026-07-25T01:00:30+09:00 - 2026-07-25T01:00:32+09:00 [player.exe]\n  \
+                 01:00:30 between",
+                "2026-07-25T01:02:00+09:00 - 2026-07-25T01:03:00+09:00\n  [audio capture pause requested for this period]",
+                "2026-07-25T01:03:30+09:00 - 2026-07-25T01:03:32+09:00 [talk.exe]\n  \
+                 01:03:30 after",
+            ]
+        );
+        assert_eq!(episode.metadata.entry_count, "3");
+    }
+
+    #[test]
+    fn an_utterance_stored_from_inside_a_pause_is_rendered_all_the_same() {
+        let observations = [
+            utterance(1, "2026-07-24T16:02:09Z", 3_000, "talk.exe", "before"),
+            utterance(2, "2026-07-24T16:02:10Z", 500, "talk.exe", "as it began"),
+            utterance(3, "2026-07-24T16:02:20Z", 1_000, "talk.exe", "as it ended"),
+        ];
+        let spans = [span(
+            1,
+            "2026-07-24T16:02:10Z",
+            "2026-07-24T16:02:20Z",
+            bare(CaptureState::Paused),
+        )];
+
+        let episode =
+            audio_episode(&observations, &spans).expect("the utterances should build an episode");
+
+        assert_eq!(
+            episode.content.split("\n\n").collect::<Vec<_>>()[1..],
+            [
+                "2026-07-25T01:02:09+09:00 - 2026-07-25T01:02:12+09:00 [talk.exe]\n  \
+                 01:02:09 before",
+                "2026-07-25T01:02:10+09:00 - 2026-07-25T01:02:20+09:00\n  [audio capture pause requested for this period]",
+                "2026-07-25T01:02:10+09:00 - 2026-07-25T01:02:21+09:00 [talk.exe]\n  \
+                 01:02:10 as it began\n  01:02:20 as it ended",
+            ]
+        );
+    }
+
+    #[test]
+    fn spaces_between_cjk_characters_are_dropped_and_other_spaces_kept() {
+        let observations = [
+            utterance(1, "2026-07-24T16:00:01Z", 1_000, "talk.exe", "許さ ない。"),
+            utterance(
+                2,
+                "2026-07-24T16:00:02Z",
+                1_000,
+                "talk.exe",
+                " Windows の 設定 を 開く ",
+            ),
+            utterance(
+                3,
+                "2026-07-24T16:00:03Z",
+                1_000,
+                "talk.exe",
+                "一行目\n二行目\r\nfirst line\nsecond line",
+            ),
+            utterance(
+                4,
+                "2026-07-24T16:00:04Z",
+                1_000,
+                "talk.exe",
+                "안녕하세요 여러분",
+            ),
+        ];
+
+        let episode =
+            audio_episode(&observations, &[]).expect("the utterances should build an episode");
+
+        assert_eq!(
+            episode.content.lines().skip(3).collect::<Vec<_>>(),
+            [
+                "  01:00:01 許さない。",
+                "  01:00:02 Windows の設定を開く",
+                "  01:00:03 一行目二行目 first line second line",
+                "  01:00:04 안녕하세요 여러분",
+            ]
+        );
+    }
+
+    #[test]
+    fn an_entry_ends_with_the_utterance_that_ends_last() {
+        let observations = [
+            utterance(1, "2026-07-24T16:00:10Z", 60_000, "talk.exe", "long"),
+            utterance(2, "2026-07-24T16:00:30Z", 2_000, "talk.exe", "short"),
+        ];
+
+        let episode =
+            audio_episode(&observations, &[]).expect("the utterances should build an episode");
+
+        assert_eq!(
+            episode.content.lines().nth(2),
+            Some("2026-07-25T01:00:10+09:00 - 2026-07-25T01:01:10+09:00 [talk.exe]")
+        );
+    }
+
+    #[test]
+    fn a_length_that_is_absent_or_a_day_or_more_ends_the_entry_at_its_start() {
+        let near_the_last_instant = "2026-07-24T16:00:40Z";
+        let observations = [
+            Observation {
+                duration_ms: None,
+                ..utterance(1, "2026-07-24T16:00:10Z", 0, "absent.exe", "one")
+            },
+            utterance(2, "2026-07-24T16:00:20Z", 86_400_000, "day.exe", "two"),
+            utterance(
+                3,
+                "2026-07-24T16:00:30Z",
+                10_000_000_000_000,
+                "far.exe",
+                "three",
+            ),
+            utterance(
+                4,
+                near_the_last_instant,
+                u64::try_from(
+                    (DateTime::<Utc>::MAX_UTC - timestamp(near_the_last_instant))
+                        .num_milliseconds()
+                        - 3_600_000,
+                )
+                .expect("the test length should be positive"),
+                "edge.exe",
+                "four",
+            ),
+            utterance(5, "2026-07-24T16:00:50Z", 86_399_999, "long.exe", "five"),
+        ];
+
+        let episode =
+            audio_episode(&observations, &[]).expect("the utterances should build an episode");
+
+        assert_eq!(
+            episode
+                .content
+                .lines()
+                .filter(|line| line.starts_with("2026"))
+                .collect::<Vec<_>>(),
+            [
+                "2026-07-25T01:00:10+09:00 - 2026-07-25T01:00:10+09:00 [absent.exe]",
+                "2026-07-25T01:00:20+09:00 - 2026-07-25T01:00:20+09:00 [day.exe]",
+                "2026-07-25T01:00:30+09:00 - 2026-07-25T01:00:30+09:00 [far.exe]",
+                "2026-07-25T01:00:40+09:00 - 2026-07-25T01:00:40+09:00 [edge.exe]",
+                "2026-07-25T01:00:50+09:00 - 2026-07-26T01:00:49+09:00 [long.exe]",
+            ]
+        );
+    }
+
+    #[test]
+    fn an_utterance_at_the_window_start_belongs_to_the_window() {
+        let observations = [utterance(
+            1,
+            "2026-07-24T16:00:00Z",
+            1_000,
+            "talk.exe",
+            "first",
+        )];
+
+        let episode =
+            audio_episode(&observations, &[]).expect("the utterance should build an episode");
+
+        assert_eq!(
+            episode.content.split("\n\n").nth(1),
+            Some(
+                "2026-07-25T01:00:00+09:00 - 2026-07-25T01:00:01+09:00 [talk.exe]\n  \
+                 01:00:00 first"
+            )
+        );
+    }
+
+    #[test]
+    fn a_pause_from_before_the_window_and_a_second_one_both_render_and_only_the_second_splits() {
+        let observations = [
+            utterance(1, "2026-07-24T16:01:30Z", 1_000, "talk.exe", "between"),
+            utterance(2, "2026-07-24T16:03:30Z", 1_000, "talk.exe", "after"),
+        ];
+        let spans = [
+            span(
+                1,
+                "2026-07-24T15:58:00Z",
+                "2026-07-24T16:01:00Z",
+                bare(CaptureState::Paused),
+            ),
+            span(
+                2,
+                "2026-07-24T16:02:00Z",
+                "2026-07-24T16:03:00Z",
+                bare(CaptureState::Paused),
+            ),
+        ];
+
+        let episode =
+            audio_episode(&observations, &spans).expect("the utterances should build an episode");
+
+        assert_eq!(
+            episode.content.split("\n\n").collect::<Vec<_>>()[1..],
+            [
+                "2026-07-25T01:00:00+09:00 - 2026-07-25T01:01:00+09:00\n  [audio capture pause requested for this period]",
+                "2026-07-25T01:01:30+09:00 - 2026-07-25T01:01:31+09:00 [talk.exe]\n  \
+                 01:01:30 between",
+                "2026-07-25T01:02:00+09:00 - 2026-07-25T01:03:00+09:00\n  [audio capture pause requested for this period]",
+                "2026-07-25T01:03:30+09:00 - 2026-07-25T01:03:31+09:00 [talk.exe]\n  \
+                 01:03:30 after",
+            ]
+        );
+        assert_eq!(episode.metadata.entry_count, "2");
+    }
+
+    #[test]
+    fn a_failed_transcription_renders_its_reason() {
+        let observations = [
+            utterance(1, "2026-07-24T16:00:01Z", 1_000, "talk.exe", "heard"),
+            heard(
+                2,
+                "2026-07-24T16:00:05Z",
+                3_000,
+                "talk.exe",
+                None,
+                Some("the request timed out"),
+            ),
+        ];
+
+        let episode =
+            audio_episode(&observations, &[]).expect("the utterances should build an episode");
+
+        assert_eq!(
+            episode.content.split("\n\n").nth(1),
+            Some(
+                "2026-07-25T01:00:01+09:00 - 2026-07-25T01:00:08+09:00 [talk.exe]\n  \
+                 01:00:01 heard\n  01:00:05 [transcription failed: the request timed out]"
+            )
+        );
+    }
+
+    #[test]
+    fn a_failed_transcription_without_a_reason_is_still_marked() {
+        let observations = [
+            heard(1, "2026-07-24T16:00:05Z", 0, "talk.exe", None, Some("")),
+            heard(
+                2,
+                "2026-07-24T16:00:06Z",
+                0,
+                "talk.exe",
+                Some("unused"),
+                Some(" \n "),
+            ),
+        ];
+
+        let episode =
+            audio_episode(&observations, &[]).expect("the failures should build an episode");
+
+        assert_eq!(
+            episode.content.lines().skip(3).collect::<Vec<_>>(),
+            [
+                "  01:00:05 [transcription failed]",
+                "  01:00:06 [transcription failed]",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_window_without_a_rendered_utterance_builds_no_audio_episode() {
+        let paused = [span(
+            1,
+            "2026-07-24T16:01:00Z",
+            "2026-07-24T16:02:00Z",
+            bare(CaptureState::Paused),
+        )];
+        let screen_only = [observation(
+            1,
+            "2026-07-24T16:00:02Z",
+            screen_payload(OcrStatus::Succeeded, Some("line one")),
+        )];
+        let outside = [
+            utterance(1, "2026-07-24T15:59:59Z", 5_000, "talk.exe", "before"),
+            utterance(2, "2026-07-24T16:05:00Z", 1_000, "talk.exe", "after"),
+        ];
+        let silent = [
+            utterance(1, "2026-07-24T16:00:01Z", 1_000, "talk.exe", " \n "),
+            heard(2, "2026-07-24T16:00:02Z", 1_000, "talk.exe", None, None),
+        ];
+
+        assert_eq!(audio_episode(&[], &[]), None);
+        assert_eq!(audio_episode(&[], &paused), None);
+        assert_eq!(audio_episode(&screen_only, &paused), None);
+        assert_eq!(audio_episode(&outside, &paused), None);
+        assert_eq!(audio_episode(&silent, &paused), None);
+    }
+
+    #[test]
+    fn an_utterance_that_renders_nothing_leaves_no_line_and_no_entry() {
+        let observations = [
+            utterance(1, "2026-07-24T16:00:01Z", 1_000, "talk.exe", ""),
+            utterance(2, "2026-07-24T16:00:10Z", 2_000, "talk.exe", "heard"),
+            utterance(3, "2026-07-24T16:00:20Z", 9_000, "talk.exe", "  "),
+            utterance(4, "2026-07-24T16:00:30Z", 1_000, "player.exe", ""),
+        ];
+
+        let episode =
+            audio_episode(&observations, &[]).expect("the utterance should build an episode");
+
+        assert_eq!(
+            episode.content.split("\n\n").collect::<Vec<_>>()[1..],
+            ["2026-07-25T01:00:10+09:00 - 2026-07-25T01:00:12+09:00 [talk.exe]\n  01:00:10 heard"]
+        );
+        assert_eq!(episode.metadata.entry_count, "1");
+    }
+
+    #[test]
+    fn an_audio_entry_longer_than_a_block_continues_under_its_own_header() {
+        let texts: Vec<_> = (1..=60)
+            .map(|n| format!("sentence {n} {}", "x".repeat(40)))
+            .collect();
+        let observations: Vec<_> = texts
+            .iter()
+            .zip(1_u32..)
+            .map(|(text, n)| {
+                utterance(
+                    u128::from(n),
+                    &format!("2026-07-24T16:{:02}:{:02}Z", n / 60, n % 60),
+                    500,
+                    "talk.exe",
+                    text,
+                )
+            })
+            .collect();
+
+        let episode =
+            audio_episode(&observations, &[]).expect("the utterances should build an episode");
+        let header = "2026-07-25T01:00:01+09:00 - 2026-07-25T01:01:00+09:00 [talk.exe]";
+        let continued = format!("{header} (continued)");
+        let blocks: Vec<_> = episode.content.split("\n\n").skip(1).collect();
+
+        assert!(blocks.len() > 2, "the entry should span several blocks");
+        let mut lines = Vec::new();
+        for (index, block) in blocks.iter().enumerate() {
+            assert!(block.chars().count() <= BLOCK_CHARS);
+            let mut block_lines = block.lines();
+            assert_eq!(
+                block_lines.next(),
+                Some(if index == 0 { header } else { &continued })
+            );
+            lines.extend(block_lines);
+        }
+        assert_eq!(lines.len(), texts.len());
+        assert_eq!(lines[59], format!("  01:01:00 {}", texts[59]));
+        assert_eq!(episode.metadata.entry_count, "1");
+    }
+
+    #[test]
+    fn a_window_holding_only_audio_builds_no_screen_episode() {
+        assert_eq!(
+            build_episode(
+                timestamp("2026-07-24T16:00:00Z"),
+                5,
+                FixedOffset::east_opt(9 * 3600).expect("test offset should be valid"),
+                &golden_utterances(),
+                &[],
+            ),
+            None
         );
     }
 }

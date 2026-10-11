@@ -25,9 +25,17 @@ pub struct ScreenPayload {
     pub foreground_pid: Option<u32>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AudioPayload {
+    pub process: String,
+    pub text: Option<String>,
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum SourcePayload {
     Screen(ScreenPayload),
+    Audio(AudioPayload),
     /// A row whose source this build does not know is kept as it was read, so a window holding
     /// one still builds its episode instead of failing the whole read.
     Unknown {
@@ -78,10 +86,11 @@ pub struct StateSpan {
 }
 
 impl SourcePayload {
-    /// "screen" for Screen; the stored source string for Unknown.
+    /// "screen" for Screen; "audio" for Audio; the stored source string for Unknown.
     pub fn kind(&self) -> &str {
         match self {
             Self::Screen(_) => "screen",
+            Self::Audio(_) => "audio",
             Self::Unknown { source, .. } => source,
         }
     }
@@ -90,23 +99,25 @@ impl SourcePayload {
     pub fn to_payload_json(&self) -> Result<serde_json::Value, serde_json::Error> {
         match self {
             Self::Screen(payload) => Ok(serde_json::to_value(payload)?),
+            Self::Audio(payload) => Ok(serde_json::to_value(payload)?),
             Self::Unknown { raw, .. } => Ok(raw.clone()),
         }
     }
 
-    /// Inverse: "screen" parses ScreenPayload (unknown JSON fields are ignored for forward
-    /// compatibility); any other source becomes Unknown{source, raw} without validation.
+    /// Inverse: "screen" parses ScreenPayload and "audio" parses AudioPayload (unknown JSON fields
+    /// are ignored for forward compatibility); any other source becomes Unknown{source, raw}
+    /// without validation.
     pub fn from_parts(
         source: &str,
         raw: serde_json::Value,
     ) -> Result<SourcePayload, serde_json::Error> {
-        if source == "screen" {
-            Ok(Self::Screen(serde_json::from_value(raw)?))
-        } else {
-            Ok(Self::Unknown {
+        match source {
+            "screen" => Ok(Self::Screen(serde_json::from_value(raw)?)),
+            "audio" => Ok(Self::Audio(serde_json::from_value(raw)?)),
+            _ => Ok(Self::Unknown {
                 source: source.to_owned(),
                 raw,
-            })
+            }),
         }
     }
 }
@@ -123,6 +134,22 @@ impl Observation {
             duration_ms: None,
             schema_version: CURRENT_SCHEMA_VERSION,
             payload: SourcePayload::Screen(payload),
+        }
+    }
+
+    /// id = new ULID, schema_version = CURRENT_SCHEMA_VERSION. `observed_at` is the utterance's
+    /// start and `duration_ms` its length.
+    pub fn new_audio(
+        payload: AudioPayload,
+        observed_at: chrono::DateTime<chrono::Utc>,
+        duration_ms: u64,
+    ) -> Observation {
+        Self {
+            id: ulid::Ulid::generate(),
+            observed_at,
+            duration_ms: Some(duration_ms),
+            schema_version: CURRENT_SCHEMA_VERSION,
+            payload: SourcePayload::Audio(payload),
         }
     }
 }
@@ -199,17 +226,17 @@ mod tests {
             }
         });
 
-        let payload =
-            SourcePayload::from_parts("audio", raw.clone()).expect("unknown source should be kept");
+        let payload = SourcePayload::from_parts("synthetic", raw.clone())
+            .expect("unknown source should be kept");
 
         assert_eq!(
             payload,
             SourcePayload::Unknown {
-                source: "audio".to_owned(),
+                source: "synthetic".to_owned(),
                 raw: raw.clone(),
             }
         );
-        assert_eq!(payload.kind(), "audio");
+        assert_eq!(payload.kind(), "synthetic");
         assert_eq!(
             payload
                 .to_payload_json()
@@ -230,5 +257,71 @@ mod tests {
             SourcePayload::from_parts("screen", raw).expect("future fields should be ignored");
 
         assert!(matches!(parsed, SourcePayload::Screen(_)));
+    }
+
+    fn spoken_audio_payload() -> AudioPayload {
+        AudioPayload {
+            process: "talk.exe".to_owned(),
+            text: Some("テスト です".to_owned()),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn audio_payload_roundtrips_via_parts() {
+        let observed_at = chrono::DateTime::parse_from_rfc3339("2026-07-25T12:34:56Z")
+            .expect("test timestamp should be valid")
+            .with_timezone(&chrono::Utc);
+        let failed = AudioPayload {
+            process: "player.exe".to_owned(),
+            text: None,
+            error: Some("the model gave out".to_owned()),
+        };
+
+        for payload in [spoken_audio_payload(), failed] {
+            let obs = Observation::new_audio(payload, observed_at, 1_500);
+
+            let json = obs
+                .payload
+                .to_payload_json()
+                .expect("audio payload should serialize");
+            let back = SourcePayload::from_parts(obs.payload.kind(), json)
+                .expect("audio payload should deserialize");
+
+            assert_eq!(back, obs.payload);
+            assert_eq!(obs.payload.kind(), "audio");
+            assert_eq!(obs.observed_at, observed_at);
+            assert_eq!(obs.duration_ms, Some(1_500));
+            assert_eq!(obs.schema_version, CURRENT_SCHEMA_VERSION);
+        }
+    }
+
+    #[test]
+    fn audio_payload_json_matches_golden_fixture() {
+        let json = serde_json::to_string(
+            &SourcePayload::Audio(spoken_audio_payload())
+                .to_payload_json()
+                .expect("audio payload should serialize"),
+        )
+        .expect("payload JSON should spell as a string");
+
+        assert_eq!(
+            json,
+            r#"{"error":null,"process":"talk.exe","text":"テスト です"}"#
+        );
+    }
+
+    #[test]
+    fn audio_parse_ignores_unknown_fields() {
+        let mut raw =
+            serde_json::to_value(spoken_audio_payload()).expect("payload should serialize");
+        raw.as_object_mut()
+            .expect("audio payload should be an object")
+            .insert("future_field".to_owned(), serde_json::json!(1));
+
+        let parsed =
+            SourcePayload::from_parts("audio", raw).expect("future fields should be ignored");
+
+        assert_eq!(parsed, SourcePayload::Audio(spoken_audio_payload()));
     }
 }

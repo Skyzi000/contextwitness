@@ -1,5 +1,6 @@
 //! The Windows OCR backend: WinRT `Windows.Media.Ocr` behind the crate's trait.
 
+use cw_core::is_cjk;
 use cw_core::model::OcrStatus;
 use windows::Globalization::Language;
 use windows::Graphics::Imaging::{BitmapPixelFormat, SoftwareBitmap};
@@ -151,15 +152,6 @@ fn join_words(words: &[Word]) -> String {
         previous = Some(word);
     }
     text
-}
-
-fn is_cjk(c: char) -> bool {
-    matches!(c,
-        '\u{2E80}'..='\u{9FFF}'
-        | '\u{F900}'..='\u{FAFF}'
-        | '\u{FE30}'..='\u{FE4F}'
-        | '\u{FF00}'..='\u{FFEF}'
-        | '\u{20000}'..='\u{3FFFF}')
 }
 
 /// First configured language that Windows actually ships an OCR engine for, falling back to the

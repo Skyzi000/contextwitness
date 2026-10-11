@@ -6,7 +6,7 @@ const FIRST_DELAY_SECONDS: i64 = 30;
 const MAX_DELAY_SECONDS: i64 = 900;
 
 const SELECT_DUE: &str = "SELECT o.episode_id, o.attempts, e.document_id, e.end_at, e.content, \
-     e.metadata_json FROM outbox o JOIN episodes e ON e.id = o.episode_id \
+     e.metadata_json, e.source FROM outbox o JOIN episodes e ON e.id = o.episode_id \
      WHERE o.state IN ('pending', 'failed') AND o.next_attempt_at IS NOT NULL \
      AND o.next_attempt_at <= ?1 ORDER BY o.next_attempt_at, e.start_at, e.id LIMIT ?2";
 const CLAIM: &str = "UPDATE outbox SET state = 'delivering' \
@@ -36,6 +36,7 @@ const NEWEST_ERROR: &str = "SELECT e.document_id, o.state, o.last_error, \
 pub struct Due {
     /// Primary key of both rows.
     pub episode_id: ulid::Ulid,
+    pub source: String,
     pub document_id: String,
     /// End of the window, which is the `timestamp` the memory is retained under.
     pub end_at: chrono::DateTime<chrono::Utc>,
@@ -272,9 +273,11 @@ fn decode(row: &rusqlite::Row<'_>) -> Result<Due, Box<dyn std::error::Error + Se
     let end_at = timestamp::from_sql(&end_at)?;
     let content: String = row.get(4)?;
     let metadata_json: String = row.get(5)?;
+    let source: String = row.get(6)?;
 
     Ok(Due {
         episode_id,
+        source,
         document_id,
         end_at,
         content,
@@ -609,6 +612,39 @@ mod tests {
             [young_id, old_id],
             "entries must be served by due instant, the window only breaking ties"
         );
+    }
+
+    #[test]
+    fn a_due_entry_carries_its_episodes_source() {
+        let dir = tempdir().expect("the temporary database directory should be creatable");
+        let mut conn =
+            db::open(&dir.path().join("db.sqlite3")).expect("the fresh database should initialize");
+        let (screen_id, start_at) = registered_episode(&mut conn);
+        let audio_id = ulid::Ulid::generate();
+        episodes::insert_with_outbox(
+            &mut conn,
+            audio_id,
+            &cw_core::episode::Episode {
+                source: "audio",
+                ..test_episode(start_at, "audio-2026-08-01T12:00:00Z-30m")
+            },
+            start_at,
+        )
+        .expect("the audio episode should register");
+
+        let mut due: Vec<_> = fetch_due(&conn, start_at, 10)
+            .expect("the due query should run")
+            .into_iter()
+            .map(|entry| (entry.episode_id, entry.source))
+            .collect();
+        due.sort();
+
+        let mut expected = [
+            (screen_id, "screen".to_owned()),
+            (audio_id, "audio".to_owned()),
+        ];
+        expected.sort();
+        assert_eq!(due, expected);
     }
 
     #[test]
