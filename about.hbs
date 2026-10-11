@@ -1,0 +1,21 @@
+ContextWitness includes the following third-party software. Each crate's
+source is available at the crates.io page listed with it. The notices for the
+Rust standard library, which is also part of contextwitness.exe, are in
+RUST-STD-COPYRIGHT.html.
+{{#each licenses}}
+
+################################################################################
+{{{name}}}
+
+Used by:
+{{#each used_by}}
+  {{crate.name}} {{crate.version}}  https://crates.io/crates/{{crate.name}}/{{crate.version}}
+{{/each}}
+{{#unless source_path}}
+
+The crates above declare this license but ship no copy of it; the standard
+text follows.
+{{/unless}}
+
+{{{text}}}
+{{/each}}
