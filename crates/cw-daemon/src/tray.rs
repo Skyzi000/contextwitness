@@ -1,7 +1,8 @@
 use crate::autostart;
 use cw_core::config::DataPaths;
 use cw_store::control::Pause;
-use tao::event_loop::{ControlFlow, EventLoopBuilder};
+use tao::event::Event;
+use tao::event_loop::{ControlFlow, EventLoop, EventLoopBuilder};
 use tao::platform::windows::EventLoopBuilderExtWindows;
 use tracing::{error, info};
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
@@ -15,7 +16,7 @@ const POLL: std::time::Duration = std::time::Duration::from_secs(5);
 /// area asks for, and scaling down from 32 looks better than scaling up from 16.
 const ICON_SIZE: u32 = 32;
 
-/// Menu item ids. The id is what comes back on the event channel, so these are the whole mapping
+/// Menu item ids. The id is what comes back in the menu event, so these are the whole mapping
 /// from a click to an action.
 const PAUSE_30M: &str = "pause-30m";
 const PAUSE_1H: &str = "pause-1h";
@@ -55,12 +56,9 @@ struct Tray {
 }
 
 /// Build the tray on this thread and hand the thread to the event loop, which never gives it back.
-///
-/// The event loop is built with the any-thread extension because this is not the main thread; the
-/// main one is running the capture loop.
 fn run(paths: DataPaths) -> Result<(), Box<dyn std::error::Error>> {
     let conn = cw_store::db::open(&paths.database())?;
-    let event_loop = EventLoopBuilder::new().with_any_thread(true).build();
+    let event_loop = menu_event_loop();
 
     let autostart_item = CheckMenuItem::with_id(
         AUTOSTART,
@@ -105,8 +103,8 @@ fn run(paths: DataPaths) -> Result<(), Box<dyn std::error::Error>> {
     };
     state.follow_pause();
 
-    event_loop.run(move |_event, _target, control_flow| {
-        while let Ok(event) = MenuEvent::receiver().try_recv() {
+    event_loop.run(move |event, _target, control_flow| {
+        if let Event::UserEvent(event) = event {
             state.act(&event.id.0);
         }
         // The click channel is unbounded and every mouse move across the icon posts to it, so
@@ -118,6 +116,24 @@ fn run(paths: DataPaths) -> Result<(), Box<dyn std::error::Error>> {
         }
         *control_flow = ControlFlow::WaitUntil(state.last_poll + POLL);
     })
+}
+
+/// The loop the tray runs on, with every menu choice posted to it as a user event: a choice does
+/// not wake the loop by itself, and one left on the menu's channel would wait for the next poll.
+///
+/// The event loop is built with the any-thread extension because this is not the main thread; the
+/// main one is running the capture loop.
+fn menu_event_loop() -> EventLoop<MenuEvent> {
+    let event_loop = EventLoopBuilder::<MenuEvent>::with_user_event()
+        .with_any_thread(true)
+        .build();
+    let proxy = event_loop.create_proxy();
+    MenuEvent::set_event_handler(Some(move |event| {
+        if proxy.send_event(event).is_err() {
+            error!("a tray menu choice was dropped because the event loop has ended");
+        }
+    }));
+    event_loop
 }
 
 impl Tray {
@@ -231,4 +247,67 @@ fn disc(rgb: [u8; 3]) -> Result<Icon, tray_icon::BadIcon> {
     }
 
     Icon::from_rgba(rgba, ICON_SIZE, ICON_SIZE)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tao::platform::run_return::EventLoopExtRunReturn;
+    use tray_icon::menu::ContextMenu;
+    use windows::Win32::Foundation::{LPARAM, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DestroyWindow, GetMenuItemID, HMENU, HWND_MESSAGE, PostMessageW,
+        WINDOW_EX_STYLE, WINDOW_STYLE, WM_COMMAND,
+    };
+    use windows::core::w;
+
+    #[test]
+    fn a_menu_choice_reaches_the_loop_without_further_input() {
+        let mut event_loop = menu_event_loop();
+        let menu = Menu::new();
+        menu.append(&MenuItem::with_id(RESUME, "Resume", true, None))
+            .unwrap();
+        // The tray icon's hidden window is subclassed the same way, and Windows reports a choice
+        // from its menu with this message.
+        let owner = unsafe {
+            let owner = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                w!(""),
+                WINDOW_STYLE(0),
+                0,
+                0,
+                0,
+                0,
+                Some(HWND_MESSAGE),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            menu.attach_menu_subclass_for_hwnd(owner.0 as isize);
+            let command = GetMenuItemID(HMENU(menu.hpopupmenu() as _), 0);
+            PostMessageW(Some(owner), WM_COMMAND, WPARAM(command as usize), LPARAM(0)).unwrap();
+            owner
+        };
+
+        let deadline = std::time::Instant::now() + POLL / 2;
+        let mut chosen = None;
+        event_loop.run_return(|event, _target, control_flow| {
+            *control_flow = ControlFlow::WaitUntil(deadline);
+            if let Event::UserEvent(event) = event {
+                chosen = Some(event.id.0);
+            }
+            if chosen.is_some() || std::time::Instant::now() >= deadline {
+                *control_flow = ControlFlow::Exit;
+            }
+        });
+        unsafe { DestroyWindow(owner) }.unwrap();
+
+        assert_eq!(
+            chosen.as_deref(),
+            Some(RESUME),
+            "nothing but the menu choice was there to wake the loop"
+        );
+    }
 }
