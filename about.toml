@@ -48,7 +48,6 @@ path = "LICENSE-LIBM-MIT"
 license = "MIT"
 checksum = "9eff396a99bafd208e7126602420d6864f6066c08b84485a5b032320a9c01997"
 
-# The crate declares MIT for its bindings but ships no MIT text; the vendored libwebp is BSD-3-Clause.
 [futures-channel.clarify]
 license = "(MIT OR Apache-2.0) AND BSD-2-Clause-Views"
 [[futures-channel.clarify.files]]
@@ -62,6 +61,7 @@ start = "/* Copyright (c) 2010-2011 Dmitry Vyukov"
 end = "either expressed or implied, of Dmitry Vyukov."
 checksum = "c55d19628a03d832a16c36543625a44d4c946f746b0bf93cfdefbbdee1f969ec"
 
+# The crate declares MIT for its bindings but ships no MIT text; the vendored libwebp is BSD-3-Clause.
 [libwebp-sys.clarify]
 license = "MIT AND BSD-3-Clause"
 [[libwebp-sys.clarify.files]]
