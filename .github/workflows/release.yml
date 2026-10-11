@@ -48,6 +48,9 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
       # Tag pushes do not trigger ci.yml, so the tagged tree is verified here before it is published.
       - run: cargo fmt --all -- --check
+      - name: Fetch the native libraries
+        shell: pwsh
+        run: ./scripts/fetch-sherpa-onnx.ps1
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
       - run: cargo audit
@@ -55,11 +58,19 @@ jobs:
         env:
           # Portable ZIP promise: the exe must run on a machine without the VC++ redistributable.
           RUSTFLAGS: -C target-feature=+crt-static
+      - name: Check that espeak-ng is not linked in
+        shell: pwsh
+        # The default sherpa-onnx archive links espeak-ng (GPL-3.0); the no-TTS one fetched above does not.
+        run: |
+          $exe = (Get-Item target/release/contextwitness.exe).FullName
+          $text = [Text.Encoding]::Latin1.GetString([IO.File]::ReadAllBytes($exe))
+          $hits = [regex]::Matches($text, 'espeak[-_]ng', 'IgnoreCase').Count
+          if ($hits) { throw "contextwitness.exe names espeak-ng $hits times" }
       - name: Package
         shell: pwsh
         run: |
           New-Item -ItemType Directory $env:STAGE | Out-Null
-          Copy-Item target/release/contextwitness.exe, README.md, README.ja.md, LICENSE, THIRD-PARTY-LICENSES.txt $env:STAGE
+          Copy-Item target/release/contextwitness.exe, README.md, README.ja.md, LICENSE, THIRD-PARTY-LICENSES.txt, THIRD-PARTY-NATIVE-LICENSES.txt $env:STAGE
           Copy-Item (Join-Path (rustc --print sysroot) share/doc/rust/COPYRIGHT-library.html) "$env:STAGE/RUST-STD-COPYRIGHT.html"
           Compress-Archive -Path $env:STAGE -DestinationPath "$env:STAGE.zip"
       - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
