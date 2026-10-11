@@ -92,15 +92,16 @@ impl Credentials {
         document: &Map<String, Value>,
         path: PathBuf,
     ) -> Result<Option<Self>, CredentialsError> {
-        let field = |key: &str| {
-            document
-                .get(key)
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-                .filter(|value| !value.trim().is_empty())
+        let field = |key: &'static str| match document.get(key) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(value)) => Ok((!value.trim().is_empty()).then(|| value.clone())),
+            Some(_) => Err(CredentialsError::NotAString {
+                path: path.clone(),
+                key,
+            }),
         };
-        let token = field("hindsightApiToken");
-        match field("hindsightApiUrl") {
+        let token = field("hindsightApiToken")?;
+        match field("hindsightApiUrl")? {
             Some(api_url) => Ok(Some(Self { api_url, token })),
             None if token.is_none() => Ok(None),
             None => Err(CredentialsError::NoUrl { path }),
@@ -211,6 +212,8 @@ pub enum CredentialsError {
     },
     #[error("{path} holds a token but no URL; run `contextwitness setup` to rewrite it")]
     NoUrl { path: PathBuf },
+    #[error("{path} holds a {key} that is not a string; run `contextwitness setup` to rewrite it")]
+    NotAString { path: PathBuf, key: &'static str },
     #[error(
         "CONTEXTWITNESS_HINDSIGHT_TOKEN is set without CONTEXTWITNESS_HINDSIGHT_URL, which \
          would pair the token with a URL from another source; set both or neither"
@@ -1027,6 +1030,55 @@ mod tests {
                 .is_none(),
             "a document holding neither key configures nothing"
         );
+    }
+
+    #[test]
+    fn a_value_of_the_wrong_type_is_an_error_rather_than_an_unset_key() {
+        let document: Map<String, Value> = [("hindsightApiUrl".to_owned(), 8888.into())]
+            .into_iter()
+            .collect();
+        assert!(
+            matches!(
+                Credentials::from_document(&document, PathBuf::from("contextwitness.json")),
+                Err(CredentialsError::NotAString {
+                    key: "hindsightApiUrl",
+                    ..
+                })
+            ),
+            "a URL of the wrong type must not read as delivery left unconfigured"
+        );
+
+        let document: Map<String, Value> = [
+            ("hindsightApiUrl".to_owned(), "http://host:5/api".into()),
+            ("hindsightApiToken".to_owned(), 424_242.into()),
+        ]
+        .into_iter()
+        .collect();
+        let error = Credentials::from_document(&document, PathBuf::from("contextwitness.json"))
+            .expect_err("a token of the wrong type must not read as a server that needs none");
+        assert!(matches!(
+            error,
+            CredentialsError::NotAString {
+                key: "hindsightApiToken",
+                ..
+            }
+        ));
+        assert!(!error.to_string().contains("424242"), "{error}");
+    }
+
+    #[test]
+    fn a_null_token_is_the_tokenless_state() {
+        let document: Map<String, Value> = [
+            ("hindsightApiUrl".to_owned(), "http://host:6/api".into()),
+            ("hindsightApiToken".to_owned(), Value::Null),
+        ]
+        .into_iter()
+        .collect();
+        let credentials =
+            Credentials::from_document(&document, PathBuf::from("contextwitness.json"))
+                .unwrap()
+                .expect("Hindsight's own integrations ship a null token as their default");
+        assert_eq!(credentials.token, None);
     }
 
     #[test]
