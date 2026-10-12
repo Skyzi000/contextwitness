@@ -261,10 +261,10 @@ Environment variables can stand in for the file: `CONTEXTWITNESS_TRANSCRIPTION_U
 Episodes go to the bank `hindsight.bank_id` names (`contextwitness` by default).
 
 - **A missing bank is created for you**, with initial settings suited to the text ContextWitness sends: screen OCR text and audio transcripts. This needs Hindsight's bank config API (`HINDSIGHT_API_ENABLE_BANK_CONFIG_API`) to be enabled.
-- **An existing bank's settings are left alone.** What you change in Hindsight stays as you set it. This includes a bank created by a version without audio recording: see [A bank created before audio recording](#bank-initialization-in-detail) if you turn audio recording on with one.
+- **An existing bank keeps its settings, with one exception.** What you change in Hindsight stays as you set it. The exception is the `observations_mission` that ContextWitness itself wrote: when a new version changes what the episodes look like, it replaces that text with its own. A mission you wrote is not touched.
 - **Keep the bank id to ContextWitness.** If another program creates a bank with the same id at the same moment, the bank it created can receive ContextWitness's initial settings.
 
-What the initial settings are, and what to do when the bank config API is disabled, is in [Bank initialization in detail](#bank-initialization-in-detail).
+What the initial settings are, when the mission is replaced, and what to do when the bank config API is disabled, is in [Bank initialization in detail](#bank-initialization-in-detail).
 
 ### Context label
 
@@ -345,17 +345,17 @@ An `audio.model_dir` that is not an absolute path is a different case: like any 
 
 For those who manage their Hindsight configuration themselves.
 
-ContextWitness looks for `hindsight.bank_id` in Hindsight's bank list. For a bank the list confirms as existing, the settings are left unchanged. When the list shows none, one PATCH to the bank config creates the bank and sets three things; every other setting follows the Hindsight server's own configuration:
+ContextWitness looks for `hindsight.bank_id` in Hindsight's bank list. For a bank the list confirms as existing, the settings are left unchanged, apart from a mission ContextWitness wrote earlier (see below). When the list shows none, one PATCH to the bank config creates the bank and sets three things; every other setting follows the Hindsight server's own configuration:
 
 - `retain_extraction_mode="chunks"` — episodes are stored as raw text chunks instead of LLM-extracted facts
 - `store_document_text=false` — the same text is not stored in Hindsight twice
 - `observations_mission` — tells Hindsight what the text is: OCR of the screen, and transcripts of speech that applications played
 
-**When the bank config API is disabled.** Creating the bank requires Hindsight's bank config API (`HINDSIGHT_API_ENABLE_BANK_CONFIG_API`). Where it is disabled, create the bank and configure it on the Hindsight side beforehand; ContextWitness then delivers without changing its settings.
+**When the mission is replaced.** Each time it starts, before its first delivery, ContextWitness reads the bank's `observations_mission`. If that is exactly the text ContextWitness last wrote there, or the text version 1.0.0 wrote, it replaces it with the current version's; no other setting is sent. Any other text, one you wrote or one another program set, is left as it is. Either way the log says so. To bring a mission of your own up to date by hand, the current text is `OBSERVATIONS_MISSION` in [`crates/cw-sink-hindsight/src/lib.rs`](crates/cw-sink-hindsight/src/lib.rs).
+
+**When the bank config API is disabled.** Creating the bank requires Hindsight's bank config API (`HINDSIGHT_API_ENABLE_BANK_CONFIG_API`). Where it is disabled, create the bank and configure it on the Hindsight side beforehand; ContextWitness then delivers without changing its settings. It cannot replace the mission there either: when Hindsight refuses, the log says so, and the current text has to be put in by hand.
 
 **Concurrent creation.** If another program creates a bank with the same id just after ContextWitness found none, that bank also receives the three settings above, once. This is why the bank id should be ContextWitness's own.
-
-**A bank created before audio recording.** A bank created by a version without audio recording has an `observations_mission` that describes screen text only, and ContextWitness does not change it. Audio episodes are delivered to such a bank as to any other, each with the [audio context label](#audio-context-label). If you want the bank's mission to describe both kinds of text, change `observations_mission` on the Hindsight side; the text a new bank gets is `OBSERVATIONS_MISSION` in [`crates/cw-sink-hindsight/src/lib.rs`](crates/cw-sink-hindsight/src/lib.rs).
 
 **What `store_document_text=false` means.** It keeps Hindsight from storing the same text twice. In `chunks` mode an episode's text is split into chunks and each chunk is stored as a memory as it is, so the whole text stays in Hindsight. Hindsight can also keep a separate copy of the original text, but that copy would only duplicate the memories, so it is turned off. In exchange, the Hindsight features that read that copy are unavailable: document and chunk text retrieval, Reflect's expand, and re-processing from the stored source text. The text also remains in ContextWitness's local database.
 

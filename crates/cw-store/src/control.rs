@@ -348,6 +348,34 @@ pub fn events_in_window(
     Ok(events)
 }
 
+const BANK_MISSION: &str = "bank_mission";
+
+/// The `observations_mission` this installation last knew its bank to hold as ContextWitness's
+/// own, if it has known one.
+pub fn bank_mission(conn: &rusqlite::Connection) -> Result<Option<String>, StoreError> {
+    let mut statement = conn
+        .prepare(SELECT_STATE)
+        .map_err(|source| StoreError::Sql { source })?;
+    let mut rows = statement
+        .query([BANK_MISSION])
+        .map_err(|source| StoreError::Sql { source })?;
+    let Some(row) = rows.next().map_err(|source| StoreError::Sql { source })? else {
+        return Ok(None);
+    };
+
+    row.get(0)
+        .map(Some)
+        .map_err(|source| StoreError::Sql { source })
+}
+
+/// Record what [`bank_mission`] answers.
+pub fn set_bank_mission(conn: &rusqlite::Connection, mission: &str) -> Result<(), StoreError> {
+    conn.execute(UPSERT_STATE, rusqlite::params![BANK_MISSION, mission])
+        .map_err(|source| StoreError::Sql { source })?;
+
+    Ok(())
+}
+
 /// The stretches of `[start, end)` over which a pause was in force, as `Paused` spans: each runs
 /// from the request that began it to the resume or the deadline that ended it.
 pub fn pauses(
@@ -930,6 +958,19 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn the_bank_mission_is_absent_until_written_and_then_the_last_one_written() {
+        let (_dir, conn) = database();
+        assert_eq!(super::bank_mission(&conn).expect("the mark reads"), None);
+        super::set_bank_mission(&conn, "first").expect("the mark stores");
+        super::set_bank_mission(&conn, "second").expect("the mark stores again");
+        assert_eq!(
+            super::bank_mission(&conn).expect("the mark reads"),
+            Some("second".to_owned())
+        );
+        assert!(matches!(get_pause(&conn), Ok(None)));
     }
 
     fn paused_between(

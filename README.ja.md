@@ -259,10 +259,10 @@ ContextWitness は画面を記録し、音声の記録を有効にしていれ�
 エピソードは `hindsight.bank_id` のバンク(既定は `contextwitness`)へ配送されます。
 
 - **バンクが無ければ自動で作ります。** ContextWitness が送るテキスト(画面の OCR テキストと、話し声を起こしたテキスト)に合わせた初期設定も一緒に入れます。これには Hindsight の bank config API(`HINDSIGHT_API_ENABLE_BANK_CONFIG_API`)が有効になっている必要があります。
-- **すでにあるバンクの設定は変更しません。** Hindsight 側で変えた設定はそのまま残ります。音声の記録に対応していない版が作ったバンクも同じです。そのバンクで音声の記録を有効にする場合は、[音声の記録に対応する前に作られたバンク](#バンク初期化の詳細)を参照してください。
+- **すでにあるバンクの設定は、1 つを除いて変更しません。** Hindsight 側で変えた設定はそのまま残ります。例外は、ContextWitness 自身が書いた `observations_mission` です。新しい版でエピソードの形が変わると、その版の文面に置き換えます。自分で書いた mission は変更されません。
 - **バンク ID は ContextWitness 専用にしてください。** 別のプログラムが同じ ID のバンクを同時に作ると、そのプログラムが作ったバンクに ContextWitness の初期設定が書き込まれることがあります。
 
-初期設定の中身と、bank config API が無効な場合の手順は[バンク初期化の詳細](#バンク初期化の詳細)にあります。
+初期設定の中身、mission が置き換わる条件、bank config API が無効な場合の手順は、[バンク初期化の詳細](#バンク初期化の詳細)にあります。
 
 ### context ラベル
 
@@ -343,17 +343,17 @@ cargo install --path crates/cw-daemon
 
 Hindsight の設定を自分で管理する人向けの説明です。
 
-ContextWitness は、Hindsight のバンク一覧で `hindsight.bank_id` を探します。一覧で存在を確認できたバンクの設定は変更しません。見つからなければ、bank config への PATCH 1 回でバンクを作成し、次の 3 項目だけを設定します。他の設定は Hindsight サーバー側の設定を引き継ぎます。
+ContextWitness は、Hindsight のバンク一覧で `hindsight.bank_id` を探します。一覧で存在を確認できたバンクの設定は変更しません(ContextWitness が以前書いた mission だけは別です。下の説明を参照してください)。見つからなければ、bank config への PATCH 1 回でバンクを作成し、次の 3 項目だけを設定します。他の設定は Hindsight サーバー側の設定を引き継ぎます。
 
 - `retain_extraction_mode="chunks"` — エピソードを LLM 抽出ではなく原文チャンクとして保存
 - `store_document_text=false` — 同じテキストを Hindsight に二重に保存しない
 - `observations_mission` — 元のテキストが何であるか(画面の OCR と、アプリが再生した話し声を起こしたテキスト)を Hindsight に伝える説明文
 
-**bank config API が無効なとき。** バンクの自動作成には Hindsight の bank config API(`HINDSIGHT_API_ENABLE_BANK_CONFIG_API`)が必要です。無効な場合は、Hindsight 側であらかじめバンクを作成し、設定を済ませておいてください。ContextWitness はそのバンクの設定を変更せずに配送します。
+**mission が置き換わるとき。** ContextWitness は、起動するたびに、最初の配送の前にバンクの `observations_mission` を読みます。それが、ContextWitness が最後にそのバンクへ書いた文面か、バージョン 1.0.0 が書いた文面と完全に同じなら、今の版の文面に置き換えます。ほかの設定は送りません。それ以外の文面(自分で書いたものや、別のプログラムが設定したもの)はそのまま残します。どちらの場合も、ログにその旨を書きます。自分で書いた mission を今の版に合わせて直すときは、[`crates/cw-sink-hindsight/src/lib.rs`](crates/cw-sink-hindsight/src/lib.rs) の `OBSERVATIONS_MISSION` が今の版の文面です。
+
+**bank config API が無効なとき。** バンクの自動作成には Hindsight の bank config API(`HINDSIGHT_API_ENABLE_BANK_CONFIG_API`)が必要です。無効な場合は、Hindsight 側であらかじめバンクを作成し、設定を済ませておいてください。ContextWitness はそのバンクの設定を変更せずに配送します。この場合は mission の置き換えもできません。Hindsight に断られるとログにその旨を書くので、今の版の文面を手で入れてください。
 
 **同時作成。** ContextWitness がバンクの不在を確認した直後に、別のプログラムが同じ ID のバンクを作ると、そのバンクにも上の 3 項目が 1 回書き込まれます。バンク ID を専用にするのはこのためです。
-
-**音声の記録に対応する前に作られたバンク。** 音声の記録に対応していない版が作ったバンクの `observations_mission` は、画面のテキストだけを説明しています。ContextWitness はこれを変更しません。音声エピソードは、ほかのバンクと同じようにこのバンクへ配送され、[音声用の context ラベル](#音声用の-context-ラベル)も添えられます。mission に両方のテキストの説明を入れたい場合は、Hindsight 側で `observations_mission` を変更してください。新しく作るバンクに入る文面は、[`crates/cw-sink-hindsight/src/lib.rs`](crates/cw-sink-hindsight/src/lib.rs) の `OBSERVATIONS_MISSION` です。
 
 **`store_document_text=false` の意味。** 同じテキストを Hindsight に二重に保存しないための設定です。`chunks` モードでは、エピソードの原文はチャンクに分割され、そのまま記憶として保存されるので、全文が Hindsight に残ります。Hindsight はそれとは別に原文の写しも保存できますが、中身が記憶と重複するため、保存しない設定にしています。その代わり、この写しを読む Hindsight の機能(文書・チャンク本文の取得、Reflect の expand、保存した原文からの再処理)は使えません。原文は ContextWitness のローカルデータベースにも残ります。
 

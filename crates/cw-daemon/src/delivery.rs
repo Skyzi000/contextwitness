@@ -1,6 +1,7 @@
 use chrono::TimeDelta;
 use cw_sink_hindsight::{
-    Credentials, DeliveryError, HindsightClient, RetainItem, RetainOutcome, display_api_url,
+    BankMission, Credentials, DeliveryError, HindsightClient, RetainItem, RetainOutcome,
+    display_api_url,
 };
 use cw_store::control::HealthKey;
 use cw_store::outbox::{self, Retry};
@@ -76,13 +77,104 @@ fn stuck_warn(
     }
 }
 
-/// Whether the bank has been made ready, and when it may be asked again if it has not. Owned by
-/// [`run`], so what one pass learned outlives it.
+/// Whether the bank has been made ready, whether its mission still has to be looked at, and when
+/// it may be asked again. Owned by [`run`], so what one pass learned outlives it.
 #[derive(Default)]
 struct BankGate {
     ready: bool,
+    settled: bool,
     attempts: u32,
     not_before: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl BankGate {
+    fn due(&self, now: chrono::DateTime<chrono::Utc>) -> bool {
+        !self.settled && self.not_before.is_none_or(|at| at <= now)
+    }
+
+    /// `keep` stores this version's mission as the one written to the bank. While that fails the
+    /// bank is asked again, so a replaced mission is never left without its local copy.
+    fn learn(
+        &mut self,
+        bank_id: &str,
+        outcome: Result<BankMission, DeliveryError>,
+        now: chrono::DateTime<chrono::Utc>,
+        keep: impl FnOnce() -> Result<(), cw_store::StoreError>,
+    ) -> Result<(), cw_store::StoreError> {
+        let holds_this_versions = match outcome {
+            Err(error) => {
+                self.wait(bank_id, &error, now);
+                return Ok(());
+            }
+            Ok(BankMission::Unchecked(error)) => {
+                self.ready = true;
+                self.wait(bank_id, &error, now);
+                return Ok(());
+            }
+            Ok(BankMission::Created) => {
+                info!(bank = %bank_id, "created the hindsight bank");
+                true
+            }
+            Ok(BankMission::Replaced) => {
+                info!(
+                    bank = %bank_id,
+                    "replaced the observations mission an earlier version wrote into the \
+                     hindsight bank"
+                );
+                true
+            }
+            Ok(BankMission::Current) => true,
+            Ok(BankMission::Other) => {
+                info!(
+                    bank = %bank_id,
+                    "the hindsight bank's observations mission is not one ContextWitness wrote, so \
+                     it is left as it is"
+                );
+                false
+            }
+            Ok(BankMission::Refused(error)) => {
+                warn!(
+                    bank = %bank_id,
+                    "the hindsight server refused to show or to take the bank's observations \
+                     mission, so it is left as it is: {error}"
+                );
+                false
+            }
+        };
+        if holds_this_versions {
+            keep()?;
+        }
+        self.ready = true;
+        self.settled = true;
+        Ok(())
+    }
+
+    fn wait(&mut self, bank_id: &str, error: &DeliveryError, now: chrono::DateTime<chrono::Utc>) {
+        self.attempts += 1;
+        // A permanent error backs off like a retryable one instead of ending the worker: the
+        // bank is configuration state, repairable while the daemon runs.
+        let delay = error
+            .retry_after()
+            .and_then(|after| TimeDelta::from_std(after).ok())
+            .unwrap_or_else(|| outbox::backoff_delay(self.attempts));
+        self.not_before = now.checked_add_signed(delay);
+        let retry_in_seconds = delay.num_seconds();
+        if self.ready {
+            warn!(
+                bank = %bank_id,
+                attempts = self.attempts,
+                retry_in_seconds,
+                "the hindsight bank's observations mission could not be checked: {error}"
+            );
+        } else {
+            warn!(
+                bank = %bank_id,
+                attempts = self.attempts,
+                retry_in_seconds,
+                "hindsight bank is not ready: {error}"
+            );
+        }
+    }
 }
 
 /// What this worker has watched the server hold in flight. Owned by [`run`]; the delivery clock
@@ -293,29 +385,16 @@ fn deliver_batch(
     if due.is_empty() {
         return Ok(Pass::Progressed(0));
     }
+    if bank.due(chrono::Utc::now()) {
+        let bank_id = &config.hindsight.bank_id;
+        let written_before = cw_store::control::bank_mission(conn)?;
+        let outcome = client.ensure_bank(bank_id, written_before.as_deref());
+        bank.learn(bank_id, outcome, chrono::Utc::now(), || {
+            cw_store::control::set_bank_mission(conn, cw_sink_hindsight::OBSERVATIONS_MISSION)
+        })?;
+    }
     if !bank.ready {
-        if bank.not_before.is_some_and(|at| chrono::Utc::now() < at) {
-            return Ok(Pass::Progressed(0));
-        }
-        if let Err(error) = client.ensure_bank(&config.hindsight.bank_id) {
-            let now = chrono::Utc::now();
-            bank.attempts += 1;
-            // A permanent error backs off like a retryable one instead of ending the worker: the
-            // bank is configuration state, repairable while the daemon runs.
-            let delay = error
-                .retry_after()
-                .and_then(|after| TimeDelta::from_std(after).ok())
-                .unwrap_or_else(|| outbox::backoff_delay(bank.attempts));
-            bank.not_before = now.checked_add_signed(delay);
-            warn!(
-                bank = %config.hindsight.bank_id,
-                attempts = bank.attempts,
-                retry_in_seconds = delay.num_seconds(),
-                "hindsight bank is not ready: {error}"
-            );
-            return Ok(Pass::Progressed(0));
-        }
-        bank.ready = true;
+        return Ok(Pass::Progressed(0));
     }
 
     let mut progressed = 0;
@@ -464,7 +543,11 @@ fn context_label<'a>(hindsight: &'a cw_core::config::HindsightConfig, source: &s
 #[cfg(test)]
 mod tests {
     use chrono::TimeDelta;
+    use cw_sink_hindsight::{BankMission, DeliveryError};
     use cw_store::StoreError;
+    use cw_store::outbox;
+
+    use super::BankGate;
 
     #[test]
     fn an_episode_is_sent_under_the_label_of_its_source() {
@@ -567,6 +650,76 @@ mod tests {
             Some(StuckWarn::Wedged),
             "a gap past the period plus the window is no longer the pipeline's own cadence"
         );
+    }
+
+    fn unavailable() -> DeliveryError {
+        DeliveryError::Retryable {
+            message: "HTTP 503".to_owned(),
+            retry_after: None,
+        }
+    }
+
+    #[test]
+    fn a_mission_check_that_failed_for_now_is_made_again_later_while_delivery_goes_on() {
+        let now = chrono::Utc::now();
+        let wait = outbox::backoff_delay(1);
+        let kept = std::cell::Cell::new(0);
+        let keep = || {
+            kept.set(kept.get() + 1);
+            Ok(())
+        };
+
+        let mut bank = BankGate::default();
+        assert!(bank.due(now));
+        bank.learn("bank", Err(unavailable()), now, keep).unwrap();
+        assert!(
+            !bank.ready,
+            "a bank that could not be asked about takes nothing"
+        );
+
+        let now = now + wait;
+        bank.learn("bank", Ok(BankMission::Unchecked(unavailable())), now, keep)
+            .unwrap();
+        assert!(bank.ready);
+        assert!(!bank.due(now), "the check is not repeated at once");
+        assert_eq!(kept.get(), 0);
+
+        let now = now + outbox::backoff_delay(2);
+        assert!(bank.due(now));
+        bank.learn("bank", Ok(BankMission::Replaced), now, keep)
+            .unwrap();
+        assert_eq!(kept.get(), 1);
+        assert!(!bank.due(now + TimeDelta::days(1)));
+    }
+
+    #[test]
+    fn a_mission_check_the_server_refuses_or_that_finds_another_text_is_not_made_again() {
+        let now = chrono::Utc::now();
+        let refused = BankMission::Refused(DeliveryError::Retryable {
+            message: "HTTP 404".to_owned(),
+            retry_after: None,
+        });
+        for found in [refused, BankMission::Other] {
+            let mut bank = BankGate::default();
+            bank.learn("bank", Ok(found), now, || panic!("nothing was written"))
+                .unwrap();
+            assert!(bank.ready);
+            assert!(!bank.due(now + TimeDelta::days(1)));
+        }
+    }
+
+    #[test]
+    fn a_local_copy_that_could_not_be_stored_has_the_bank_asked_again() {
+        let now = chrono::Utc::now();
+        let mut bank = BankGate::default();
+        let failed = bank.learn("bank", Ok(BankMission::Replaced), now, || {
+            Err(StoreError::Sql {
+                source: rusqlite::Error::InvalidQuery,
+            })
+        });
+        assert!(failed.is_err());
+        assert!(!bank.ready);
+        assert!(bank.due(now));
     }
 
     #[test]
