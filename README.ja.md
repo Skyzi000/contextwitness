@@ -66,7 +66,7 @@ contextwitness run
 | `status` | 現在の動作状況を 1 画面で表示する。 |
 | `pause [30m\|2h\|...]` | 画面と音声の記録を一時停止する。時間を指定しなければ `resume` するまで。 |
 | `resume` | 記録を再開する。 |
-| `defaults` | 全設定の既定値と意味を表示する。 |
+| `defaults` | 全設定の既定値と意味、Hindsight バンクに設定する mission を表示する。 |
 | `autostart enable\|disable` | ログオン時の自動起動。 |
 | `capture-once` | 動作確認用に画面を 1 回だけキャプチャする。一時停止中でも実行される。 |
 
@@ -349,9 +349,9 @@ ContextWitness は、Hindsight のバンク一覧で `hindsight.bank_id` を探�
 - `store_document_text=false` — 同じテキストを Hindsight に二重に保存しない
 - `observations_mission` — 元のテキストが何であるか(画面の OCR と、アプリが再生した話し声を起こしたテキスト)を Hindsight に伝える説明文
 
-**mission が置き換わるとき。** ContextWitness は、起動するたびに、最初の配送の前にバンクの `observations_mission` を読みます。それが、ContextWitness が最後にそのバンクへ書いた文面か、バージョン 1.0.0 が書いた文面と完全に同じなら、今の版の文面に置き換えます。ほかの設定は送りません。それ以外の文面(自分で書いたものや、別のプログラムが設定したもの)はそのまま残します。どちらの場合も、ログにその旨を書きます。自分で書いた mission を今の版に合わせて直すときは、[`crates/cw-sink-hindsight/src/lib.rs`](crates/cw-sink-hindsight/src/lib.rs) の `OBSERVATIONS_MISSION` が今の版の文面です。
+**mission が置き換わるとき。** ContextWitness は、起動するたびに、最初の配送の前にバンクの `observations_mission` を読みます。それが、ContextWitness が最後にそのバンクへ書いた文面か、バージョン 1.0.0 が書いた文面と完全に同じなら、今の版の文面に置き換えます。ほかの設定は送りません。それ以外の文面(自分で書いたものや、別のプログラムが設定したもの)はそのまま残します。どちらの場合も、ログにその旨を書きます。自分で書いた mission を今の版に合わせて直すときは、`contextwitness defaults` の出力の末尾に今の版の文面があります。
 
-**bank config API が無効なとき。** バンクの自動作成には Hindsight の bank config API(`HINDSIGHT_API_ENABLE_BANK_CONFIG_API`)が必要です。無効な場合は、Hindsight 側であらかじめバンクを作成し、設定を済ませておいてください。ContextWitness はそのバンクの設定を変更せずに配送します。この場合は mission の置き換えもできません。Hindsight に断られるとログにその旨を書くので、今の版の文面を手で入れてください。
+**bank config API が無効なとき。** バンクの自動作成には Hindsight の bank config API(`HINDSIGHT_API_ENABLE_BANK_CONFIG_API`)が必要です。無効な場合は、Hindsight 側であらかじめバンクを作成し、設定を済ませておいてください。ContextWitness はそのバンクの設定を変更せずに配送します。この場合は mission の置き換えもできません。Hindsight に断られるとログにその旨を書くので、今の版の文面(`contextwitness defaults` が表示します)を手で入れてください。
 
 **同時作成。** ContextWitness がバンクの不在を確認した直後に、別のプログラムが同じ ID のバンクを作ると、そのバンクにも上の 3 項目が 1 回書き込まれます。バンク ID を専用にするのはこのためです。
 

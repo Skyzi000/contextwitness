@@ -65,7 +65,8 @@ enum Command {
     Resume,
     /// Ask for the Hindsight credentials and the data directory, and write them.
     Setup,
-    /// Print every setting with its built-in default.
+    /// Print every setting with its built-in default, and the mission given to the Hindsight
+    /// bank.
     Defaults,
     /// Start at logon, or stop doing so.
     Autostart {
@@ -543,9 +544,18 @@ fn setup() -> Result<(), Failure> {
 }
 
 fn defaults() -> Result<(), Failure> {
-    print!("{DEFAULT_CONFIG_TOML}");
+    print!("{}", defaults_listing());
 
     Ok(())
+}
+
+/// The mission is not a setting, so it is listed as a comment and the whole stays valid TOML.
+fn defaults_listing() -> String {
+    format!(
+        "{DEFAULT_CONFIG_TOML}\n# Not a setting: the observations mission ContextWitness gives the \
+         Hindsight bank.\n# {}\n",
+        cw_sink_hindsight::OBSERVATIONS_MISSION
+    )
 }
 
 fn setup_credentials() -> Result<(), Failure> {
@@ -839,6 +849,18 @@ mod tests {
     use crate::capture::{SaveFailure, Stored};
     use cw_core::config::INITIAL_CONFIG_TOML;
     use cw_store::outbox::NewestError;
+
+    #[test]
+    fn the_defaults_listing_ends_with_the_bank_mission_and_still_reads_as_the_settings() {
+        let listing = super::defaults_listing();
+        let mission = cw_sink_hindsight::OBSERVATIONS_MISSION;
+
+        assert!(listing.ends_with(&format!("# {mission}\n")));
+        assert_eq!(
+            cw_core::config::Config::from_toml_str(&listing).expect("the listing parses"),
+            cw_core::config::Config::default()
+        );
+    }
 
     #[test]
     fn a_mutex_name_is_claimed_once() {

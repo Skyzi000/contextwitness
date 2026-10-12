@@ -66,7 +66,7 @@ To record the speech your applications play as well, see [Turning on audio recor
 | `status` | One-screen summary of what this installation is doing. |
 | `pause [30m\|2h\|...]` | Stops recording, screen and audio; no duration means until `resume`. |
 | `resume` | Starts recording again. |
-| `defaults` | Prints every setting with its built-in default and meaning. |
+| `defaults` | Prints every setting with its built-in default and meaning, and the mission given to the Hindsight bank. |
 | `autostart enable\|disable` | Start at logon. |
 | `capture-once` | One manual screen capture pass, for checking the pipeline; it ignores `pause`. |
 
@@ -351,9 +351,9 @@ ContextWitness looks for `hindsight.bank_id` in Hindsight's bank list. For a ban
 - `store_document_text=false` — the same text is not stored in Hindsight twice
 - `observations_mission` — tells Hindsight what the text is: OCR of the screen, and transcripts of speech that applications played
 
-**When the mission is replaced.** Each time it starts, before its first delivery, ContextWitness reads the bank's `observations_mission`. If that is exactly the text ContextWitness last wrote there, or the text version 1.0.0 wrote, it replaces it with the current version's; no other setting is sent. Any other text, one you wrote or one another program set, is left as it is. Either way the log says so. To bring a mission of your own up to date by hand, the current text is `OBSERVATIONS_MISSION` in [`crates/cw-sink-hindsight/src/lib.rs`](crates/cw-sink-hindsight/src/lib.rs).
+**When the mission is replaced.** Each time it starts, before its first delivery, ContextWitness reads the bank's `observations_mission`. If that is exactly the text ContextWitness last wrote there, or the text version 1.0.0 wrote, it replaces it with the current version's; no other setting is sent. Any other text, one you wrote or one another program set, is left as it is. Either way the log says so. To bring a mission of your own up to date by hand, `contextwitness defaults` prints the current text at its end.
 
-**When the bank config API is disabled.** Creating the bank requires Hindsight's bank config API (`HINDSIGHT_API_ENABLE_BANK_CONFIG_API`). Where it is disabled, create the bank and configure it on the Hindsight side beforehand; ContextWitness then delivers without changing its settings. It cannot replace the mission there either: when Hindsight refuses, the log says so, and the current text has to be put in by hand.
+**When the bank config API is disabled.** Creating the bank requires Hindsight's bank config API (`HINDSIGHT_API_ENABLE_BANK_CONFIG_API`). Where it is disabled, create the bank and configure it on the Hindsight side beforehand; ContextWitness then delivers without changing its settings. It cannot replace the mission there either: when Hindsight refuses, the log says so, and the current text, which `contextwitness defaults` prints, has to be put in by hand.
 
 **Concurrent creation.** If another program creates a bank with the same id just after ContextWitness found none, that bank also receives the three settings above, once. This is why the bank id should be ContextWitness's own.
 
