@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -118,6 +118,8 @@ impl Host for Listener {
     fn settled(&mut self, through: DateTime<Utc>) {
         self.settled = Some(through);
     }
+
+    fn skipped(&mut self, _: &BTreeSet<String>, _: DateTime<Utc>) {}
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

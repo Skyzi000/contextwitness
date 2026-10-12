@@ -144,6 +144,9 @@ An audio episode with made-up content:
   01:00:21 Figure one shows the release flow.
   01:00:34 [transcription failed: HTTP 503 Service Unavailable]
 
+2026-07-25T01:00:45+09:00 - 2026-07-25T01:01:20+09:00
+  [audio capture skipped by the process blacklist: vault.exe]
+
 2026-07-25T01:02:21+09:00 - 2026-07-25T01:05:00+09:00
   [audio capture pause requested for this period]
 ```
@@ -151,6 +154,7 @@ An audio episode with made-up content:
 - **An entry gathers utterances of one application.** Its header gives the time range of those utterances and the executable the audio was captured from. When that application is itself playing sound, speech from programs it started is recorded under its name too. Entries of different applications can overlap in time, as the two above do.
 - **A line is one utterance**, beginning with the local time it started.
 - **A bracketed line** stands for an utterance that could not be transcribed, with the reason — here, the status a transcription API answered with.
+- **`[audio capture skipped by the process blacklist: …]`** marks a stretch over which audio was not recorded because of a program on the blacklist, which it names.
 - **`[audio capture pause requested for this period]`** marks a stretch over which a pause was in force, from when it was asked for until it was lifted or ran out. Recording stops about a second after it is asked to, so an utterance from the start of the stretch can still appear.
 
 ## Privacy
@@ -174,7 +178,7 @@ Turning audio recording on adds the following:
   - a program it started, directly or through other programs;
   - an application it is running under, for as long as it runs there.
 
-  While a blacklist is set, a program whose name cannot be read is not recorded either. Audio episodes carry no note of what was skipped.
+  While a blacklist is set, a program whose name cannot be read is not recorded either. The stretches that were skipped are noted in the audio episode, with the name of the listed program.
 - **What the blacklist does not catch.**
   - The moment after a listed program starts under an application that is already being recorded: up to about a second of audio can still be transcribed.
   - A program that a listed program started, once the listed program itself has exited: it is recorded like any other.

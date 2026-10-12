@@ -152,7 +152,7 @@ pub fn close_due_audio(
             window_minutes,
             now,
             cw_core::episode::build_audio_episode,
-            cw_store::control::pauses,
+            pauses_and_skips,
         ) {
             Ok(new) => registered += usize::from(new),
             Err(error) => {
@@ -170,6 +170,18 @@ pub fn close_due_audio(
     }
 
     failed.map_or(Ok(registered), Err)
+}
+
+fn pauses_and_skips(
+    conn: &rusqlite::Connection,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+) -> Result<Vec<cw_core::model::StateSpan>, cw_store::StoreError> {
+    let mut spans = cw_store::control::pauses(conn, start, end)?;
+    spans.extend(cw_store::audio_skips::overlapping(conn, start, end)?);
+    spans.sort_by_key(|span| span.start_at);
+
+    Ok(spans)
 }
 
 type Build = fn(
@@ -465,6 +477,54 @@ mod tests {
                     false
                 ),
                 (at("2026-07-24T16:02:18Z"), at("2026-07-24T16:03:00Z"), true),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_blacklist_skip_and_a_pause_both_render_beside_the_utterance_of_their_window() {
+        let (_dir, mut conn) = database();
+        begin(&conn, 5, "2026-07-24T16:00:30Z");
+        hear(&conn, "2026-07-24T16:01:00Z");
+        let skip =
+            cw_store::audio_skips::begin(&conn, Some("vault.exe"), at("2026-07-24T16:01:10Z"))
+                .expect("the skip should be stored");
+        cw_store::audio_skips::extend(&conn, skip, at("2026-07-24T16:01:50Z"))
+            .expect("the skip should extend");
+        pause(&mut conn, "2026-07-24T16:02:10Z");
+        resume(&mut conn, "2026-07-24T16:03:00Z");
+        cw_store::audio_skips::begin(&conn, Some("vault.exe"), at("2026-07-24T16:05:00Z"))
+            .expect("the skip of the next window should be stored");
+
+        assert_eq!(close_audio(&mut conn, 5, "2026-07-24T16:20:00Z", false), 1);
+        let content: String = conn
+            .query_one("SELECT content FROM episodes", [], |row| row.get(0))
+            .expect("the registered episode should be readable");
+        let stretches: Vec<_> = content
+            .split("\n\n")
+            .skip(1)
+            .map(|block| {
+                let mut words = block.split_whitespace();
+                let from = at(words.next().expect("a block starts with a time"));
+                let to = at(words.nth(1).expect("a block names its end"));
+                let note = block.lines().nth(1).map(str::trim_start);
+                (from, to, note.filter(|note| note.starts_with('[')))
+            })
+            .collect();
+        assert_eq!(
+            stretches,
+            [
+                (at("2026-07-24T16:01:00Z"), at("2026-07-24T16:01:01Z"), None),
+                (
+                    at("2026-07-24T16:01:10Z"),
+                    at("2026-07-24T16:01:50Z"),
+                    Some("[audio capture skipped by the process blacklist: vault.exe]")
+                ),
+                (
+                    at("2026-07-24T16:02:10Z"),
+                    at("2026-07-24T16:03:00Z"),
+                    Some("[audio capture pause requested for this period]")
+                ),
             ]
         );
     }

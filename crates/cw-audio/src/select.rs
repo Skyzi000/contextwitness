@@ -28,6 +28,7 @@ pub(crate) type Table = HashMap<u32, Process>;
 pub(crate) struct Selection {
     pub keep: BTreeSet<Target>,
     pub discard: BTreeSet<Target>,
+    pub skipped: BTreeSet<String>,
 }
 
 pub(crate) fn select(
@@ -47,13 +48,14 @@ pub(crate) fn select(
     let discard = open
         .iter()
         .map(|(target, _)| *target)
-        .filter(|target| tree.blocked(target.pid))
+        .filter(|target| tree.blocker(target.pid).is_some())
         .collect();
 
     let lingering = open
         .iter()
         .filter(|(target, idle)| *idle <= GRACE && alive(target))
         .map(|(target, _)| target.pid);
+    let mut skipped = BTreeSet::new();
     let mut playing: Vec<Target> = active
         .iter()
         .copied()
@@ -63,12 +65,17 @@ pub(crate) fn select(
         .filter(|pid| *pid != 0 && *pid != own_pid)
         .filter_map(|pid| {
             let process = table.get(&pid)?;
-            (!process.exe.eq_ignore_ascii_case("audiodg.exe") && !tree.blocked(pid)).then_some(
-                Target {
-                    pid,
-                    created: process.created,
-                },
-            )
+            if process.exe.eq_ignore_ascii_case("audiodg.exe") {
+                return None;
+            }
+            if let Some(blocker) = tree.blocker(pid) {
+                skipped.insert(blocker.to_owned());
+                return None;
+            }
+            Some(Target {
+                pid,
+                created: process.created,
+            })
         })
         .collect();
 
@@ -85,7 +92,11 @@ pub(crate) fn select(
         }
     }
 
-    Selection { keep, discard }
+    Selection {
+        keep,
+        discard,
+        skipped,
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -128,6 +139,7 @@ pub(crate) struct Seen {
 pub(crate) struct Verdict {
     pub endings: Vec<(Target, Ending)>,
     pub openings: Vec<Target>,
+    pub skipped: BTreeSet<String>,
 }
 
 pub(crate) fn judge(
@@ -183,7 +195,11 @@ pub(crate) fn judge(
         .filter(|target| !streams.iter().any(|seen| seen.target == **target))
         .copied()
         .collect();
-    Verdict { endings, openings }
+    Verdict {
+        endings,
+        openings,
+        skipped: selection.skipped,
+    }
 }
 
 struct Tree<'a> {
@@ -216,38 +232,40 @@ impl<'a> Tree<'a> {
             .then_some(process.parent)
     }
 
-    fn listed(&self, pid: u32) -> bool {
-        self.table.get(&pid).is_some_and(|process| {
-            process.exe.is_empty() || is_blacklisted(&process.exe, self.blacklist)
-        })
+    fn listed(&self, pid: u32) -> Option<&'a str> {
+        let exe = self.table.get(&pid)?.exe.as_str();
+        (exe.is_empty() || is_blacklisted(exe, self.blacklist)).then_some(exe)
     }
 
-    fn blocked(&self, pid: u32) -> bool {
+    fn blocker(&self, pid: u32) -> Option<&'a str> {
         if self.blacklist.is_empty() {
-            return false;
+            return None;
         }
         let mut seen = HashSet::new();
         let mut lineage = Some(pid);
         while let Some(current) = lineage.filter(|current| seen.insert(*current)) {
-            if self.listed(current) {
-                return true;
+            if let Some(exe) = self.listed(current) {
+                return Some(exe);
             }
             lineage = self.parent(current);
         }
 
         let mut seen = HashSet::from([pid]);
         let mut pending = vec![pid];
+        let mut smallest = None;
         while let Some(current) = pending.pop() {
             for child in self.children.get(&current).into_iter().flatten() {
                 if seen.insert(*child) {
-                    if self.listed(*child) {
-                        return true;
+                    if let Some(exe) = self.listed(*child)
+                        && smallest.is_none_or(|least| exe < least)
+                    {
+                        smallest = Some(exe);
                     }
                     pending.push(*child);
                 }
             }
         }
-        false
+        smallest
     }
 }
 
@@ -537,6 +555,137 @@ mod tests {
         );
     }
 
+    fn skipped(
+        table: &Table,
+        active: &[u32],
+        open: &[(Target, Duration)],
+        blacklist: &[&str],
+    ) -> BTreeSet<String> {
+        select(
+            table,
+            &active.iter().copied().collect(),
+            open,
+            OWN_PID,
+            &listed(blacklist),
+        )
+        .skipped
+    }
+
+    fn names(list: &[&str]) -> BTreeSet<String> {
+        list.iter().map(|name| (*name).to_owned()).collect()
+    }
+
+    #[test]
+    fn a_listed_program_that_is_playing_and_was_never_opened_is_reported_by_its_own_name() {
+        let table = table(&[(10, 1, 100, "vault.exe"), (20, 1, 100, "player.exe")]);
+        assert_eq!(
+            skipped(&table, &[10, 20], &[], &["vault.exe"]),
+            names(&["vault.exe"])
+        );
+    }
+
+    #[test]
+    fn a_playing_child_of_a_listed_program_is_reported_by_the_listed_parent_s_name() {
+        let table = table(&[
+            (10, 1, 100, "vault.exe"),
+            (11, 10, 110, "helper.exe"),
+            (12, 11, 120, "talk.exe"),
+        ]);
+        assert_eq!(
+            skipped(&table, &[12], &[], &["vault.exe"]),
+            names(&["vault.exe"])
+        );
+    }
+
+    #[test]
+    fn the_nearest_listed_process_on_the_lineage_is_the_one_reported() {
+        let table = table(&[
+            (10, 1, 100, "vault.exe"),
+            (11, 10, 110, "secret.exe"),
+            (12, 11, 120, "talk.exe"),
+            (13, 12, 130, "editor.exe"),
+        ]);
+        let blacklist = ["vault.exe", "secret.exe", "editor.exe"];
+        assert_eq!(
+            skipped(&table, &[12], &[], &blacklist),
+            names(&["secret.exe"]),
+            "the parent, not the grandparent above it or the child below"
+        );
+        assert_eq!(
+            skipped(&table, &[11], &[], &blacklist),
+            names(&["secret.exe"]),
+            "the process itself before any of them"
+        );
+    }
+
+    #[test]
+    fn a_playing_application_with_a_listed_process_underneath_it_is_reported_by_that_name() {
+        let table = table(&[
+            (10, 1, 100, "talk.exe"),
+            (11, 10, 110, "helper.exe"),
+            (12, 11, 120, "vault.exe"),
+        ]);
+        assert_eq!(
+            skipped(&table, &[10], &[], &["vault.exe"]),
+            names(&["vault.exe"])
+        );
+    }
+
+    #[test]
+    fn an_open_stream_that_became_blocked_is_reported_while_it_counts_as_playing() {
+        let table = table(&[(10, 1, 100, "talk.exe"), (11, 10, 110, "vault.exe")]);
+        let inside = [(target(10, 100), GRACE)];
+        assert_eq!(
+            skipped(&table, &[], &inside, &["vault.exe"]),
+            names(&["vault.exe"])
+        );
+        let past = [(target(10, 100), GRACE + Duration::from_millis(1))];
+        assert_eq!(skipped(&table, &[], &past, &["vault.exe"]), names(&[]));
+        assert_eq!(
+            skipped(&table, &[10], &past, &["vault.exe"]),
+            names(&["vault.exe"])
+        );
+    }
+
+    #[test]
+    fn an_unnamed_process_under_a_blacklist_is_reported_as_the_empty_name() {
+        let table = table(&[(10, 1, 100, ""), (11, 10, 110, "talk.exe")]);
+        assert_eq!(skipped(&table, &[11], &[], &["vault.exe"]), names(&[""]));
+        assert_eq!(skipped(&table, &[11], &[], &[]), names(&[]));
+    }
+
+    #[test]
+    fn a_listed_program_that_is_not_playing_reports_nothing() {
+        let table = table(&[
+            (10, 1, 100, "vault.exe"),
+            (20, 1, 100, "player.exe"),
+            (40, 1, 100, "audiodg.exe"),
+            (41, 40, 110, "vault.exe"),
+            (OWN_PID, 10, 110, "contextwitness.exe"),
+        ]);
+        assert_eq!(
+            skipped(&table, &[20, 40, OWN_PID, 77], &[], &["vault.exe"]),
+            names(&[]),
+            "neither audiodg nor this process is a candidate, so neither is a skip"
+        );
+        assert_eq!(skipped(&table, &[], &[], &["vault.exe"]), names(&[]));
+    }
+
+    #[test]
+    fn with_two_listed_descendants_the_reported_name_is_the_same_on_every_run() {
+        for _ in 0..64 {
+            let table = table(&[
+                (10, 1, 100, "talk.exe"),
+                (11, 10, 110, "vault.exe"),
+                (12, 10, 120, "secret.exe"),
+            ]);
+            assert_eq!(
+                skipped(&table, &[10], &[], &["vault.exe", "secret.exe"]),
+                names(&["secret.exe"])
+            );
+        }
+    }
+
     fn seen(pid: u32, created: u64, idle: Duration, recording: bool) -> Seen {
         Seen {
             target: target(pid, created),
@@ -675,6 +824,28 @@ mod tests {
             verdict.openings,
             [],
             "neither the unopened 30 nor the process that took over pid 40"
+        );
+    }
+
+    #[test]
+    fn the_verdict_names_what_kept_a_playing_process_from_being_recorded() {
+        let table = table(&[
+            (10, 1, 100, "talk.exe"),
+            (11, 10, 110, "secret.exe"),
+            (20, 1, 100, ""),
+            (30, 1, 100, "player.exe"),
+        ]);
+        let streams = [seen(10, 100, Duration::ZERO, true)];
+
+        let verdict = judged(&table, Some(&[10, 20, 30]), &streams);
+        assert_eq!(verdict.endings, [(target(10, 100), Ending::Blacklisted)]);
+        assert_eq!(verdict.openings, [target(30, 100)]);
+        assert_eq!(verdict.skipped, names(&["", "secret.exe"]));
+
+        assert_eq!(
+            judged(&table, Some(&[30]), &[]).skipped,
+            names(&[]),
+            "a listed process that plays nothing is not a skip"
         );
     }
 }

@@ -281,19 +281,28 @@ pub fn build_audio_episode(
     spans: &[crate::model::StateSpan],
 ) -> Option<Episode> {
     let (window_start, end_at) = window_bounds(window_start, window_minutes);
-    let pauses: Vec<_> = spans
+    let states: Vec<_> = spans
         .iter()
-        .filter(|span| {
-            span.status.state == crate::model::CaptureState::Paused
-                && span.start_at < end_at
-                && span.end_at >= window_start
-        })
-        .map(|span| {
-            (
+        .filter(|span| span.start_at < end_at && span.end_at >= window_start)
+        .filter_map(|span| {
+            let note = match (span.status.state, &span.status.process) {
+                (crate::model::CaptureState::Paused, _) => {
+                    "audio capture pause requested for this period".to_owned()
+                }
+                (crate::model::CaptureState::Excluded, Some(process)) => {
+                    format!("audio capture skipped by the process blacklist: {process}")
+                }
+                (crate::model::CaptureState::Excluded, None) => {
+                    "audio capture skipped by the process blacklist".to_owned()
+                }
+                _ => return None,
+            };
+            Some((
                 span.start_at.max(window_start),
                 span.end_at.min(end_at),
-                span.id,
-            )
+                span,
+                note,
+            ))
         })
         .collect();
     let mut utterances: Vec<_> = observations
@@ -325,7 +334,12 @@ pub fn build_audio_episode(
         std::collections::HashMap::new();
     for (observation, process, line) in utterances {
         let at = observation.observed_at;
-        let pauses_before = pauses.iter().filter(|(from, ..)| *from <= at).count();
+        let pauses_before = states
+            .iter()
+            .filter(|(from, _, span, _)| {
+                span.status.state == crate::model::CaptureState::Paused && *from <= at
+            })
+            .count();
         let end = observation
             .duration_ms
             .and_then(|ms| i64::try_from(ms).ok())
@@ -346,15 +360,11 @@ pub fn build_audio_episode(
     }
     let entry_count = entries.len();
 
-    let mut blocks: Vec<_> = pauses
+    let mut blocks: Vec<_> = states
         .into_iter()
-        .map(|(from, to, id)| {
-            let state = format!(
-                "{} - {}\n  [audio capture pause requested for this period]",
-                render(from),
-                render(to)
-            );
-            ((from, 0, id), vec![state])
+        .map(|(from, to, span, note)| {
+            let state = format!("{} - {}\n  [{note}]", render(from), render(to));
+            ((from, 0, span.id), vec![state])
         })
         .collect();
     for ((_, process), (first_at, first_id, end, lines)) in entries {
@@ -2743,12 +2753,20 @@ mod tests {
 
     #[test]
     fn audio_episode_content_renders_golden_text() {
-        let spans = [span(
-            1,
-            "2026-07-24T16:02:00Z",
-            "2026-07-24T16:09:00Z",
-            bare(CaptureState::Paused),
-        )];
+        let spans = [
+            span(
+                1,
+                "2026-07-24T16:02:00Z",
+                "2026-07-24T16:09:00Z",
+                bare(CaptureState::Paused),
+            ),
+            span(
+                2,
+                "2026-07-24T16:00:45Z",
+                "2026-07-24T16:01:20Z",
+                status(CaptureState::Excluded, Some("vault.exe"), None, None),
+            ),
+        ];
 
         let episode = audio_episode(&golden_utterances(), &spans)
             .expect("the golden utterances should build an episode");
@@ -2761,6 +2779,9 @@ mod tests {
 
 2026-07-25T01:00:21+09:00 - 2026-07-25T01:00:26+09:00 [player.exe]
   01:00:21 Figure one shows the release flow.
+
+2026-07-25T01:00:45+09:00 - 2026-07-25T01:01:20+09:00
+  [audio capture skipped by the process blacklist: vault.exe]
 
 2026-07-25T01:02:00+09:00 - 2026-07-25T01:05:00+09:00
   [audio capture pause requested for this period]"#;
@@ -2793,7 +2814,7 @@ mod tests {
     }
 
     #[test]
-    fn a_pause_splits_a_process_into_two_entries_and_no_other_state_renders() {
+    fn a_pause_splits_a_process_into_two_entries_and_no_state_but_a_pause_or_a_skip_renders() {
         let observations = [
             utterance(1, "2026-07-24T16:00:12Z", 2_000, "talk.exe", "before one"),
             utterance(2, "2026-07-24T16:00:30Z", 2_000, "player.exe", "between"),
@@ -2837,12 +2858,134 @@ mod tests {
                  01:00:12 before one\n  01:01:36 before two",
                 "2026-07-25T01:00:30+09:00 - 2026-07-25T01:00:32+09:00 [player.exe]\n  \
                  01:00:30 between",
+                "2026-07-25T01:00:40+09:00 - 2026-07-25T01:00:50+09:00\n  [audio capture skipped by the process blacklist: vault.exe]",
                 "2026-07-25T01:02:00+09:00 - 2026-07-25T01:03:00+09:00\n  [audio capture pause requested for this period]",
                 "2026-07-25T01:03:30+09:00 - 2026-07-25T01:03:32+09:00 [talk.exe]\n  \
                  01:03:30 after",
             ]
         );
         assert_eq!(episode.metadata.entry_count, "3");
+    }
+
+    #[test]
+    fn a_skip_names_the_listed_program_and_an_unnamed_one_renders_without_a_name() {
+        let observations = [utterance(
+            1,
+            "2026-07-24T16:01:00Z",
+            1_000,
+            "talk.exe",
+            "heard",
+        )];
+        let spans = [
+            span(
+                2,
+                "2026-07-24T16:03:10Z",
+                "2026-07-24T16:04:00Z",
+                status(CaptureState::Excluded, Some("vault.exe"), None, None),
+            ),
+            span(
+                1,
+                "2026-07-24T16:00:10Z",
+                "2026-07-24T16:00:20Z",
+                bare(CaptureState::Excluded),
+            ),
+        ];
+
+        let episode =
+            audio_episode(&observations, &spans).expect("the utterance should build an episode");
+
+        assert_eq!(
+            episode.content.split("\n\n").collect::<Vec<_>>()[1..],
+            [
+                "2026-07-25T01:00:10+09:00 - 2026-07-25T01:00:20+09:00\n  [audio capture skipped by the process blacklist]",
+                "2026-07-25T01:01:00+09:00 - 2026-07-25T01:01:01+09:00 [talk.exe]\n  \
+                 01:01:00 heard",
+                "2026-07-25T01:03:10+09:00 - 2026-07-25T01:04:00+09:00\n  [audio capture skipped by the process blacklist: vault.exe]",
+            ]
+        );
+        assert_eq!(episode.metadata.entry_count, "1");
+    }
+
+    #[test]
+    fn a_skip_does_not_split_the_entry_it_falls_inside() {
+        let observations = [
+            utterance(1, "2026-07-24T16:00:12Z", 2_000, "talk.exe", "before"),
+            utterance(2, "2026-07-24T16:02:30Z", 2_000, "talk.exe", "after"),
+        ];
+        let spans = [span(
+            1,
+            "2026-07-24T16:01:00Z",
+            "2026-07-24T16:02:00Z",
+            status(CaptureState::Excluded, Some("vault.exe"), None, None),
+        )];
+
+        let episode =
+            audio_episode(&observations, &spans).expect("the utterances should build an episode");
+
+        assert_eq!(
+            episode.content.split("\n\n").collect::<Vec<_>>()[1..],
+            [
+                "2026-07-25T01:00:12+09:00 - 2026-07-25T01:02:32+09:00 [talk.exe]\n  \
+                 01:00:12 before\n  01:02:30 after",
+                "2026-07-25T01:01:00+09:00 - 2026-07-25T01:02:00+09:00\n  [audio capture skipped by the process blacklist: vault.exe]",
+            ]
+        );
+        assert_eq!(episode.metadata.entry_count, "1");
+    }
+
+    #[test]
+    fn a_skip_is_clipped_to_the_window_and_one_seen_at_a_single_instant_keeps_both_ends() {
+        let observations = [utterance(
+            1,
+            "2026-07-24T16:01:00Z",
+            1_000,
+            "talk.exe",
+            "heard",
+        )];
+        let vault = || status(CaptureState::Excluded, Some("vault.exe"), None, None);
+        let spans = [
+            span(1, "2026-07-24T15:58:00Z", "2026-07-24T16:00:30Z", vault()),
+            span(2, "2026-07-24T16:02:00Z", "2026-07-24T16:02:00Z", vault()),
+            span(3, "2026-07-24T16:04:00Z", "2026-07-24T16:07:00Z", vault()),
+            span(4, "2026-07-24T15:50:00Z", "2026-07-24T15:59:59Z", vault()),
+            span(5, "2026-07-24T16:05:00Z", "2026-07-24T16:06:00Z", vault()),
+        ];
+
+        let episode =
+            audio_episode(&observations, &spans).expect("the utterance should build an episode");
+
+        assert_eq!(
+            episode
+                .content
+                .lines()
+                .filter(|line| line.starts_with("2026") && !line.ends_with(']'))
+                .collect::<Vec<_>>(),
+            [
+                "2026-07-25T01:00:00+09:00 - 2026-07-25T01:00:30+09:00",
+                "2026-07-25T01:02:00+09:00 - 2026-07-25T01:02:00+09:00",
+                "2026-07-25T01:04:00+09:00 - 2026-07-25T01:05:00+09:00",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_window_holding_only_a_skip_builds_no_audio_episode() {
+        let skipped = [span(
+            1,
+            "2026-07-24T16:01:00Z",
+            "2026-07-24T16:02:00Z",
+            status(CaptureState::Excluded, Some("vault.exe"), None, None),
+        )];
+        let silent = [utterance(
+            1,
+            "2026-07-24T16:00:01Z",
+            1_000,
+            "talk.exe",
+            " \n ",
+        )];
+
+        assert_eq!(audio_episode(&[], &skipped), None);
+        assert_eq!(audio_episode(&silent, &skipped), None);
     }
 
     #[test]

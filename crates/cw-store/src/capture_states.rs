@@ -23,7 +23,7 @@ const SELECT_RECORDED_UNTIL: &str = "SELECT id, max(at) FROM (\
      UNION ALL SELECT id, ?1 FROM capture_states WHERE end_at >= ?1 AND start_at < ?1)";
 
 /// How a state is spelled in the `state` column.
-const fn spelling(state: CaptureState) -> &'static str {
+pub(crate) const fn spelling(state: CaptureState) -> &'static str {
     match state {
         CaptureState::Paused => "paused",
         CaptureState::Excluded => "excluded",
@@ -201,7 +201,7 @@ fn recorded_until(
         })
 }
 
-fn spans_where(
+pub(crate) fn spans_where(
     conn: &rusqlite::Connection,
     sql: &str,
     params: impl rusqlite::Params,

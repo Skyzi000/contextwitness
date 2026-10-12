@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io::{BufRead as _, Write as _};
 use std::os::windows::process::CommandExt as _;
 use std::path::Path;
@@ -18,6 +18,7 @@ const FIRST_WAIT: Duration = Duration::from_secs(5);
 const LONGEST_WAIT: Duration = Duration::from_secs(300);
 const LASTED: Duration = Duration::from_secs(60);
 const SETTLED_STEP: TimeDelta = TimeDelta::seconds(10);
+const SKIP_GAP: TimeDelta = TimeDelta::seconds(30);
 
 pub fn worker(
     config_path: &Path,
@@ -101,6 +102,7 @@ struct StoreHost {
     conn: rusqlite::Connection,
     failures: HashMap<&'static str, String>,
     settled_written: Option<DateTime<Utc>>,
+    open_skips: HashMap<String, (ulid::Ulid, DateTime<Utc>)>,
 }
 
 impl StoreHost {
@@ -109,6 +111,7 @@ impl StoreHost {
             conn,
             failures: HashMap::new(),
             settled_written: None,
+            open_skips: HashMap::new(),
         }
     }
 
@@ -185,6 +188,18 @@ impl cw_audio::Host for StoreHost {
         {
             return;
         }
+        let extended = self.open_skips.values().try_for_each(|(id, last_seen)| {
+            cw_store::audio_skips::extend(&self.conn, *id, *last_seen)
+        });
+        if self
+            .report(
+                "the end of a blacklist skip could not be stored, so the settled mark stays",
+                extended,
+            )
+            .is_none()
+        {
+            return;
+        }
         let advanced =
             cw_store::control::advance_health(&self.conn, HealthKey::AudioSettled, through);
         if self
@@ -192,6 +207,36 @@ impl cw_audio::Host for StoreHost {
             .is_some()
         {
             self.settled_written = Some(through);
+        }
+    }
+
+    fn skipped(&mut self, by: &BTreeSet<String>, at: DateTime<Utc>) {
+        let ended: Vec<_> = self
+            .open_skips
+            .iter()
+            .filter(|(_, (_, last_seen))| at - *last_seen > SKIP_GAP)
+            .map(|(name, (id, last_seen))| (name.clone(), *id, *last_seen))
+            .collect();
+        for (name, id, last_seen) in ended {
+            let extended = cw_store::audio_skips::extend(&self.conn, id, last_seen);
+            if self
+                .report("the end of a blacklist skip could not be stored", extended)
+                .is_some()
+            {
+                self.open_skips.remove(&name);
+            }
+        }
+
+        for name in by {
+            if let Some((_, last_seen)) = self.open_skips.get_mut(name) {
+                *last_seen = at;
+                continue;
+            }
+            let process = (!name.is_empty()).then_some(name.as_str());
+            let begun = cw_store::audio_skips::begin(&self.conn, process, at);
+            if let Some(id) = self.report("a blacklist skip could not be stored", begun) {
+                self.open_skips.insert(name.clone(), (id, at));
+            }
         }
     }
 }
@@ -295,6 +340,7 @@ mod tests {
     use cw_core::config::{AudioConfig, DataPaths};
     use cw_core::model::{AudioPayload, SourcePayload};
     use cw_store::control::{HealthKey, Pause};
+    use std::collections::BTreeSet;
     use std::time::Duration;
 
     fn at(text: &str) -> DateTime<Utc> {
@@ -447,6 +493,143 @@ mod tests {
                 .expect("the settled mark should be readable"),
             Some(at("2026-07-24T16:00:46Z"))
         );
+    }
+
+    fn by(names: &[&str]) -> BTreeSet<String> {
+        names.iter().map(|name| (*name).to_owned()).collect()
+    }
+
+    fn skips(host: &StoreHost) -> Vec<(Option<String>, DateTime<Utc>, DateTime<Utc>)> {
+        cw_store::audio_skips::overlapping(
+            &host.conn,
+            at("2000-01-01T00:00:00Z"),
+            at("3000-01-01T00:00:00Z"),
+        )
+        .expect("the skips should be readable")
+        .into_iter()
+        .map(|span| (span.status.process, span.start_at, span.end_at))
+        .collect()
+    }
+
+    fn settled_mark(host: &StoreHost) -> Option<DateTime<Utc>> {
+        cw_store::control::get_health(&host.conn, HealthKey::AudioSettled)
+            .expect("the settled mark should be readable")
+    }
+
+    const FIRST_SKIP: &str = "2026-07-24T16:01:00Z";
+
+    fn after(seconds: i64) -> DateTime<Utc> {
+        at(FIRST_SKIP) + TimeDelta::seconds(seconds)
+    }
+
+    fn vault(
+        start_at: DateTime<Utc>,
+        end_at: DateTime<Utc>,
+    ) -> (Option<String>, DateTime<Utc>, DateTime<Utc>) {
+        (Some("vault.exe".to_owned()), start_at, end_at)
+    }
+
+    #[test]
+    fn a_name_seen_on_several_patrols_is_one_row_whose_end_is_written_before_the_mark_moves() {
+        let (_dir, mut host) = host();
+        host.skipped(&by(&["vault.exe"]), after(0));
+        for second in 1..=5 {
+            host.skipped(&by(&["vault.exe", ""]), after(second));
+        }
+        assert_eq!(
+            skips(&host),
+            [vault(after(0), after(0)), (None, after(1), after(1))]
+        );
+
+        host.settled(at("2026-07-24T16:01:05Z"));
+        assert_eq!(
+            skips(&host),
+            [vault(after(0), after(5)), (None, after(1), after(5))]
+        );
+        assert_eq!(settled_mark(&host), Some(at("2026-07-24T16:01:05Z")));
+    }
+
+    #[test]
+    fn a_name_absent_for_more_than_thirty_seconds_is_closed_where_it_was_last_seen() {
+        let (_dir, mut host) = host();
+        host.skipped(&by(&["vault.exe"]), after(0));
+        host.skipped(&by(&["vault.exe"]), after(4));
+        host.skipped(&by(&[]), after(34));
+        assert_eq!(
+            skips(&host),
+            [vault(after(0), after(0))],
+            "exactly thirty seconds of absence leave it open"
+        );
+
+        host.skipped(&by(&[]), after(35));
+        assert_eq!(skips(&host), [vault(after(0), after(4))]);
+
+        host.skipped(&by(&["vault.exe"]), after(36));
+        assert_eq!(
+            skips(&host),
+            [vault(after(0), after(4)), vault(after(36), after(36))],
+            "the return is a new row"
+        );
+    }
+
+    #[test]
+    fn a_name_that_returns_within_thirty_seconds_continues_its_row() {
+        let (_dir, mut host) = host();
+        host.skipped(&by(&["vault.exe"]), after(0));
+        host.skipped(&by(&[]), after(1));
+        host.skipped(&by(&["vault.exe"]), after(30));
+        host.skipped(&by(&[]), after(59));
+        host.skipped(&by(&["vault.exe"]), after(60));
+
+        host.settled(at("2026-07-24T16:01:30Z"));
+        assert_eq!(skips(&host), [vault(after(0), after(60))]);
+    }
+
+    #[test]
+    fn a_name_seen_again_after_thirty_seconds_without_a_patrol_is_a_new_row() {
+        let (_dir, mut host) = host();
+        host.skipped(&by(&["vault.exe"]), after(0));
+        host.skipped(&by(&["vault.exe"]), after(3_600));
+
+        assert_eq!(
+            skips(&host),
+            [vault(after(0), after(0)), vault(after(3_600), after(3_600))]
+        );
+    }
+
+    #[test]
+    fn a_skip_whose_end_cannot_be_written_holds_the_settled_mark_back() {
+        let (_dir, mut host) = host();
+        host.skipped(&by(&["vault.exe"]), after(0));
+        host.skipped(&by(&["vault.exe"]), after(5));
+        host.conn
+            .execute_batch("ALTER TABLE audio_skips RENAME TO audio_skips_away")
+            .expect("the table should be movable");
+        host.settled(at("2026-07-24T16:01:05Z"));
+        host.conn
+            .execute_batch("ALTER TABLE audio_skips_away RENAME TO audio_skips")
+            .expect("the table should be movable back");
+        assert_eq!(settled_mark(&host), None);
+        assert_eq!(skips(&host), [vault(after(0), after(0))]);
+
+        host.settled(at("2026-07-24T16:01:06Z"));
+        assert_eq!(settled_mark(&host), Some(at("2026-07-24T16:01:06Z")));
+        assert_eq!(skips(&host), [vault(after(0), after(5))]);
+    }
+
+    #[test]
+    fn a_skip_that_could_not_be_stored_begins_at_the_next_patrol() {
+        let (_dir, mut host) = host();
+        host.conn
+            .execute_batch("ALTER TABLE audio_skips RENAME TO audio_skips_away")
+            .expect("the table should be movable");
+        host.skipped(&by(&["vault.exe"]), after(0));
+        host.conn
+            .execute_batch("ALTER TABLE audio_skips_away RENAME TO audio_skips")
+            .expect("the table should be movable back");
+
+        host.skipped(&by(&["vault.exe"]), after(1));
+        assert_eq!(skips(&host), [vault(after(1), after(1))]);
     }
 
     #[test]

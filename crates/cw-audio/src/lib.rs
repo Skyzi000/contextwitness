@@ -9,7 +9,7 @@ mod stream;
 mod transcribe;
 mod vad;
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::convert::Infallible;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -74,6 +74,9 @@ pub trait Host {
     /// Every utterance that started before `through` has already been passed to
     /// [`utterance`](Self::utterance).
     fn settled(&mut self, through: DateTime<Utc>);
+    /// Called on every patrol with the listed programs that kept audio from being recorded; a
+    /// process without a readable name is the empty string.
+    fn skipped(&mut self, by: &BTreeSet<String>, at: DateTime<Utc>);
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -131,11 +134,13 @@ pub fn run(settings: Settings, host: &mut dyn Host) -> Result<Infallible, Error>
         if transcriber.is_finished() {
             return Err(Error::TranscriberStopped);
         }
-        if host.paused() {
+        let skipped = if host.paused() {
             patrol.end_all(Ending::Paused);
+            BTreeSet::new()
         } else {
-            patrol.walk();
-        }
+            patrol.walk()
+        };
+        host.skipped(&skipped, Utc::now());
         take_events(&events, began + PATROL, &mut pending, host)?;
         let now = Utc::now();
         if hold.clear(now)
@@ -238,7 +243,7 @@ impl Patrol {
         self.trouble = trouble;
     }
 
-    fn walk(&mut self) {
+    fn walk(&mut self) -> BTreeSet<String> {
         let table = match self.processes.table() {
             Ok(table) => table,
             Err(error) => {
@@ -246,7 +251,7 @@ impl Patrol {
                     "the process list could not be read, so nothing is recorded: {error}"
                 )));
                 self.end_all(Ending::Unjudged);
-                return;
+                return BTreeSet::new();
             }
         };
         let sessions = self.sessions.active_pids();
@@ -345,6 +350,8 @@ impl Patrol {
             }
             true
         });
+
+        verdict.skipped
     }
 }
 
@@ -427,6 +434,8 @@ mod tests {
         fn utterance(&mut self, _: Utterance) {}
 
         fn settled(&mut self, _: DateTime<Utc>) {}
+
+        fn skipped(&mut self, _: &BTreeSet<String>, _: DateTime<Utc>) {}
     }
 
     #[test]
