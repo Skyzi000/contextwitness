@@ -1031,6 +1031,60 @@ mod tests {
         }
     }
 
+    fn hiss(samples: usize) -> impl Iterator<Item = f32> {
+        (0..samples).map(|index| if index % 2 == 0 { 1e-4 } else { -1e-4 })
+    }
+
+    fn loud(samples: &[f32]) -> usize {
+        samples
+            .iter()
+            .position(|sample| sample.abs() > 0.05)
+            .expect("the sample recording has speech in it")
+    }
+
+    #[test]
+    #[ignore = "needs a SenseVoice model folder in CW_AUDIO_TEST_MODEL_DIR"]
+    fn an_utterance_begins_with_the_sound_that_led_up_to_it() {
+        let (_, speech) = sample();
+        let speech = &speech[loud(&speech) - SAMPLE_RATE / 20..];
+        let played: Vec<f32> = hiss(SAMPLE_RATE)
+            .chain(std::iter::repeat_n(0.0, SAMPLE_RATE / 5))
+            .chain(speech.iter().copied())
+            .collect();
+        let loud = loud(&played);
+
+        let first = segments(&played, 160).remove(0);
+        let microseconds = (first.started_at - started(0))
+            .num_microseconds()
+            .expect("the utterance starts within the recording");
+        let from = (microseconds as usize * SAMPLE_RATE + 500_000) / 1_000_000;
+        println!(
+            "the utterance starts {} ms before the speech gets loud",
+            (loud as i64 - from as i64) * 1000 / SAMPLE_RATE as i64
+        );
+        assert!(
+            from + SAMPLE_RATE * 3 / 10 <= loud,
+            "more than the detector alone goes back, and past the silence it was not fed"
+        );
+        assert_eq!(
+            first.samples[..loud - from],
+            played[from..loud],
+            "and it is the sound that was played then"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs a SenseVoice model folder in CW_AUDIO_TEST_MODEL_DIR"]
+    fn speech_that_lasts_under_half_a_second_is_an_utterance() {
+        let (_, speech) = sample();
+        let short = &speech[loud(&speech)..][..SAMPLE_RATE * 2 / 5];
+        let played: Vec<f32> = hiss(SAMPLE_RATE)
+            .chain(short.iter().copied())
+            .chain(hiss(SAMPLE_RATE))
+            .collect();
+        assert_eq!(segments(&played, 160).len(), 1);
+    }
+
     #[test]
     #[ignore = "needs a SenseVoice model folder in CW_AUDIO_TEST_MODEL_DIR"]
     fn speech_the_detector_does_not_close_is_cut_by_force_without_losing_any() {
