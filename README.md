@@ -299,7 +299,7 @@ The URL and key of a transcription API, needed only with `audio.backend = "api"`
 
 ## Updating and uninstalling
 
-**Updating.** Quit from the tray menu, then switch to the new version's `contextwitness.exe`. Start at logon points at where `contextwitness.exe` was when you enabled it. Each version's ZIP unpacks into a differently named folder, so when the location changes, run `autostart enable` again with the new `contextwitness.exe`. Audio recording is off by default, so updating from a version without it does not turn it on. For a source install, see [Building from source](#building-from-source).
+**Updating.** Quit from the tray menu, then switch to the new version's `contextwitness.exe`. Start at logon points at where `contextwitness.exe` was when you enabled it. Each version's ZIP unpacks into a differently named folder, so when the location changes, run `autostart enable` again with the new `contextwitness.exe`. Audio recording is off by default, so updating from a version without it does not turn it on. Read [CHANGELOG](CHANGELOG.md) first: it says when a version migrates the database. For a source install, see [Building from source](#building-from-source).
 
 **Uninstalling.** In this order:
 

@@ -70,7 +70,7 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory $env:STAGE | Out-Null
-          Copy-Item target/release/contextwitness.exe, README.md, README.ja.md, LICENSE, THIRD-PARTY-LICENSES.txt, THIRD-PARTY-NATIVE-LICENSES.txt $env:STAGE
+          Copy-Item target/release/contextwitness.exe, README.md, README.ja.md, CHANGELOG.md, LICENSE, THIRD-PARTY-LICENSES.txt, THIRD-PARTY-NATIVE-LICENSES.txt $env:STAGE
           Copy-Item (Join-Path (rustc --print sysroot) share/doc/rust/COPYRIGHT-library.html) "$env:STAGE/RUST-STD-COPYRIGHT.html"
           Compress-Archive -Path $env:STAGE -DestinationPath "$env:STAGE.zip"
       - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
