@@ -1,0 +1,4 @@
+[advisories]
+# zip is a build dependency of sherpa-onnx-sys, which extracts only its iOS .xcframework.zip with it,
+# and nothing at all while SHERPA_ONNX_LIB_DIR is set, as config.toml sets it.
+ignore = ["RUSTSEC-2026-0367", "RUSTSEC-2026-0368", "RUSTSEC-2026-0369"]
