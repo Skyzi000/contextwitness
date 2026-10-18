@@ -39,7 +39,7 @@ type Failure = Box<dyn std::error::Error>;
 #[derive(Parser)]
 #[command(
     name = "contextwitness",
-    version,
+    version = env!("CW_VERSION"),
     about = "Captures the screen, reads it, and delivers what it saw to Hindsight.",
     arg_required_else_help = true
 )]
@@ -859,6 +859,30 @@ mod tests {
         assert_eq!(
             cw_core::config::Config::from_toml_str(&listing).expect("the listing parses"),
             cw_core::config::Config::default()
+        );
+    }
+
+    #[test]
+    fn the_version_names_the_commit_it_was_built_from() {
+        use clap::Parser;
+
+        let head = std::process::Command::new("git")
+            .args(["rev-parse", "--short", "HEAD"])
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| format!(" ({})", String::from_utf8_lossy(&output.stdout).trim()));
+        let shown = match super::Cli::try_parse_from(["contextwitness", "--version"]) {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("--version should stop at the version"),
+        };
+        assert_eq!(
+            shown,
+            format!(
+                "contextwitness {}{}\n",
+                env!("CARGO_PKG_VERSION"),
+                head.unwrap_or_default()
+            )
         );
     }
 

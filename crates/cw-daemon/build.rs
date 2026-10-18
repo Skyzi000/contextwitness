@@ -18,4 +18,27 @@ fn main() {
         "cargo:rustc-link-arg-bins=/MANIFESTINPUT:{}",
         manifest.display()
     );
+    version();
+}
+
+fn version() {
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git").args(args).output().ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    };
+    let mut version = env!("CARGO_PKG_VERSION").to_owned();
+    if let Some(commit) = git(&["rev-parse", "--short", "HEAD"]) {
+        version = format!("{version} ({commit})");
+        for path in ["HEAD", "refs/heads", "reftable"] {
+            if let Some(path) = git(&["rev-parse", "--path-format=absolute", "--git-path", path])
+                .filter(|path| std::path::Path::new(path).exists())
+            {
+                println!("cargo:rerun-if-changed={path}");
+            }
+        }
+    }
+    println!("cargo:rustc-env=CW_VERSION={version}");
 }
