@@ -539,7 +539,7 @@ dependencies = [
 
 [[package]]
 name = "cw-audio"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "chrono",
  "cw-core",
@@ -558,7 +558,7 @@ dependencies = [
 
 [[package]]
 name = "cw-capture"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "chrono",
  "thiserror 2.0.21",
@@ -569,7 +569,7 @@ dependencies = [
 
 [[package]]
 name = "cw-core"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "chrono",
  "dirs",
@@ -584,7 +584,7 @@ dependencies = [
 
 [[package]]
 name = "cw-daemon"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "chrono",
  "clap",
@@ -609,7 +609,7 @@ dependencies = [
 
 [[package]]
 name = "cw-ocr"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "cw-core",
  "image",
@@ -618,7 +618,7 @@ dependencies = [
 
 [[package]]
 name = "cw-sink-hindsight"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "chrono",
  "cw-core",
@@ -631,7 +631,7 @@ dependencies = [
 
 [[package]]
 name = "cw-store"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "chrono",
  "cw-core",
