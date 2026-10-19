@@ -170,13 +170,20 @@ pub(crate) fn judge(
     }
     let open: Vec<(Target, Duration)> = recording().map(|seen| (seen.target, seen.idle)).collect();
     let selection = select(table, &active, &open, own_pid, blacklist);
+    let tree = Tree::new(table, blacklist);
 
     let endings = streams
         .iter()
         .filter(|seen| !selection.keep.contains(&seen.target))
         .filter_map(|seen| {
             let ending = if !seen.recording {
-                (!alive(&seen.target)).then_some(Ending::Exited)?
+                if !alive(&seen.target) {
+                    Ending::Exited
+                } else if tree.blocker(seen.target.pid).is_some() {
+                    Ending::Blacklisted
+                } else {
+                    return None;
+                }
             } else if selection.discard.contains(&seen.target) {
                 Ending::Blacklisted
             } else if !alive(&seen.target) {
@@ -783,6 +790,15 @@ mod tests {
             judged(&table, Some(&[10, 11]), &recording_parent).openings,
             []
         );
+    }
+
+    #[test]
+    fn a_stream_that_has_not_started_closes_once_a_blacklisted_process_is_in_its_tree() {
+        let table = table(&[(10, 1, 100, "launcher.exe"), (11, 10, 110, "secret.exe")]);
+        let streams = [seen(10, 100, Duration::ZERO, false)];
+        let verdict = judged(&table, Some(&[10]), &streams);
+        assert_eq!(verdict.endings, [(target(10, 100), Ending::Blacklisted)]);
+        assert_eq!(verdict.openings, []);
     }
 
     #[test]
