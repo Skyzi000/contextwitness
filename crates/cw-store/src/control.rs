@@ -1,6 +1,7 @@
 //! Pause state, health marks and the audit trail the CLI, the tray and the daemon share.
 
 use crate::{StoreError, timestamp};
+use cw_core::model::{CaptureState, CaptureStatus, StateSpan};
 
 /// The recorded pause, as [`get_pause`] answers it: no clock is consulted, so whether capture
 /// is stopped is its reader's side.
@@ -13,7 +14,7 @@ pub enum Pause {
     Indefinite,
 }
 
-/// A moment `contextwitness status` reports on.
+/// A moment `contextwitness status` reports on, or one the episode closer resumes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HealthKey {
     /// When a recent tick started.
@@ -22,6 +23,11 @@ pub enum HealthKey {
     LastCapture,
     /// When an episode was last delivered.
     LastDelivery,
+    /// Every utterance that started before this moment has been stored, or given up on after a
+    /// failed write.
+    AudioSettled,
+    /// Where the audio episode closer resumes: the end of the last window it examined.
+    AudioClosed,
 }
 
 /// What an audit row records.
@@ -66,6 +72,8 @@ impl HealthKey {
             Self::LastTick => "last_tick_at",
             Self::LastCapture => "last_capture_at",
             Self::LastDelivery => "last_delivery_at",
+            Self::AudioSettled => "audio_settled_at",
+            Self::AudioClosed => "audio_closed_at",
         }
     }
 }
@@ -104,6 +112,8 @@ const INSERT_EVENT: &str =
     "INSERT INTO control_events (id, kind, at, detail) VALUES (?1, ?2, ?3, ?4)";
 const SELECT_EVENTS_IN_WINDOW: &str = "SELECT id, kind, at, detail FROM control_events \
      WHERE at >= ?1 AND at <= ?2 ORDER BY at, id";
+const SELECT_PAUSE_REQUESTS: &str = "SELECT id, kind, at, detail FROM control_events \
+     WHERE kind IN (?1, ?2) AND at < ?3 ORDER BY at, id";
 
 /// What the database says about the pause, exactly as it is stored.
 ///
@@ -338,6 +348,108 @@ pub fn events_in_window(
     Ok(events)
 }
 
+const BANK_MISSION: &str = "bank_mission";
+
+/// The `observations_mission` this installation last knew its bank to hold as ContextWitness's
+/// own, if it has known one.
+pub fn bank_mission(conn: &rusqlite::Connection) -> Result<Option<String>, StoreError> {
+    let mut statement = conn
+        .prepare(SELECT_STATE)
+        .map_err(|source| StoreError::Sql { source })?;
+    let mut rows = statement
+        .query([BANK_MISSION])
+        .map_err(|source| StoreError::Sql { source })?;
+    let Some(row) = rows.next().map_err(|source| StoreError::Sql { source })? else {
+        return Ok(None);
+    };
+
+    row.get(0)
+        .map(Some)
+        .map_err(|source| StoreError::Sql { source })
+}
+
+/// Record what [`bank_mission`] answers.
+pub fn set_bank_mission(conn: &rusqlite::Connection, mission: &str) -> Result<(), StoreError> {
+    conn.execute(UPSERT_STATE, rusqlite::params![BANK_MISSION, mission])
+        .map_err(|source| StoreError::Sql { source })?;
+
+    Ok(())
+}
+
+/// The stretches of `[start, end)` over which a pause was in force, as `Paused` spans: each runs
+/// from the request that began it to the resume or the deadline that ended it.
+pub fn pauses(
+    conn: &rusqlite::Connection,
+    start: chrono::DateTime<chrono::Utc>,
+    end: chrono::DateTime<chrono::Utc>,
+) -> Result<Vec<StateSpan>, StoreError> {
+    let mut statement = conn
+        .prepare(SELECT_PAUSE_REQUESTS)
+        .map_err(|source| StoreError::Sql { source })?;
+    let mut rows = statement
+        .query(rusqlite::params![
+            EventKind::Paused.spelling(),
+            EventKind::Resumed.spelling(),
+            timestamp::to_sql(end)?,
+        ])
+        .map_err(|source| StoreError::Sql { source })?;
+    let mut spans = Vec::new();
+    let mut open: Option<(ControlEvent, Option<chrono::DateTime<chrono::Utc>>)> = None;
+    let mut close = |(began, deadline): (ControlEvent, Option<chrono::DateTime<chrono::Utc>>),
+                     at: chrono::DateTime<chrono::Utc>| {
+        let start_at = began.at.max(start);
+        let end_at = deadline.map_or(at, |deadline| deadline.min(at)).min(end);
+        if start_at < end_at {
+            spans.push(StateSpan {
+                id: began.id,
+                status: CaptureStatus {
+                    state: CaptureState::Paused,
+                    process: None,
+                    title: None,
+                    detail: None,
+                },
+                start_at,
+                end_at,
+            });
+        }
+    };
+
+    while let Some(row) = rows.next().map_err(|source| StoreError::Sql { source })? {
+        let event = event_from_row(row)?;
+        match event.kind {
+            EventKind::Paused => {
+                let deadline = event
+                    .detail
+                    .as_deref()
+                    .map(|deadline| read_timestamp(&event.id.to_string(), deadline))
+                    .transpose()?;
+                open = match open.take() {
+                    Some((began, in_force)) if in_force.is_none_or(|until| event.at < until) => {
+                        Some((began, deadline))
+                    }
+                    ended => {
+                        if let Some(ended) = ended {
+                            close(ended, event.at);
+                        }
+                        Some((event, deadline))
+                    }
+                };
+            }
+            EventKind::Resumed => {
+                if let Some(ended) = open.take() {
+                    close(ended, event.at);
+                }
+            }
+            EventKind::BlacklistSkip => {}
+        }
+    }
+    if let Some(ended) = open {
+        close(ended, end);
+    }
+
+    Ok(spans)
+}
+
 fn read_timestamp(subject: &str, value: &str) -> Result<chrono::DateTime<chrono::Utc>, StoreError> {
     timestamp::from_sql(value).map_err(|source| StoreError::Control {
         subject: subject.to_owned(),
@@ -394,8 +506,8 @@ fn decode_event(
 mod tests {
     use super::{
         ControlEvent, EventKind, HealthKey, INSERT_EVENT, PAUSE_INDEFINITE, PAUSE_UNTIL, Pause,
-        UPSERT_STATE, advance_health, events_in_window, get_health, get_pause, record_event,
-        resume, set_health, set_pause,
+        UPSERT_STATE, advance_health, events_in_window, get_health, get_pause, pauses,
+        record_event, resume, set_health, set_pause,
     };
     use crate::{StoreError, db, timestamp};
     use chrono::{DateTime, TimeDelta, TimeZone, Utc};
@@ -735,6 +847,8 @@ mod tests {
             (HealthKey::LastTick, at(2026, 7, 30, 12, 0, 0)),
             (HealthKey::LastCapture, at(2026, 7, 30, 12, 1, 0)),
             (HealthKey::LastDelivery, at(2026, 7, 30, 12, 2, 0)),
+            (HealthKey::AudioSettled, at(2026, 7, 30, 12, 4, 0)),
+            (HealthKey::AudioClosed, at(2026, 7, 30, 12, 5, 0)),
         ];
 
         for (which, _) in marks {
@@ -843,6 +957,97 @@ mod tests {
                     detail: None,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn the_bank_mission_is_absent_until_written_and_then_the_last_one_written() {
+        let (_dir, conn) = database();
+        assert_eq!(super::bank_mission(&conn).expect("the mark reads"), None);
+        super::set_bank_mission(&conn, "first").expect("the mark stores");
+        super::set_bank_mission(&conn, "second").expect("the mark stores again");
+        assert_eq!(
+            super::bank_mission(&conn).expect("the mark reads"),
+            Some("second".to_owned())
+        );
+        assert!(matches!(get_pause(&conn), Ok(None)));
+    }
+
+    fn paused_between(
+        conn: &rusqlite::Connection,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Vec<(DateTime<Utc>, DateTime<Utc>)> {
+        pauses(conn, start, end)
+            .expect("the pauses should be readable")
+            .into_iter()
+            .map(|span| (span.start_at, span.end_at))
+            .collect()
+    }
+
+    #[test]
+    fn a_resume_and_a_second_pause_seconds_apart_leave_the_stretch_between_them_out() {
+        let (_dir, mut conn) = database();
+        let second = |second| at(2026, 7, 30, 12, 0, second);
+        let mut id = 0u128;
+        let mut next_id = || {
+            id += 1;
+            ulid::Ulid::from(id)
+        };
+        set_pause(&mut conn, Pause::Indefinite, next_id(), second(10))
+            .expect("the pause should be stored");
+        resume(&mut conn, next_id(), second(12)).expect("the resume should be stored");
+        set_pause(&mut conn, Pause::Indefinite, next_id(), second(18))
+            .expect("the second pause should be stored");
+        record_event(
+            &conn,
+            &ControlEvent {
+                id: next_id(),
+                kind: EventKind::BlacklistSkip,
+                at: second(19),
+                detail: None,
+            },
+        )
+        .expect("the skip should be stored");
+
+        assert_eq!(
+            paused_between(&conn, second(0), second(30)),
+            [(second(10), second(12)), (second(18), second(30))]
+        );
+        assert_eq!(
+            paused_between(&conn, second(11), second(15)),
+            [(second(11), second(12))]
+        );
+        assert_eq!(
+            paused_between(&conn, second(20), second(40)),
+            [(second(20), second(40))]
+        );
+        assert!(paused_between(&conn, second(12), second(18)).is_empty());
+    }
+
+    #[test]
+    fn a_pause_with_a_deadline_ends_there_unless_resumed_or_asked_for_again_first() {
+        let (_dir, mut conn) = database();
+        let minute = |minute| at(2026, 7, 30, 12, minute, 0);
+        let mut id = 0u128;
+        let mut next_id = || {
+            id += 1;
+            ulid::Ulid::from(id)
+        };
+        set_pause(&mut conn, Pause::Until(minute(10)), next_id(), minute(1))
+            .expect("the first pause should be stored");
+        resume(&mut conn, next_id(), minute(12)).expect("the late resume should be stored");
+        set_pause(&mut conn, Pause::Until(minute(25)), next_id(), minute(20))
+            .expect("the second pause should be stored");
+        set_pause(&mut conn, Pause::Until(minute(40)), next_id(), minute(22))
+            .expect("the longer deadline should be stored");
+        resume(&mut conn, next_id(), minute(30)).expect("the early resume should be stored");
+        set_pause(&mut conn, Pause::Until(minute(45)), next_id(), minute(50))
+            .expect("the pause that was over when asked for should be stored");
+
+        assert_eq!(
+            paused_between(&conn, minute(0), minute(59)),
+            [(minute(1), minute(10)), (minute(20), minute(30))]
         );
     }
 

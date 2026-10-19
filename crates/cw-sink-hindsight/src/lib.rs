@@ -12,9 +12,10 @@ use reqwest::{StatusCode, Url};
 use serde_json::value::RawValue;
 use serde_json::{Map, Value, json};
 
-/// The `observations_mission` a new bank starts with: tells Hindsight's consolidation what the
-/// episode text is (OCR of screen captures) and what the display alone cannot establish.
-const OBSERVATIONS_MISSION: &str = "Sources are OCR text from captures of the foreground window, grouped into time windows. Entries carry a timestamp and, where known, the application and window title of the captured window; a long entry continues under its header marked (continued). Consecutive identical captures are folded into one entry. An entry headed (changes since <time>) is a unified diff of OCR lines against the same window's capture at that time: @@ lines give line positions, lines marked - disappeared from the OCR text, lines marked + appeared in it, and unmarked lines are unchanged context. Other entries give their capture's OCR text in full, or a bracketed note where OCR failed. The full text at a diff entry is that window's entry at <time> with the diff applied, where that entry is itself full text or a diff entry rebuilt the same way, all in the same document. A time range with a bracketed note gives the capture state over a stretch where no new capture was stored, or marks a stretch where nothing was recorded; keep these stretches as stated, without reading a cause into them: no new frame or no change above the capture threshold does not confirm that the window stayed the same, and nothing recorded does not establish why, such as the user being away or the machine being asleep or off. OCR may misrecognize displayed text, so a changed line may be a recognition difference rather than a change on screen. The display alone does not establish that the user read, wrote, ran, or agreed with the text, even when the text may be the user's own; a line that appeared or disappeared does not establish that the user typed or deleted it. Keep the time, application, and window title exactly as they appear in the input, and do not invent them where they are missing. The same text observed again is not independent confirmation. Consolidate related screen records into observations about which applications, documents, pages, and topics were on screen, when, and what changed on them; do not create a new observation for a repetition that adds nothing.";
+/// The `observations_mission` a bank gets: tells Hindsight's consolidation what the episode text
+/// is (OCR of screen captures, transcripts of played speech) and what neither alone can
+/// establish.
+pub const OBSERVATIONS_MISSION: &str = "Sources are OCR text from captures of the foreground window, grouped into time windows. Entries carry a timestamp and, where known, the application and window title of the captured window; a long entry continues under its header marked (continued). Consecutive identical captures are folded into one entry. An entry headed (changes since <time>) is a unified diff of OCR lines against the same window's capture at that time: @@ lines give line positions, lines marked - disappeared from the OCR text, lines marked + appeared in it, and unmarked lines are unchanged context. Other entries give their capture's OCR text in full, or a bracketed note where OCR failed. The full text at a diff entry is that window's entry at <time> with the diff applied, where that entry is itself full text or a diff entry rebuilt the same way, all in the same document. A time range with a bracketed note gives the capture state over a stretch where no new capture was stored, or marks a stretch where nothing was recorded; keep these stretches as stated, without reading a cause into them: no new frame or no change above the capture threshold does not confirm that the window stayed the same, and nothing recorded does not establish why, such as the user being away or the machine being asleep or off. OCR may misrecognize displayed text, so a changed line may be a recognition difference rather than a change on screen. The display alone does not establish that the user read, wrote, ran, or agreed with the text, even when the text may be the user's own; a line that appeared or disappeared does not establish that the user typed or deleted it. Keep the time, application, and window title exactly as they appear in the input, and do not invent them where they are missing. The same text observed again is not independent confirmation. Consolidate related screen records into observations about which applications, documents, pages, and topics were on screen, when, and what changed on them; do not create a new observation for a repetition that adds nothing. Some documents are audio documents instead: machine transcripts of speech that applications played. Each of their entries is headed by the time range its utterances span and the application the audio was captured from, which can include sound from programs that application started, and each line gives the local time an utterance started and what was transcribed, or a bracketed note where it could not be transcribed. A time range with a bracketed note marks a stretch over which a pause was requested or audio was skipped for a program on the user's blacklist; like a stretch without lines, it does not establish that nothing was playing, since only speech is transcribed. Transcripts mishear words, especially names, and do not mark who is speaking. That speech was played does not establish that the user heard it, said it, or agreed with it. Consolidate related audio records into observations about what was said in which application and when.";
 
 /// Bounds the whole exchange, request-body upload included, so the largest configurable episode
 /// over a slow link must fit within it; detecting a dead host promptly is [`CONNECT_TIMEOUT`]'s
@@ -266,6 +267,41 @@ struct OperationWire {
     error_message: Option<String>,
 }
 
+/// The mission 1.0.0 wrote. That version kept no record of what it had written, so a bank still
+/// holding this text is taken to hold ContextWitness's own.
+const MISSION_OF_1_0_0: &str = "Sources are OCR text from captures of the foreground window, grouped into time windows. Entries carry a timestamp and, where known, the application and window title of the captured window; a long entry continues under its header marked (continued). Consecutive identical captures are folded into one entry. An entry headed (changes since <time>) is a unified diff of OCR lines against the same window's capture at that time: @@ lines give line positions, lines marked - disappeared from the OCR text, lines marked + appeared in it, and unmarked lines are unchanged context. Other entries give their capture's OCR text in full, or a bracketed note where OCR failed. The full text at a diff entry is that window's entry at <time> with the diff applied, where that entry is itself full text or a diff entry rebuilt the same way, all in the same document. A time range with a bracketed note gives the capture state over a stretch where no new capture was stored, or marks a stretch where nothing was recorded; keep these stretches as stated, without reading a cause into them: no new frame or no change above the capture threshold does not confirm that the window stayed the same, and nothing recorded does not establish why, such as the user being away or the machine being asleep or off. OCR may misrecognize displayed text, so a changed line may be a recognition difference rather than a change on screen. The display alone does not establish that the user read, wrote, ran, or agreed with the text, even when the text may be the user's own; a line that appeared or disappeared does not establish that the user typed or deleted it. Keep the time, application, and window title exactly as they appear in the input, and do not invent them where they are missing. The same text observed again is not independent confirmation. Consolidate related screen records into observations about which applications, documents, pages, and topics were on screen, when, and what changed on them; do not create a new observation for a repetition that adds nothing.";
+
+/// What [`HindsightClient::ensure_bank`] found the bank's `observations_mission` to be, or made
+/// it.
+#[derive(Debug)]
+pub enum BankMission {
+    /// The bank did not exist and was created with [`OBSERVATIONS_MISSION`].
+    Created,
+    /// The bank held a mission ContextWitness wrote earlier, now replaced with
+    /// [`OBSERVATIONS_MISSION`].
+    Replaced,
+    /// The bank already held [`OBSERVATIONS_MISSION`].
+    Current,
+    /// The bank holds a mission ContextWitness did not write, or none, and was left as it is.
+    Other,
+    /// The bank exists, and the server refused to show or to take its mission: any 4xx but 408
+    /// and 429. Hindsight answers 404 while its bank config API is disabled.
+    Refused(DeliveryError),
+    /// The bank exists, and its mission could not be read or replaced this time.
+    Unchecked(DeliveryError),
+}
+
+#[derive(serde::Deserialize)]
+struct BankConfig {
+    #[serde(default)]
+    overrides: BankOverrides,
+}
+
+#[derive(Default, serde::Deserialize)]
+struct BankOverrides {
+    observations_mission: Option<String>,
+}
+
 const BANK_LIST_PAGE_SIZE: usize = 100;
 
 #[derive(serde::Deserialize)]
@@ -428,26 +464,95 @@ impl HindsightClient {
         Ok(url)
     }
 
-    /// Applies the initial settings only when the bank list reports it absent; a bank the list
-    /// confirmed as existing is never written. The PATCH both creates a missing bank and sets
-    /// its config, so a bank another client creates between the check and the PATCH still
-    /// receives the settings once.
-    pub fn ensure_bank(&self, bank_id: &str) -> Result<(), DeliveryError> {
+    /// Applies the initial settings only when the bank list reports it absent. The PATCH both
+    /// creates a missing bank and sets its config, so a bank another client creates between the
+    /// check and the PATCH still receives the settings once.
+    ///
+    /// A bank the list confirmed as existing keeps every setting but one: an
+    /// `observations_mission` that ContextWitness wrote, which is `written_before` or the one
+    /// 1.0.0 wrote, is replaced with [`OBSERVATIONS_MISSION`]. Failing at that does not make the
+    /// bank unusable, so it is answered as [`BankMission::Refused`] or [`BankMission::Unchecked`]
+    /// rather than as an error.
+    pub fn ensure_bank(
+        &self,
+        bank_id: &str,
+        written_before: Option<&str>,
+    ) -> Result<BankMission, DeliveryError> {
         vet_bank_id(bank_id)?;
-        if self.bank_exists(bank_id)? {
-            return Ok(());
-        }
         let url = self.endpoint(&["v1", "default", "banks", bank_id, "config"])?;
-        let desired = json!({
-            "updates": {
+        if self.bank_exists(bank_id)? {
+            return Ok(self
+                .follow_mission(url, written_before)
+                .unwrap_or_else(BankMission::Unchecked));
+        }
+        self.update_config(
+            url,
+            json!({
                 "retain_extraction_mode": "chunks",
                 "store_document_text": false,
                 "observations_mission": OBSERVATIONS_MISSION,
-            }
-        });
-        accept(
-            self.send(self.http.patch(url).json(&desired).timeout(CONTROL_TIMEOUT))?,
+            }),
             INITIALIZE_BANK_OPERATION,
+        )?;
+        Ok(BankMission::Created)
+    }
+
+    fn follow_mission(
+        &self,
+        url: Url,
+        written_before: Option<&str>,
+    ) -> Result<BankMission, DeliveryError> {
+        let read = self.http.get(url.clone());
+        let response = match self.mission_exchange(read, READ_BANK_CONFIG_OPERATION)? {
+            Ok(response) => response,
+            Err(refused) => return Ok(refused),
+        };
+        let text = read_strict_text(response, READ_BANK_CONFIG_OPERATION)?;
+        let config: BankConfig = parse_text(&text, READ_BANK_CONFIG_OPERATION)?;
+        match config.overrides.observations_mission.as_deref() {
+            Some(OBSERVATIONS_MISSION) => Ok(BankMission::Current),
+            Some(mission) if mission == MISSION_OF_1_0_0 || Some(mission) == written_before => {
+                let replace = self
+                    .http
+                    .patch(url)
+                    .json(&json!({ "updates": { "observations_mission": OBSERVATIONS_MISSION } }));
+                Ok(self
+                    .mission_exchange(replace, REPLACE_MISSION_OPERATION)?
+                    .map_or_else(|refused| refused, |_| BankMission::Replaced))
+            }
+            _ => Ok(BankMission::Other),
+        }
+    }
+
+    /// [`accept`]s the answer, with a refusal set apart as the inner error.
+    fn mission_exchange(
+        &self,
+        request: RequestBuilder,
+        operation: &str,
+    ) -> Result<Result<Response, BankMission>, DeliveryError> {
+        let response = self.send(request.timeout(CONTROL_TIMEOUT))?;
+        let status = response.status();
+        let refused = status.is_client_error()
+            && !matches!(
+                status,
+                StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_MANY_REQUESTS
+            );
+        match accept(response, operation) {
+            Err(error) if refused => Ok(Err(BankMission::Refused(error))),
+            accepted => accepted.map(Ok),
+        }
+    }
+
+    fn update_config(
+        &self,
+        url: Url,
+        updates: Value,
+        operation: &str,
+    ) -> Result<(), DeliveryError> {
+        let body = json!({ "updates": updates });
+        accept(
+            self.send(self.http.patch(url).json(&body).timeout(CONTROL_TIMEOUT))?,
+            operation,
         )
         .map(drop)
     }
@@ -666,6 +771,8 @@ fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
 const RETAIN_OPERATION: &str = "retain";
 const INITIALIZE_BANK_OPERATION: &str = "initialize bank";
 const LIST_BANKS_OPERATION: &str = "list banks";
+const READ_BANK_CONFIG_OPERATION: &str = "read bank config";
+const REPLACE_MISSION_OPERATION: &str = "replace bank mission";
 const POLL_OPERATION: &str = "operation status";
 
 fn accept(response: Response, operation: &str) -> Result<Response, DeliveryError> {
@@ -1681,38 +1788,132 @@ mod tests {
         );
     }
 
+    fn existing_bank() -> Turn {
+        answer(
+            "HTTP/1.1 200 OK",
+            bank_list_page(
+                vec![
+                    // Id and name both match the substring query; only the exact bank_id
+                    // comparison tells it from the target.
+                    bank_profile("shadow-bank", "the bank of someone else"),
+                    bank_profile("bank", "the target"),
+                ],
+                2,
+                0,
+            ),
+        )
+    }
+
+    fn bank_config(observations_mission: Option<&str>) -> Turn {
+        let mut overrides = json!({"retain_chunk_size": 8000});
+        if let Some(mission) = observations_mission {
+            overrides["observations_mission"] = json!(mission);
+        }
+        answer(
+            "HTTP/1.1 200 OK",
+            json!({"bank_id": "bank", "config": {}, "overrides": overrides}).to_string(),
+        )
+    }
+
+    const BANK_QUESTIONS: [&str; 2] = [
+        "GET /v1/default/banks?q=bank&limit=100&offset=0",
+        "GET /v1/default/banks/bank/config",
+    ];
+
     #[test]
-    fn an_existing_bank_is_never_written_on_initialization_or_restart() {
-        let list = bank_list_page(
-            vec![
-                // Id and name both match the substring query; only the exact bank_id
-                // comparison tells it from the target.
-                bank_profile("shadow-bank", "the bank of someone else"),
-                bank_profile("bank", "the target"),
-            ],
-            2,
-            0,
-        );
-        let (seen, port) = scripted_server(vec![
-            answer("HTTP/1.1 200 OK", list.clone()),
-            answer("HTTP/1.1 200 OK", list),
-        ]);
-        bank_client(port)
-            .ensure_bank("bank")
-            .expect("a bank the list names exactly is ready as it stands");
-        // A fresh client stands in for a process restart.
-        bank_client(port)
-            .ensure_bank("bank")
-            .expect("a restart must find the same bank the same way");
-        assert_eq!(
-            asked(&seen_requests(&seen)),
-            [
-                "GET /v1/default/banks?q=bank&limit=100&offset=0",
-                "GET /v1/default/banks?q=bank&limit=100&offset=0",
-            ],
-            "an existing bank owes the read-only list check and nothing else, before or after \
-             a restart"
-        );
+    fn an_existing_bank_holding_this_mission_or_one_contextwitness_never_wrote_is_only_read() {
+        for (held, current) in [
+            (Some(OBSERVATIONS_MISSION), true),
+            (Some("the owner's own mission"), false),
+            (None, false),
+        ] {
+            let (seen, port) = scripted_server(vec![existing_bank(), bank_config(held)]);
+            let found = bank_client(port)
+                .ensure_bank("bank", Some("what this installation wrote before"))
+                .expect("a bank the list names exactly is ready as it stands");
+            assert!(
+                matches!(
+                    (&found, current),
+                    (BankMission::Current, true) | (BankMission::Other, false)
+                ),
+                "{held:?} was answered as {found:?}"
+            );
+            assert_eq!(asked(&seen_requests(&seen)), BANK_QUESTIONS);
+        }
+    }
+
+    #[test]
+    fn a_mission_contextwitness_wrote_earlier_is_replaced_and_no_other_setting_is_sent() {
+        for (held, written_before) in [
+            (MISSION_OF_1_0_0, None),
+            (
+                "a text from between releases",
+                Some("a text from between releases"),
+            ),
+        ] {
+            let (seen, port) = scripted_server(vec![
+                existing_bank(),
+                bank_config(Some(held)),
+                answer("HTTP/1.1 200 OK", "{}".to_owned()),
+            ]);
+            let found = bank_client(port)
+                .ensure_bank("bank", written_before)
+                .expect("replacing its own mission leaves the bank ready");
+            assert!(matches!(found, BankMission::Replaced), "{found:?}");
+            let requests = seen_requests(&seen);
+            assert_eq!(
+                asked(&requests),
+                [
+                    BANK_QUESTIONS[0],
+                    BANK_QUESTIONS[1],
+                    "PATCH /v1/default/banks/bank/config",
+                ]
+            );
+            assert_eq!(
+                serde_json::from_str::<Value>(&requests[2].1).expect("the PATCH body is JSON"),
+                json!({"updates": {"observations_mission": OBSERVATIONS_MISSION}})
+            );
+        }
+    }
+
+    #[test]
+    fn an_existing_bank_whose_mission_cannot_be_read_or_replaced_is_ready_all_the_same() {
+        let disabled = || {
+            answer(
+                "HTTP/1.1 404 Not Found",
+                r#"{"detail":"Bank configuration API is disabled."}"#.to_owned(),
+            )
+        };
+        let unavailable = || answer("HTTP/1.1 503 Service Unavailable", String::new());
+        let held = || bank_config(Some(MISSION_OF_1_0_0));
+        for (turns, refused) in [
+            (vec![existing_bank(), disabled()], true),
+            (vec![existing_bank(), held(), disabled()], true),
+            (vec![existing_bank(), unavailable()], false),
+            (vec![existing_bank(), held(), unavailable()], false),
+            (vec![existing_bank(), Turn::HangUp], false),
+        ] {
+            let (seen, port) = scripted_server(turns);
+            let found = bank_client(port)
+                .ensure_bank("bank", None)
+                .expect("a bank that exists delivers whatever became of its mission");
+            assert!(
+                matches!(
+                    (&found, refused),
+                    (BankMission::Refused(_), true) | (BankMission::Unchecked(_), false)
+                ),
+                "{found:?}"
+            );
+            drop(seen_requests(&seen));
+        }
+    }
+
+    #[test]
+    fn the_mission_is_the_text_1_0_0_wrote_followed_by_the_audio_part() {
+        let audio = OBSERVATIONS_MISSION
+            .strip_prefix(MISSION_OF_1_0_0)
+            .expect("the screen text should stay as 1.0.0 wrote it");
+        assert!(audio.starts_with(" Some documents are audio documents instead"));
     }
 
     #[test]
@@ -1738,10 +1939,10 @@ mod tests {
             ),
         ]);
         bank_client(port)
-            .ensure_bank("bank")
+            .ensure_bank("bank", None)
             .expect("an absent bank is this client's to initialize");
         bank_client(port)
-            .ensure_bank("bank")
+            .ensure_bank("bank", None)
             .expect("the initialized bank now exists, whatever its settings are");
         let requests = seen_requests(&seen);
         assert_eq!(
@@ -1787,7 +1988,7 @@ mod tests {
         ] {
             let (seen, port) = scripted_server(vec![answer(status_line, body.to_owned())]);
             let error = bank_client(port)
-                .ensure_bank("bank")
+                .ensure_bank("bank", None)
                 .expect_err("a list that cannot be read is not an absent bank");
             assert!(error.is_retryable(), "{status_line}: {error}");
             assert!(
@@ -1813,7 +2014,7 @@ mod tests {
                 .port()
         };
         let refused = bank_client(port)
-            .ensure_bank("bank")
+            .ensure_bank("bank", None)
             .expect_err("a server that cannot be reached leaves the bank undecidable");
         assert!(refused.is_retryable(), "{refused}");
         assert!(
@@ -1833,11 +2034,11 @@ mod tests {
             ),
         ]);
         let lost = bank_client(port)
-            .ensure_bank("bank")
+            .ensure_bank("bank", None)
             .expect_err("a lost answer leaves initialization unconfirmed");
         assert!(lost.is_retryable(), "{lost}");
         bank_client(port)
-            .ensure_bank("bank")
+            .ensure_bank("bank", None)
             .expect("the bank the lost exchange initialized is now simply present");
         assert_eq!(
             asked(&seen_requests(&seen)),
@@ -1866,7 +2067,7 @@ mod tests {
             ),
         ]);
         let refused = bank_client(port)
-            .ensure_bank("bank")
+            .ensure_bank("bank", None)
             .expect_err("a refused PATCH is not a successful initialization");
         assert!(refused.is_retryable(), "{refused}");
         assert!(
@@ -1878,7 +2079,7 @@ mod tests {
             "the bounded server words are the diagnosis: {refused}"
         );
         bank_client(port)
-            .ensure_bank("bank")
+            .ensure_bank("bank", None)
             .expect("a later initialization attempt can still succeed");
         assert_eq!(
             asked(&seen_requests(&seen)),
@@ -1906,7 +2107,7 @@ mod tests {
             ),
         ]);
         bank_client(port)
-            .ensure_bank("bank")
+            .ensure_bank("bank", None)
             .expect("the target sits on the second page");
         assert_eq!(
             asked(&seen_requests(&seen)),
@@ -1935,7 +2136,7 @@ mod tests {
         ));
         let (seen, port) = scripted_server(turns);
         bank_client(port)
-            .ensure_bank("bank")
+            .ensure_bank("bank", None)
             .expect("the target sits on the eleventh page");
         let requests = seen_requests(&seen);
         assert_eq!(
@@ -1967,7 +2168,7 @@ mod tests {
             ),
         ]);
         let undecidable = bank_client(port)
-            .ensure_bank("bank")
+            .ensure_bank("bank", None)
             .expect_err("a walk that never saw the bank cannot call it absent");
         assert!(undecidable.is_retryable(), "{undecidable}");
         assert!(
@@ -1993,7 +2194,7 @@ mod tests {
             bank_list_page(vec![bank_profile("shadow-bank", "a kin decoy")], 2, 0),
         )]);
         let undecidable = bank_client(port)
-            .ensure_bank("bank")
+            .ensure_bank("bank", None)
             .expect_err("a page that contradicts its own total cannot acquit a write");
         assert!(undecidable.is_retryable(), "{undecidable}");
         assert!(
@@ -2027,7 +2228,7 @@ mod tests {
             ),
         ]);
         bank_client(port)
-            .ensure_bank("bank")
+            .ensure_bank("bank", None)
             .expect("kin alone is not the bank, so initialization is free to run");
         assert_eq!(
             asked(&seen_requests(&seen)),
@@ -2046,7 +2247,7 @@ mod tests {
         body.extend_from_slice(br#""}],"total":1,"limit":100,"offset":0}"#);
         let (seen, port) = scripted_server(vec![answer_bytes("HTTP/1.1 200 OK", body)]);
         let undecodable = bank_client(port)
-            .ensure_bank("bank")
+            .ensure_bank("bank", None)
             .expect_err("bytes that cannot state a bank_id cannot acquit a write either");
         assert!(undecodable.is_retryable(), "{undecodable}");
         assert!(

@@ -15,6 +15,7 @@ cw-core = { workspace = true }
 cw-capture = { workspace = true }
 cw-ocr = { workspace = true }
 cw-store = { workspace = true }
+cw-audio = { workspace = true }
 cw-sink-hindsight = { workspace = true }
 chrono = { workspace = true }
 rusqlite = { workspace = true }

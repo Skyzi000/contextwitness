@@ -416,7 +416,7 @@ impl Subject {
 /// The spelling `save_failed` deduplicates on. Several store errors name the freshly minted
 /// observation id, or the image path derived from it, so their full messages never repeat; the
 /// key keeps the parts that spell the same while the cause does.
-fn save_failure_key(error: &cw_store::StoreError) -> String {
+pub(crate) fn save_failure_key(error: &cw_store::StoreError) -> String {
     use cw_store::StoreError;
     match error {
         StoreError::ImageIo { source, .. } => format!("image io: {source}"),

@@ -1,6 +1,6 @@
 use std::io::Write as _;
 
-use crate::{autostart, capture, delivery, episodes, logging, maintenance, tray};
+use crate::{audio, autostart, capture, delivery, episodes, logging, maintenance, tray};
 use clap::{Parser, Subcommand};
 use cw_core::atomic_file::create_temporary_beside;
 use cw_core::config::{
@@ -39,7 +39,7 @@ type Failure = Box<dyn std::error::Error>;
 #[derive(Parser)]
 #[command(
     name = "contextwitness",
-    version,
+    version = env!("CW_VERSION"),
     about = "Captures the screen, reads it, and delivers what it saw to Hindsight.",
     arg_required_else_help = true
 )]
@@ -65,7 +65,8 @@ enum Command {
     Resume,
     /// Ask for the Hindsight credentials and the data directory, and write them.
     Setup,
-    /// Print every setting with its built-in default.
+    /// Print every setting with its built-in default, and the mission given to the Hindsight
+    /// bank.
     Defaults,
     /// Start at logon, or stop doing so.
     Autostart {
@@ -74,6 +75,14 @@ enum Command {
     },
     /// Capture, read and store the way a tick would, then exit.
     CaptureOnce,
+    /// Record and transcribe what applications play, for the `run` that started this.
+    #[command(hide = true)]
+    AudioWorker {
+        #[arg(long)]
+        config: std::path::PathBuf,
+        #[arg(long)]
+        data_dir: std::path::PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -94,6 +103,7 @@ pub fn main() {
         Command::Defaults => defaults(),
         Command::Autostart { action } => set_autostart(&action),
         Command::CaptureOnce => capture_once(),
+        Command::AudioWorker { config, data_dir } => audio::worker(&config, data_dir),
     };
 
     if let Err(error) = outcome {
@@ -125,6 +135,12 @@ fn daemon() -> ! {
     if created {
         info!(path = %config_path.display(), "wrote the default config");
     }
+    if let Err(error) = std::fs::create_dir_all(paths.models()) {
+        error!(
+            "creating the models folder {} failed: {error}",
+            paths.models().display()
+        );
+    }
 
     if !dpi_aware {
         error!(
@@ -148,6 +164,20 @@ fn daemon() -> ! {
         Ok(registered) => info!(registered, "registered windows that closed while stopped"),
         Err(error) => error!("the startup episode rescan failed: {error}"),
     }
+    match episodes::close_due_audio(
+        &mut conn,
+        config.episode.window_minutes,
+        chrono::Utc::now(),
+        false,
+    ) {
+        Ok(0) => {}
+        Ok(registered) => info!(
+            registered,
+            "registered audio windows that closed while stopped"
+        ),
+        Err(error) => error!("the startup audio episode rescan failed: {error}"),
+    }
+    let audio_worker_alive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     spawn("delivery", {
         let conn = open_for("delivery", &paths);
@@ -158,7 +188,8 @@ fn daemon() -> ! {
     spawn("episodes", {
         let conn = open_for("episodes", &paths);
         let config = config.clone();
-        move || episodes::run(conn, config, cursor)
+        let audio_worker_alive = audio_worker_alive.clone();
+        move || episodes::run(conn, config, cursor, audio_worker_alive)
     });
     spawn("maintenance", {
         let conn = open_for("maintenance", &paths);
@@ -166,6 +197,22 @@ fn daemon() -> ! {
         let paths = DataPaths::new(paths.root.clone());
         move || maintenance::run(conn, paths, config)
     });
+    if config.audio.enabled {
+        spawn("audio", {
+            let conn = open_for("audio", &paths);
+            let data_dir = paths.root.clone();
+            let window_minutes = config.episode.window_minutes;
+            move || {
+                audio::supervise(
+                    &conn,
+                    &config_path,
+                    &data_dir,
+                    window_minutes,
+                    &audio_worker_alive,
+                )
+            }
+        });
+    }
     tray::spawn(DataPaths::new(paths.root.clone()));
 
     info!(
@@ -282,6 +329,7 @@ fn status() -> Result<(), Failure> {
     for (label, key) in [
         ("last tick", HealthKey::LastTick),
         ("last capture", HealthKey::LastCapture),
+        ("audio worker", HealthKey::AudioSettled),
         ("last delivery", HealthKey::LastDelivery),
     ] {
         field(
@@ -496,9 +544,18 @@ fn setup() -> Result<(), Failure> {
 }
 
 fn defaults() -> Result<(), Failure> {
-    print!("{DEFAULT_CONFIG_TOML}");
+    print!("{}", defaults_listing());
 
     Ok(())
+}
+
+/// The mission is not a setting, so it is listed as a comment and the whole stays valid TOML.
+fn defaults_listing() -> String {
+    format!(
+        "{DEFAULT_CONFIG_TOML}\n# Not a setting: the observations mission ContextWitness gives the \
+         Hindsight bank.\n# {}\n",
+        cw_sink_hindsight::OBSERVATIONS_MISSION
+    )
 }
 
 fn setup_credentials() -> Result<(), Failure> {
@@ -792,6 +849,42 @@ mod tests {
     use crate::capture::{SaveFailure, Stored};
     use cw_core::config::INITIAL_CONFIG_TOML;
     use cw_store::outbox::NewestError;
+
+    #[test]
+    fn the_defaults_listing_ends_with_the_bank_mission_and_still_reads_as_the_settings() {
+        let listing = super::defaults_listing();
+        let mission = cw_sink_hindsight::OBSERVATIONS_MISSION;
+
+        assert!(listing.ends_with(&format!("# {mission}\n")));
+        assert_eq!(
+            cw_core::config::Config::from_toml_str(&listing).expect("the listing parses"),
+            cw_core::config::Config::default()
+        );
+    }
+
+    #[test]
+    fn the_version_names_the_commit_it_was_built_from() {
+        use clap::Parser;
+
+        let head = std::process::Command::new("git")
+            .args(["rev-parse", "--short", "HEAD"])
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| format!(" ({})", String::from_utf8_lossy(&output.stdout).trim()));
+        let shown = match super::Cli::try_parse_from(["contextwitness", "--version"]) {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("--version should stop at the version"),
+        };
+        assert_eq!(
+            shown,
+            format!(
+                "contextwitness {}{}\n",
+                env!("CARGO_PKG_VERSION"),
+                head.unwrap_or_default()
+            )
+        );
+    }
 
     #[test]
     fn a_mutex_name_is_claimed_once() {
